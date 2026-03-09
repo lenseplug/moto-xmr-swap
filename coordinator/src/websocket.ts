@@ -1,11 +1,14 @@
 /**
  * WebSocket server for real-time swap state updates.
  * Uses the built-in `ws` module via Node.js http.Server upgrade.
+ *
+ * Preimage messages are ONLY sent to clients that have subscribed to
+ * the specific swap ID via a { type: 'subscribe', swapId } message.
  */
 
 import { type IncomingMessage, type Server } from 'node:http';
 import { WebSocketServer, WebSocket } from 'ws';
-import { type ISwapRecord, type IWsMessage, type IWsPreimageReady } from './types.js';
+import { type ISwapRecord, type IWsMessage, type IWsPreimageReady, type IWsClientMessage } from './types.js';
 import { StorageService } from './storage.js';
 
 const ALLOWED_ORIGIN = process.env['CORS_ORIGIN'] ?? 'http://localhost:5173';
@@ -14,6 +17,9 @@ const ALLOWED_ORIGIN = process.env['CORS_ORIGIN'] ?? 'http://localhost:5173';
 export class SwapWebSocketServer {
     private readonly wss: WebSocketServer;
     private readonly storage: StorageService;
+
+    /** Maps swapId → Set of WebSocket clients subscribed to that swap. */
+    private readonly subscriptions = new Map<string, Set<WebSocket>>();
 
     public constructor(httpServer: Server, storage: StorageService) {
         this.storage = storage;
@@ -33,6 +39,7 @@ export class SwapWebSocketServer {
 
     /**
      * Broadcasts a swap state update to all connected clients.
+     * General swap updates are public — they contain no secrets.
      * @param swap - The updated swap record.
      */
     public broadcastSwapUpdate(swap: ISwapRecord): void {
@@ -41,9 +48,9 @@ export class SwapWebSocketServer {
     }
 
     /**
-     * Broadcasts the preimage for a swap that has reached XMR_LOCKED state.
+     * Sends the preimage ONLY to clients subscribed to this swap.
      * This is the ONLY mechanism by which the preimage is delivered to Bob's frontend.
-     * It is never exposed via a public HTTP endpoint.
+     * It is never exposed via a public HTTP endpoint or broadcast to all clients.
      *
      * @param swapId - The swap ID.
      * @param preimage - The hex-encoded preimage.
@@ -51,8 +58,22 @@ export class SwapWebSocketServer {
     public broadcastPreimageReady(swapId: string, preimage: string): void {
         const payload: IWsPreimageReady = { swapId, preimage };
         const message: IWsMessage = { type: 'preimage_ready', data: payload };
-        this.broadcast(message);
-        console.log(`[WebSocket] Preimage broadcast for swap ${swapId}`);
+        const json = JSON.stringify(message);
+
+        const subscribers = this.subscriptions.get(swapId);
+        if (!subscribers || subscribers.size === 0) {
+            console.log(`[WebSocket] Preimage ready for swap ${swapId} but no subscribers`);
+            return;
+        }
+
+        let sent = 0;
+        for (const client of subscribers) {
+            if (client.readyState === WebSocket.OPEN) {
+                client.send(json);
+                sent++;
+            }
+        }
+        console.log(`[WebSocket] Preimage sent to ${sent} subscriber(s) for swap ${swapId}`);
     }
 
     /**
@@ -82,13 +103,46 @@ export class SwapWebSocketServer {
         const initMsg: IWsMessage = { type: 'active_swaps', data: activeSwaps };
         this.sendToClient(ws, initMsg);
 
+        ws.on('message', (raw: Buffer | string) => {
+            this.handleClientMessage(ws, raw);
+        });
+
         ws.on('close', () => {
+            this.removeClientFromAllSubscriptions(ws);
             console.log(`[WebSocket] Client disconnected (${this.wss.clients.size} remaining)`);
         });
 
         ws.on('error', (err: Error) => {
             console.error(`[WebSocket] Client error: ${err.message}`);
         });
+    }
+
+    private handleClientMessage(ws: WebSocket, raw: Buffer | string): void {
+        try {
+            const text = typeof raw === 'string' ? raw : raw.toString('utf-8');
+            const msg = JSON.parse(text) as IWsClientMessage;
+
+            if (msg.type === 'subscribe' && typeof msg.swapId === 'string') {
+                let subs = this.subscriptions.get(msg.swapId);
+                if (!subs) {
+                    subs = new Set();
+                    this.subscriptions.set(msg.swapId, subs);
+                }
+                subs.add(ws);
+                console.log(`[WebSocket] Client subscribed to swap ${msg.swapId}`);
+            }
+        } catch {
+            // Ignore malformed messages
+        }
+    }
+
+    private removeClientFromAllSubscriptions(ws: WebSocket): void {
+        for (const [swapId, subs] of this.subscriptions) {
+            subs.delete(ws);
+            if (subs.size === 0) {
+                this.subscriptions.delete(swapId);
+            }
+        }
     }
 
     private broadcast(message: IWsMessage): void {

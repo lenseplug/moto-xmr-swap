@@ -108,6 +108,12 @@ export interface IWsPreimageReady {
     readonly preimage: string;
 }
 
+/** Incoming WebSocket message from client. */
+export interface IWsClientMessage {
+    readonly type: 'subscribe';
+    readonly swapId: string;
+}
+
 /** WebSocket message shape. */
 export interface IWsMessage {
     readonly type: 'swap_update' | 'active_swaps' | 'error' | 'preimage_ready';

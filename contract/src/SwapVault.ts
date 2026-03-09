@@ -447,16 +447,20 @@ export class SwapVault extends OP_NET {
         const total = this.nextSwapId.value;
         const maxU  = u256.fromU32(MAX_ACTIVE_SWAPS);
 
-        // Determine iteration limit: min(total, MAX_ACTIVE_SWAPS) — bounded loop
-        const limit = u256.lt(total, maxU) ? total : maxU;
-        const limitU32: u32 = <u32>limit.lo1;
+        // Scan the most recent MAX_ACTIVE_SWAPS swap IDs (not always 0..49)
+        // start = max(0, total - MAX_ACTIVE_SWAPS)
+        const start: u256 = u256.gt(total, maxU) ? SafeMath.sub(total, maxU) : u256.Zero;
 
-        // Collect active (OPEN) swap IDs
+        // Number of IDs to check: min(total, MAX_ACTIVE_SWAPS)
+        const scanCount = u256.lt(total, maxU) ? total : maxU;
+        const scanU32: u32 = <u32>scanCount.lo1;
+
+        // Collect active (OPEN or TAKEN) swap IDs
         const activeIds: u256[] = [];
-        for (let i: u32 = 0; i < limitU32; i++) {
-            const id     = u256.fromU32(i);
+        for (let i: u32 = 0; i < scanU32; i++) {
+            const id     = SafeMath.add(start, u256.fromU32(i));
             const status = this.swapStatuses.get(id);
-            if (u256.eq(status, STATUS_OPEN)) {
+            if (u256.eq(status, STATUS_OPEN) || u256.eq(status, STATUS_TAKEN)) {
                 activeIds.push(id);
             }
         }

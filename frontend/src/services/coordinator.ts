@@ -11,7 +11,7 @@ const COORDINATOR_BASE = import.meta.env.VITE_COORDINATOR_URL;
  */
 export async function checkCoordinatorHealth(): Promise<CoordinatorHealth> {
     try {
-        const res = await fetch(`${COORDINATOR_BASE}/health`, {
+        const res = await fetch(`${COORDINATOR_BASE}/api/health`, {
             signal: AbortSignal.timeout(5000),
         });
         if (!res.ok) return { status: 'error' };
@@ -28,7 +28,7 @@ export async function checkCoordinatorHealth(): Promise<CoordinatorHealth> {
  */
 export async function getCoordinatorSwapStatus(swapId: string): Promise<CoordinatorStatus | null> {
     try {
-        const res = await fetch(`${COORDINATOR_BASE}/swap/${swapId}`, {
+        const res = await fetch(`${COORDINATOR_BASE}/api/swaps/${swapId}`, {
             signal: AbortSignal.timeout(10000),
         });
         if (!res.ok) return null;
@@ -47,10 +47,10 @@ export async function getCoordinatorSwapStatus(swapId: string): Promise<Coordina
  */
 export async function notifySwapTaken(swapId: string, txId: string): Promise<boolean> {
     try {
-        const res = await fetch(`${COORDINATOR_BASE}/swap/${swapId}/taken`, {
+        const res = await fetch(`${COORDINATOR_BASE}/api/swaps/${swapId}/take`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ txId }),
+            body: JSON.stringify({ opnetTxId: txId }),
             signal: AbortSignal.timeout(10000),
         });
         return res.ok;
@@ -64,7 +64,7 @@ export async function notifySwapTaken(swapId: string, txId: string): Promise<boo
  */
 export async function getAllCoordinatorStatuses(): Promise<CoordinatorStatus[]> {
     try {
-        const res = await fetch(`${COORDINATOR_BASE}/swaps`, {
+        const res = await fetch(`${COORDINATOR_BASE}/api/swaps`, {
             signal: AbortSignal.timeout(10000),
         });
         if (!res.ok) return [];

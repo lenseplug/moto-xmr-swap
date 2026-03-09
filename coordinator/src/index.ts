@@ -19,7 +19,6 @@ import { type ISwapRecord, SwapStatus } from './types.js';
 const PORT = parseInt(process.env['PORT'] ?? '3001', 10);
 const DB_PATH = process.env['DB_PATH'] ?? 'coordinator.db';
 const EXPIRY_CHECK_INTERVAL_MS = 30_000;
-const CLEANUP_INTERVAL_MS = 60_000;
 
 /**
  * Allowed CORS origin. Defaults to the local Vite dev server.
@@ -36,7 +35,8 @@ const RATE_LIMIT_MAX_WRITE = 10; // write requests per minute
 const RATE_LIMIT_MAX_READ = 60; // read requests per minute
 
 interface IRateLimitEntry {
-    count: number;
+    readCount: number;
+    writeCount: number;
     resetAt: number;
 }
 
@@ -47,11 +47,19 @@ function checkRateLimit(ip: string, isWrite: boolean): boolean {
     const limit = isWrite ? RATE_LIMIT_MAX_WRITE : RATE_LIMIT_MAX_READ;
     const entry = requestCounts.get(ip);
     if (!entry || now > entry.resetAt) {
-        requestCounts.set(ip, { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS });
+        requestCounts.set(ip, {
+            readCount: isWrite ? 0 : 1,
+            writeCount: isWrite ? 1 : 0,
+            resetAt: now + RATE_LIMIT_WINDOW_MS,
+        });
         return true;
     }
-    entry.count++;
-    return entry.count <= limit;
+    if (isWrite) {
+        entry.writeCount++;
+        return entry.writeCount <= limit;
+    }
+    entry.readCount++;
+    return entry.readCount <= limit;
 }
 
 /** Returns the best-effort client IP from an incoming request. */
@@ -270,17 +278,9 @@ async function main(): Promise<void> {
         }
     }, EXPIRY_CHECK_INTERVAL_MS);
 
-    const cleanupTimer = setInterval(() => {
-        const currentBlock = watcher.getCurrentBlock();
-        if (currentBlock > 0n) {
-            watcher.checkExpirations(currentBlock);
-        }
-    }, CLEANUP_INTERVAL_MS);
-
     function shutdown(): void {
         console.log('[Coordinator] Shutting down...');
         clearInterval(expiryCheckTimer);
-        clearInterval(cleanupTimer);
         watcher.stop();
         wsServer?.close();
         server.close(() => {
