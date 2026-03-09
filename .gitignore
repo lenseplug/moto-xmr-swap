@@ -1,0 +1,14 @@
+node_modules/
+dist/
+build/
+*.wasm
+*.js.map
+.env
+.env.*
+*.db
+coordinator/dist/
+coordinator/data/
+frontend/dist/
+contract/build/
+.claude/
+build-result.json

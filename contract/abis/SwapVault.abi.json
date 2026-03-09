@@ -1,0 +1,279 @@
+{
+    "functions": [
+        {
+            "name": "createSwap",
+            "type": "Function",
+            "payable": false,
+            "onlyOwner": false,
+            "inputs": [
+                {
+                    "name": "hashLock",
+                    "type": "UINT256"
+                },
+                {
+                    "name": "refundBlock",
+                    "type": "UINT256"
+                },
+                {
+                    "name": "amount",
+                    "type": "UINT256"
+                },
+                {
+                    "name": "xmrAmount",
+                    "type": "UINT256"
+                },
+                {
+                    "name": "xmrAddressHi",
+                    "type": "UINT256"
+                },
+                {
+                    "name": "xmrAddressLo",
+                    "type": "UINT256"
+                }
+            ],
+            "outputs": [
+                {
+                    "name": "swapId",
+                    "type": "UINT256"
+                }
+            ]
+        },
+        {
+            "name": "takeSwap",
+            "type": "Function",
+            "payable": false,
+            "onlyOwner": false,
+            "inputs": [
+                {
+                    "name": "swapId",
+                    "type": "UINT256"
+                }
+            ],
+            "outputs": [
+                {
+                    "name": "success",
+                    "type": "BOOL"
+                }
+            ]
+        },
+        {
+            "name": "claim",
+            "type": "Function",
+            "payable": false,
+            "onlyOwner": false,
+            "inputs": [
+                {
+                    "name": "swapId",
+                    "type": "UINT256"
+                },
+                {
+                    "name": "preimage",
+                    "type": "UINT256"
+                }
+            ],
+            "outputs": [
+                {
+                    "name": "success",
+                    "type": "BOOL"
+                }
+            ]
+        },
+        {
+            "name": "refund",
+            "type": "Function",
+            "payable": false,
+            "onlyOwner": false,
+            "inputs": [
+                {
+                    "name": "swapId",
+                    "type": "UINT256"
+                }
+            ],
+            "outputs": [
+                {
+                    "name": "success",
+                    "type": "BOOL"
+                }
+            ]
+        },
+        {
+            "name": "getSwap",
+            "type": "Function",
+            "payable": false,
+            "onlyOwner": false,
+            "inputs": [
+                {
+                    "name": "swapId",
+                    "type": "UINT256"
+                }
+            ],
+            "outputs": [
+                {
+                    "name": "hashLock",
+                    "type": "UINT256"
+                },
+                {
+                    "name": "refundBlock",
+                    "type": "UINT256"
+                },
+                {
+                    "name": "amount",
+                    "type": "UINT256"
+                },
+                {
+                    "name": "xmrAmount",
+                    "type": "UINT256"
+                },
+                {
+                    "name": "depositor",
+                    "type": "ADDRESS"
+                },
+                {
+                    "name": "counterparty",
+                    "type": "ADDRESS"
+                },
+                {
+                    "name": "status",
+                    "type": "UINT256"
+                },
+                {
+                    "name": "xmrAddressHi",
+                    "type": "UINT256"
+                },
+                {
+                    "name": "xmrAddressLo",
+                    "type": "UINT256"
+                }
+            ]
+        },
+        {
+            "name": "getActiveSwaps",
+            "type": "Function",
+            "payable": false,
+            "onlyOwner": false,
+            "inputs": [],
+            "outputs": [
+                {
+                    "name": "swapIds",
+                    "type": "UINT256_ARRAY"
+                }
+            ]
+        },
+        {
+            "name": "getSwapCount",
+            "type": "Function",
+            "payable": false,
+            "onlyOwner": false,
+            "inputs": [],
+            "outputs": [
+                {
+                    "name": "count",
+                    "type": "UINT256"
+                }
+            ]
+        },
+        {
+            "name": "getTotalEscrow",
+            "type": "Function",
+            "payable": false,
+            "onlyOwner": false,
+            "inputs": [],
+            "outputs": [
+                {
+                    "name": "totalEscrow",
+                    "type": "UINT256"
+                }
+            ]
+        }
+    ],
+    "events": [
+        {
+            "name": "SwapCreated",
+            "values": [
+                {
+                    "name": "swapId",
+                    "type": "UINT256"
+                },
+                {
+                    "name": "depositor",
+                    "type": "ADDRESS"
+                },
+                {
+                    "name": "hashLock",
+                    "type": "UINT256"
+                },
+                {
+                    "name": "refundBlock",
+                    "type": "UINT256"
+                },
+                {
+                    "name": "amount",
+                    "type": "UINT256"
+                },
+                {
+                    "name": "xmrAmount",
+                    "type": "UINT256"
+                },
+                {
+                    "name": "xmrAddressHi",
+                    "type": "UINT256"
+                },
+                {
+                    "name": "xmrAddressLo",
+                    "type": "UINT256"
+                }
+            ],
+            "type": "Event"
+        },
+        {
+            "name": "SwapTaken",
+            "values": [
+                {
+                    "name": "swapId",
+                    "type": "UINT256"
+                },
+                {
+                    "name": "counterparty",
+                    "type": "ADDRESS"
+                }
+            ],
+            "type": "Event"
+        },
+        {
+            "name": "SwapClaimed",
+            "values": [
+                {
+                    "name": "swapId",
+                    "type": "UINT256"
+                },
+                {
+                    "name": "counterparty",
+                    "type": "ADDRESS"
+                },
+                {
+                    "name": "preimage",
+                    "type": "UINT256"
+                }
+            ],
+            "type": "Event"
+        },
+        {
+            "name": "SwapRefunded",
+            "values": [
+                {
+                    "name": "swapId",
+                    "type": "UINT256"
+                },
+                {
+                    "name": "depositor",
+                    "type": "ADDRESS"
+                },
+                {
+                    "name": "amount",
+                    "type": "UINT256"
+                }
+            ],
+            "type": "Event"
+        }
+    ]
+}

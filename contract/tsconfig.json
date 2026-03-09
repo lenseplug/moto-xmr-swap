@@ -1,0 +1,15 @@
+{
+    "extends": "./node_modules/@btc-vision/btc-runtime/tsconfig.json",
+    "compilerOptions": {
+        "strict": false,
+        "experimentalDecorators": true,
+        "outDir": "build",
+        "baseUrl": ".",
+        "paths": {
+            "@btc-vision/btc-runtime/runtime": ["./node_modules/@btc-vision/btc-runtime/runtime/index.ts"],
+            "@btc-vision/btc-runtime/runtime/*": ["./node_modules/@btc-vision/btc-runtime/runtime/*"]
+        }
+    },
+    "include": ["src/**/*.ts"],
+    "exclude": ["node_modules", "build"]
+}

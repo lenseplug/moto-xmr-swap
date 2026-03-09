@@ -1,0 +1,27 @@
+{
+    "name": "moto-xmr-swap-vault",
+    "version": "1.0.0",
+    "description": "SwapVault HTLC contract for MOTO-XMR atomic swaps on OPNet",
+    "type": "module",
+    "scripts": {
+        "build": "asc src/index.ts --config asconfig.json --target release",
+        "lint": "eslint src/",
+        "clean": "rm -rf build/*"
+    },
+    "dependencies": {
+        "@assemblyscript/loader": "^0.28.9",
+        "@btc-vision/as-bignum": "^0.1.2",
+        "@btc-vision/assemblyscript": "^0.29.2",
+        "@btc-vision/btc-runtime": "^1.11.0-rc.10",
+        "@btc-vision/opnet-transform": "^1.2.0",
+        "binaryen": "^125.0.0"
+    },
+    "devDependencies": {
+        "@eslint/js": "^10.0.1",
+        "eslint": "^10.0.0",
+        "typescript-eslint": "^8.56.0"
+    },
+    "overrides": {
+        "@noble/hashes": "2.0.1"
+    }
+}

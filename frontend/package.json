@@ -1,0 +1,42 @@
+{
+    "name": "moto-xmr-swap-frontend",
+    "version": "1.0.0",
+    "type": "module",
+    "scripts": {
+        "dev": "vite",
+        "build": "vite build",
+        "preview": "vite preview",
+        "lint": "eslint src/",
+        "typecheck": "tsc --noEmit"
+    },
+    "dependencies": {
+        "@btc-vision/bitcoin": "rc",
+        "@btc-vision/bip32": "latest",
+        "@btc-vision/ecpair": "latest",
+        "@btc-vision/transaction": "rc",
+        "@btc-vision/walletconnect": "latest",
+        "opnet": "rc",
+        "react": "^19.0.0",
+        "react-dom": "^19.0.0"
+    },
+    "devDependencies": {
+        "@eslint/js": "^9.39.2",
+        "@types/node": "latest",
+        "@types/react": "latest",
+        "@types/react-dom": "latest",
+        "@vitejs/plugin-react": "latest",
+        "crypto-browserify": "latest",
+        "eslint": "^9.39.2",
+        "eslint-plugin-react-hooks": "^5.2.0",
+        "eslint-plugin-react-refresh": "^0.4.9",
+        "stream-browserify": "latest",
+        "typescript": "latest",
+        "typescript-eslint": "^8.26.0",
+        "vite": "latest",
+        "vite-plugin-eslint2": "latest",
+        "vite-plugin-node-polyfills": "latest"
+    },
+    "overrides": {
+        "@noble/hashes": "2.0.1"
+    }
+}
