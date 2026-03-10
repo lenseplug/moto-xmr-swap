@@ -484,7 +484,7 @@ export async function handleSetFeeAddress(
  * Handler: POST /api/swaps/:id/keys
  *
  * Accepts Bob's key material for trustless mode:
- *   { bobEd25519PubKey: string, bobViewKey: string, bobDleqProof: string }
+ *   { bobEd25519PubKey: string, bobViewKey: string, bobKeyProof: string }
  *
  * The swap must already be in trustless mode (Alice submitted aliceViewKey with secret).
  * Once Bob's keys are stored, the coordinator can compute the shared Monero address.

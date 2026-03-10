@@ -120,7 +120,7 @@ export function secretHexToBigint(secretHex: string): bigint {
 }
 
 /**
- * Persists a swap secret to localStorage so the user can claim later.
+ * Persists a swap secret to sessionStorage so the user can claim later.
  *
  * @param swapId - The swap ID (decimal string)
  * @param secret - The secret preimage hex

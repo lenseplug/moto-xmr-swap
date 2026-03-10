@@ -208,7 +208,7 @@ export async function submitSwapSecret(swapId: string, secret: string, aliceView
  * Submits Bob's key material for a trustless swap.
  *
  * @param swapId - The swap ID as a decimal string
- * @param keys - Bob's ed25519 public key, view key, and DLEQ proof
+ * @param keys - Bob's ed25519 public key, view key, and key proof-of-knowledge
  * @returns true if the keys were accepted
  */
 export async function submitBobKeys(swapId: string, keys: BobKeyMaterial): Promise<boolean> {
