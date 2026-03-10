@@ -236,8 +236,8 @@ export async function handleSubmitSecret(
 
     // Accept secrets for OPEN (Alice submits right after creation), TAKEN (normal flow),
     // and later pre-claim states (idempotent re-submission).
-    // In trustless mode, the preimage alone doesn't enable theft without
-    // also calling claim() on-chain, so early storage is acceptable.
+    // The preimage alone doesn't enable theft without also calling claim()
+    // on-chain, so early storage is acceptable.
     const ACCEPT_SECRET_STATES = new Set([
         SwapStatus.OPEN,
         SwapStatus.TAKEN,
@@ -267,7 +267,7 @@ export async function handleSubmitSecret(
             return;
         }
         secret = (parsed as { secret: string }).secret.trim().toLowerCase();
-        // Optional: Alice's view key for trustless mode
+        // Optional: Alice's view key for split-key mode
         const candidate = parsed as Record<string, unknown>;
         if (typeof candidate['aliceViewKey'] === 'string') {
             aliceViewKey = candidate['aliceViewKey'].trim().toLowerCase();
@@ -314,18 +314,18 @@ export async function handleSubmitSecret(
     // Build update params
     const updateParams: Record<string, string | number | null> = { preimage: secret };
 
-    // If Alice provides a view key, enable trustless mode and derive her ed25519 pub from the secret
+    // If Alice provides a view key, enable split-key mode and derive her ed25519 pub from the secret
     if (aliceViewKey) {
         const secretBytes = hexToBytes(secret);
         const alicePub = ed25519PublicFromPrivate(secretBytes);
         const alicePubHex = bytesToHex(alicePub);
-        updateParams['trustless_mode'] = 1;
+        updateParams['trustless_mode'] = 1; // DB column name kept for migration compat
         updateParams['alice_ed25519_pub'] = alicePubHex;
         updateParams['alice_view_key'] = aliceViewKey;
-        console.log(`[Routes] Trustless mode enabled for swap ${swapId} (Alice pub: ${alicePubHex.slice(0, 16)}...)`);
+        console.log(`[Routes] Split-key mode enabled for swap ${swapId} (Alice pub: ${alicePubHex.slice(0, 16)}...)`);
     }
 
-    // Store the preimage (and trustless fields if present)
+    // Store the preimage (and split-key fields if present)
     storage.updateSwap(swapId, updateParams as import('../types.js').IUpdateSwapParams);
     console.log(`[Routes] Secret stored for swap ${swapId}`);
 
@@ -483,11 +483,12 @@ export async function handleSetFeeAddress(
 /**
  * Handler: POST /api/swaps/:id/keys
  *
- * Accepts Bob's key material for trustless mode:
+ * Accepts Bob's key material for split-key mode:
  *   { bobEd25519PubKey: string, bobViewKey: string, bobKeyProof: string }
  *
- * The swap must already be in trustless mode (Alice submitted aliceViewKey with secret).
+ * The swap must already be in split-key mode (Alice submitted aliceViewKey with secret).
  * Once Bob's keys are stored, the coordinator can compute the shared Monero address.
+ * NOTE: The coordinator holds both key shares and is trusted with the XMR side.
  */
 export async function handleSubmitKeys(
     req: IncomingMessage,
@@ -501,9 +502,9 @@ export async function handleSubmitKeys(
         return;
     }
 
-    // Must be in trustless mode
+    // Must be in split-key mode
     if (swap.trustless_mode !== 1) {
-        jsonResponse(res, 409, fail('NOT_TRUSTLESS', 'Swap is not in trustless mode — Alice must submit aliceViewKey with secret first'));
+        jsonResponse(res, 409, fail('NOT_TRUSTLESS', 'Swap is not in split-key mode — Alice must submit aliceViewKey with secret first'));
         return;
     }
 
@@ -576,7 +577,7 @@ export async function handleSubmitKeys(
         bob_view_key: bobViewKey,
         bob_dleq_proof: bobKeyProof,
     });
-    console.log(`[Routes] Bob's keys verified and stored for trustless swap ${swapId} (pub: ${bobPub.slice(0, 16)}...)`);
+    console.log(`[Routes] Bob's keys verified and stored for split-key swap ${swapId} (pub: ${bobPub.slice(0, 16)}...)`);
 
     jsonResponse(res, 200, success({ stored: true }));
 }

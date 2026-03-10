@@ -116,12 +116,12 @@ export interface LocalSwapSecret {
     readonly secret: string;
     readonly hashLock: string;
     readonly createdAt: number;
-    /** Alice's ed25519 private view key for trustless mode. */
+    /** Alice's ed25519 private view key for split-key mode. */
     readonly aliceViewKey?: string;
 }
 
 /**
- * Bob's key material for trustless atomic swap.
+ * Bob's key material for coordinator-mediated atomic swap.
  */
 export interface BobKeyMaterial {
     readonly bobEd25519PubKey: string;

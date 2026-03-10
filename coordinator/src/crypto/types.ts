@@ -1,7 +1,7 @@
 /**
- * Types for cross-curve cryptographic operations used in trustless swaps.
+ * Types for cross-curve cryptographic operations used in coordinator-mediated swaps.
  *
- * The trustless swap protocol uses ed25519 (Monero) and secp256k1 (Bitcoin/OPNet)
+ * The split-key swap protocol uses ed25519 (Monero) and secp256k1 (Bitcoin/OPNet)
  * key pairs with DLEQ proofs to ensure the same discrete logarithm underlies
  * keys on both curves.
  */
@@ -41,7 +41,7 @@ export interface ISharedMoneroAddress {
 export type MoneroNetwork = 'mainnet' | 'stagenet';
 
 /**
- * Key material submitted by Alice (MOTO depositor) when creating a trustless swap.
+ * Key material submitted by Alice (MOTO depositor) when creating a split-key swap.
  * Alice's secret scalar s_a is used as the HTLC preimage: hash_lock = SHA256(s_a).
  */
 export interface IAliceKeyMaterial {
@@ -54,7 +54,7 @@ export interface IAliceKeyMaterial {
 }
 
 /**
- * Key material submitted by Bob (XMR sender) when taking a trustless swap.
+ * Key material submitted by Bob (XMR sender) when taking a split-key swap.
  * Bob keeps his secret scalar s_b private until the swap completes.
  */
 export interface IBobKeyMaterial {

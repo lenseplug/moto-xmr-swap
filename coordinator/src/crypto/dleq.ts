@@ -1,5 +1,5 @@
 /**
- * Bob key proof-of-knowledge verification for trustless swaps.
+ * Bob key proof-of-knowledge verification for split-key swaps.
  *
  * Replaces the V1 DLEQ placeholder with a Schnorr proof-of-knowledge scheme.
  * Bob proves he knows the private scalar behind his submitted ed25519 public key

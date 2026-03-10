@@ -96,9 +96,9 @@ export interface ISwapRecord {
     readonly xmr_lock_confirmations: number;
     readonly xmr_subaddr_index: number | null;
     readonly claim_token: string | null;
-    /** Trustless mode: swap uses cross-curve key exchange for shared Monero address. */
+    /** Split-key mode: swap uses cross-curve key exchange for shared Monero address. Coordinator is trusted with XMR. */
     readonly trustless_mode: number;
-    /** Alice's ed25519 public spend key (64 hex chars). Derived from preimage in trustless mode. */
+    /** Alice's ed25519 public spend key (64 hex chars). Derived from preimage in split-key mode. */
     readonly alice_ed25519_pub: string | null;
     /** Alice's ed25519 private view key (64 hex chars). */
     readonly alice_view_key: string | null;

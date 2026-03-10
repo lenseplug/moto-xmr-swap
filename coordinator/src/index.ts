@@ -338,14 +338,14 @@ function startXmrLocking(
         return;
     }
 
-    // Trustless mode: need both Alice's and Bob's keys before proceeding
+    // Split-key mode: need both Alice's and Bob's keys before proceeding
     if (swap.trustless_mode === 1) {
         if (!swap.alice_ed25519_pub || !swap.alice_view_key) {
-            console.warn(`[XMR Locking] Trustless swap ${swapId} missing Alice's key material — waiting`);
+            console.warn(`[XMR Locking] Split-key swap ${swapId} missing Alice's key material — waiting`);
             return;
         }
         if (!swap.bob_ed25519_pub || !swap.bob_view_key) {
-            console.warn(`[XMR Locking] Trustless swap ${swapId} missing Bob's key material — waiting`);
+            console.warn(`[XMR Locking] Split-key swap ${swapId} missing Bob's key material — waiting`);
             return;
         }
     }
@@ -385,7 +385,7 @@ function startXmrLocking(
             let subaddrIndex: number | undefined;
 
             if (swap.trustless_mode === 1 && swap.alice_ed25519_pub && swap.alice_view_key && swap.bob_ed25519_pub && swap.bob_view_key) {
-                // Trustless mode: compute shared Monero address from split keys
+                // Split-key mode: compute shared Monero address from split keys
                 const aliceSpendPub = hexToUint8(swap.alice_ed25519_pub);
                 const bobSpendPub = hexToUint8(swap.bob_ed25519_pub);
                 const aliceViewPriv = hexToUint8(swap.alice_view_key);
@@ -398,7 +398,7 @@ function startXmrLocking(
                     moneroNetwork,
                 );
                 xmrLockAddress = shared.address;
-                console.log(`[XMR Locking] Trustless swap ${swapId} — shared address: ${xmrLockAddress.slice(0, 12)}...`);
+                console.log(`[XMR Locking] Split-key swap ${swapId} — shared address: ${xmrLockAddress.slice(0, 12)}...`);
             } else {
                 // Standard mode: generate address from wallet RPC
                 const lockResult = await moneroService.createLockAddress(swapId);

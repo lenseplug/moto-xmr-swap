@@ -147,9 +147,9 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
                 await new Promise<void>((r) => setTimeout(r, 3000));
             }
 
-            // Step 3: Generate trustless ed25519 keys + hash-lock
+            // Step 3: Generate ed25519 split keys + hash-lock
             setStep('creating');
-            setStatusMessage('Generating trustless keys...');
+            setStatusMessage('Generating swap keys...');
 
             const { secret, hashLock, hashLockHex, aliceViewKey } = await generateTrustlessSecret();
 
@@ -283,7 +283,7 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
                     Create Swap
                 </h2>
                 <p style={{ fontSize: '0.875rem', color: 'var(--color-text-secondary)' }}>
-                    Offer MOTO tokens in exchange for Monero. Trustless ed25519 keys are generated locally.
+                    Offer MOTO tokens in exchange for Monero. Split ed25519 keys are generated locally.
                 </p>
             </div>
 
@@ -479,7 +479,7 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
                                     marginTop: '6px',
                                 }}
                             >
-                                Trustless keys saved locally. Do not clear localStorage until the swap is
+                                Swap keys saved locally. Do not clear browser data until the swap is
                                 complete.
                             </p>
                             <ExplorerLinks txId={txResult.txId} address={walletAddress ?? undefined} />

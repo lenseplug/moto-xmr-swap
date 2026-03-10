@@ -86,7 +86,7 @@ export default function App(): React.ReactElement {
                         marginTop: '8px',
                     }}
                 >
-                    Trustless atomic exchange — Bitcoin L1 to Monero
+                    Coordinator-mediated atomic swap — Bitcoin L1 to Monero
                 </p>
             </div>
 

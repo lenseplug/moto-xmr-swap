@@ -506,7 +506,7 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
                                     letterSpacing: '0.06em',
                                 }}
                             >
-                                Trustless
+                                Split-Key
                             </span>
                         )}
                     </div>

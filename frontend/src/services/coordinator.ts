@@ -191,7 +191,7 @@ export async function getAllCoordinatorStatuses(): Promise<CoordinatorStatus[]> 
  *
  * @param swapId - The swap ID as a decimal string
  * @param secret - The 64-char hex preimage
- * @param aliceViewKey - Optional Alice view key for trustless mode (64 hex chars)
+ * @param aliceViewKey - Optional Alice view key for split-key mode (64 hex chars)
  * @returns true if the secret was accepted
  */
 export async function submitSwapSecret(swapId: string, secret: string, aliceViewKey?: string): Promise<boolean> {
@@ -213,7 +213,7 @@ export async function submitSwapSecret(swapId: string, secret: string, aliceView
 }
 
 /**
- * Submits Bob's key material for a trustless swap.
+ * Submits Bob's key material for a split-key swap.
  *
  * @param swapId - The swap ID as a decimal string
  * @param keys - Bob's ed25519 public key, view key, and key proof-of-knowledge

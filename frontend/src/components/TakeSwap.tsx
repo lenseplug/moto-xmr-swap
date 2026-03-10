@@ -112,7 +112,7 @@ export function TakeSwap({ swapId, onBack, onTaken }: TakeSwapProps): React.Reac
                     bobKeyProof: uint8ArrayToHex(keyProof),
                 });
             } catch {
-                console.warn('Failed to submit Bob keys — coordinator may operate without trustless mode');
+                console.warn('Failed to submit Bob keys — coordinator may operate without split-key mode');
             }
 
             setStep('done');

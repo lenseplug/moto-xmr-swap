@@ -37,14 +37,16 @@ export async function generateSecretAndHashLock(): Promise<{
 }
 
 /**
- * Generates a trustless swap secret using ed25519 key generation.
+ * Generates a swap secret using ed25519 split-key generation.
  *
- * In trustless mode, Alice's ed25519 private spend key IS the secret.
+ * In split-key mode, Alice's ed25519 private spend key IS the secret.
  * hash_lock = SHA-256(spend_private_key).
  * A separate ed25519 view keypair is generated for monitoring.
  *
  * When Bob claims MOTO (revealing the preimage), the coordinator can reconstruct
  * the full Monero spend key: s_full = s_alice + s_bob.
+ *
+ * NOTE: The coordinator holds both key shares and is trusted with the XMR side.
  *
  * @returns The secret (hex), hashLock (bigint), view key (hex), and ed25519 pub key (hex).
  */
