@@ -12,3 +12,4 @@ frontend/dist/
 contract/build/
 .claude/
 build-result.json
+frontend/src/**/*.js

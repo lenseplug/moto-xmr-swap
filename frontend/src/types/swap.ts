@@ -81,6 +81,9 @@ export interface CoordinatorStatus {
     readonly xmrTotal?: string;
     readonly xmrLockAddress?: string;
     readonly xmrLockConfirmations?: number;
+    readonly trustlessMode?: boolean;
+    readonly aliceEd25519Pub?: string;
+    readonly bobEd25519Pub?: string;
     readonly updatedAt: number;
 }
 
@@ -113,6 +116,17 @@ export interface LocalSwapSecret {
     readonly secret: string;
     readonly hashLock: string;
     readonly createdAt: number;
+    /** Alice's ed25519 private view key for trustless mode. */
+    readonly aliceViewKey?: string;
+}
+
+/**
+ * Bob's key material for trustless atomic swap.
+ */
+export interface BobKeyMaterial {
+    readonly bobEd25519PubKey: string;
+    readonly bobViewKey: string;
+    readonly bobDleqProof: string;
 }
 
 /**

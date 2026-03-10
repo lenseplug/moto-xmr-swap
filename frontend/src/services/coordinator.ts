@@ -2,7 +2,7 @@
  * Coordinator REST client for XMR side of the atomic swap.
  * The coordinator handles Monero locking/unlocking off-chain.
  */
-import type { CoordinatorHealth, CoordinatorStatus } from '../types/swap';
+import type { BobKeyMaterial, CoordinatorHealth, CoordinatorStatus } from '../types/swap';
 
 const COORDINATOR_BASE = import.meta.env.VITE_COORDINATOR_URL;
 
@@ -92,14 +92,40 @@ export async function getAllCoordinatorStatuses(): Promise<CoordinatorStatus[]> 
  *
  * @param swapId - The swap ID as a decimal string
  * @param secret - The 64-char hex preimage
+ * @param aliceViewKey - Optional Alice view key for trustless mode (64 hex chars)
  * @returns true if the secret was accepted
  */
-export async function submitSwapSecret(swapId: string, secret: string): Promise<boolean> {
+export async function submitSwapSecret(swapId: string, secret: string, aliceViewKey?: string): Promise<boolean> {
     try {
+        const body: Record<string, string> = { secret };
+        if (aliceViewKey) {
+            body['aliceViewKey'] = aliceViewKey;
+        }
         const res = await fetch(`${COORDINATOR_BASE}/api/swaps/${swapId}/secret`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ secret }),
+            body: JSON.stringify(body),
+            signal: AbortSignal.timeout(10000),
+        });
+        return res.ok;
+    } catch {
+        return false;
+    }
+}
+
+/**
+ * Submits Bob's key material for a trustless swap.
+ *
+ * @param swapId - The swap ID as a decimal string
+ * @param keys - Bob's ed25519 public key, view key, and DLEQ proof
+ * @returns true if the keys were accepted
+ */
+export async function submitBobKeys(swapId: string, keys: BobKeyMaterial): Promise<boolean> {
+    try {
+        const res = await fetch(`${COORDINATOR_BASE}/api/swaps/${swapId}/keys`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(keys),
             signal: AbortSignal.timeout(10000),
         });
         return res.ok;

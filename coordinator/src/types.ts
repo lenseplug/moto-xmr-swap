@@ -96,6 +96,18 @@ export interface ISwapRecord {
     readonly xmr_lock_confirmations: number;
     readonly xmr_subaddr_index: number | null;
     readonly claim_token: string | null;
+    /** Trustless mode: swap uses cross-curve key exchange for shared Monero address. */
+    readonly trustless_mode: number;
+    /** Alice's ed25519 public spend key (64 hex chars). Derived from preimage in trustless mode. */
+    readonly alice_ed25519_pub: string | null;
+    /** Alice's ed25519 private view key (64 hex chars). */
+    readonly alice_view_key: string | null;
+    /** Bob's ed25519 public spend key (64 hex chars). */
+    readonly bob_ed25519_pub: string | null;
+    /** Bob's ed25519 private view key (64 hex chars). */
+    readonly bob_view_key: string | null;
+    /** Bob's DLEQ proof (hex). */
+    readonly bob_dleq_proof: string | null;
     readonly created_at: string;
     readonly updated_at: string;
 }
@@ -126,6 +138,12 @@ export interface IUpdateSwapParams {
     readonly xmr_address?: string;
     readonly xmr_subaddr_index?: number;
     readonly claim_token?: string | null;
+    readonly trustless_mode?: number;
+    readonly alice_ed25519_pub?: string;
+    readonly alice_view_key?: string;
+    readonly bob_ed25519_pub?: string;
+    readonly bob_view_key?: string;
+    readonly bob_dleq_proof?: string;
 }
 
 /** A state history entry. */

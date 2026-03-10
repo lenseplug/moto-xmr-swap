@@ -196,6 +196,30 @@ export class StorageService {
             setClauses.push('claim_token = ?');
             values.push(updates.claim_token);
         }
+        if (updates.trustless_mode !== undefined) {
+            setClauses.push('trustless_mode = ?');
+            values.push(updates.trustless_mode);
+        }
+        if (updates.alice_ed25519_pub !== undefined) {
+            setClauses.push('alice_ed25519_pub = ?');
+            values.push(updates.alice_ed25519_pub);
+        }
+        if (updates.alice_view_key !== undefined) {
+            setClauses.push('alice_view_key = ?');
+            values.push(updates.alice_view_key);
+        }
+        if (updates.bob_ed25519_pub !== undefined) {
+            setClauses.push('bob_ed25519_pub = ?');
+            values.push(updates.bob_ed25519_pub);
+        }
+        if (updates.bob_view_key !== undefined) {
+            setClauses.push('bob_view_key = ?');
+            values.push(updates.bob_view_key);
+        }
+        if (updates.bob_dleq_proof !== undefined) {
+            setClauses.push('bob_dleq_proof = ?');
+            values.push(updates.bob_dleq_proof);
+        }
 
         if (setClauses.length > 1) {
             values.push(swapId);
@@ -303,6 +327,13 @@ export class StorageService {
         // Migrations: add columns if missing (existing DBs)
         this.migrateAddColumn('swaps', 'claim_token', 'TEXT');
         this.migrateAddColumn('swaps', 'xmr_subaddr_index', 'INTEGER');
+        // Trustless mode columns
+        this.migrateAddColumnWithDefault('swaps', 'trustless_mode', 'INTEGER', '0');
+        this.migrateAddColumn('swaps', 'alice_ed25519_pub', 'TEXT');
+        this.migrateAddColumn('swaps', 'alice_view_key', 'TEXT');
+        this.migrateAddColumn('swaps', 'bob_ed25519_pub', 'TEXT');
+        this.migrateAddColumn('swaps', 'bob_view_key', 'TEXT');
+        this.migrateAddColumn('swaps', 'bob_dleq_proof', 'TEXT');
 
         this.saveTimer = setInterval(() => {
             this.persistToDisk();
@@ -312,6 +343,14 @@ export class StorageService {
     private migrateAddColumn(table: string, column: string, type: string): void {
         try {
             this.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+        } catch {
+            // Column already exists — ignore
+        }
+    }
+
+    private migrateAddColumnWithDefault(table: string, column: string, type: string, defaultVal: string): void {
+        try {
+            this.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type} DEFAULT ${defaultVal}`);
         } catch {
             // Column already exists — ignore
         }

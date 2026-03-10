@@ -17,6 +17,7 @@ import {
     handleGetFeeAddress,
     handleSetFeeAddress,
     handleSubmitSecret,
+    handleSubmitKeys,
 } from './routes/swaps.js';
 import { type ISwapRecord, SwapStatus } from './types.js';
 import {
@@ -24,6 +25,7 @@ import {
     notifyXmrConfirmed,
     type IMoneroService,
 } from './monero-module.js';
+import { computeSharedMoneroAddress } from './crypto/index.js';
 
 const PORT = parseInt(process.env['PORT'] ?? '3001', 10);
 const DB_PATH = process.env['DB_PATH'] ?? 'coordinator.db';
@@ -181,6 +183,17 @@ function matchRoute(
         return { route: 'submit_secret', params: { id: part2 } };
     }
 
+    if (
+        parts.length === 4 &&
+        part0 === 'api' &&
+        part1 === 'swaps' &&
+        part3 === 'keys' &&
+        method === 'POST' &&
+        part2 !== undefined
+    ) {
+        return { route: 'submit_keys', params: { id: part2 } };
+    }
+
     return null;
 }
 
@@ -300,6 +313,18 @@ function startXmrLocking(
         return;
     }
 
+    // Trustless mode: need both Alice's and Bob's keys before proceeding
+    if (swap.trustless_mode === 1) {
+        if (!swap.alice_ed25519_pub || !swap.alice_view_key) {
+            console.warn(`[XMR Locking] Trustless swap ${swapId} missing Alice's key material — waiting`);
+            return;
+        }
+        if (!swap.bob_ed25519_pub || !swap.bob_view_key) {
+            console.warn(`[XMR Locking] Trustless swap ${swapId} missing Bob's key material — waiting`);
+            return;
+        }
+    }
+
     xmrLockingInProgress.add(swapId);
 
     // Safety check: refuse to start XMR locking if HTLC timelock is too tight.
@@ -331,16 +356,37 @@ function startXmrLocking(
 
     void (async (): Promise<void> => {
         try {
-            // Generate XMR lock address
-            const lockResult = await moneroService.createLockAddress(swapId);
-            const xmrLockAddress = lockResult.address;
+            let xmrLockAddress: string;
+            let subaddrIndex: number | undefined;
 
-            // Set xmr_lock_tx to 'pending' to satisfy the state guard, plus store the address and subaddr index
+            if (swap.trustless_mode === 1 && swap.alice_ed25519_pub && swap.alice_view_key && swap.bob_ed25519_pub && swap.bob_view_key) {
+                // Trustless mode: compute shared Monero address from split keys
+                const aliceSpendPub = hexToUint8(swap.alice_ed25519_pub);
+                const bobSpendPub = hexToUint8(swap.bob_ed25519_pub);
+                const aliceViewPriv = hexToUint8(swap.alice_view_key);
+                const bobViewPriv = hexToUint8(swap.bob_view_key);
+
+                const moneroNetwork = (process.env['MONERO_NETWORK'] ?? 'stagenet') as 'mainnet' | 'stagenet';
+                const shared = computeSharedMoneroAddress(
+                    aliceSpendPub, bobSpendPub,
+                    aliceViewPriv, bobViewPriv,
+                    moneroNetwork,
+                );
+                xmrLockAddress = shared.address;
+                console.log(`[XMR Locking] Trustless swap ${swapId} — shared address: ${xmrLockAddress.slice(0, 12)}...`);
+            } else {
+                // Standard mode: generate address from wallet RPC
+                const lockResult = await moneroService.createLockAddress(swapId);
+                xmrLockAddress = lockResult.address;
+                subaddrIndex = lockResult.subaddrIndex;
+            }
+
+            // Set xmr_lock_tx to 'pending' to satisfy the state guard, plus store the address
             storage.updateSwap(swapId, {
                 xmr_lock_tx: 'pending',
                 xmr_address: xmrLockAddress,
-                xmr_subaddr_index: lockResult.subaddrIndex,
-            });
+                ...(subaddrIndex !== undefined ? { xmr_subaddr_index: subaddrIndex } : {}),
+            } as import('./types.js').IUpdateSwapParams);
 
             // Validate and transition TAKEN → XMR_LOCKING
             const updated = storage.getSwap(swapId);
@@ -561,6 +607,43 @@ async function main(): Promise<void> {
                 break;
             }
 
+            case 'submit_keys': {
+                const id = match.params['id'];
+                if (!id) {
+                    notFound(res);
+                    break;
+                }
+                handleSubmitKeys(req, res, storage, id)
+                    .then(() => {
+                        // After Bob submits keys for a trustless swap that's TAKEN
+                        // with a preimage, trigger XMR locking
+                        if (wsServer) {
+                            const swap = storage.getSwap(id);
+                            if (
+                                swap &&
+                                swap.status === SwapStatus.TAKEN &&
+                                swap.preimage &&
+                                swap.trustless_mode === 1 &&
+                                swap.bob_ed25519_pub
+                            ) {
+                                startXmrLocking(
+                                    id,
+                                    storage,
+                                    stateMachine,
+                                    moneroService,
+                                    wsServer,
+                                    () => watcher.getCurrentBlock(),
+                                );
+                            }
+                        }
+                    })
+                    .catch((err: unknown) => {
+                        const msg = err instanceof Error ? err.message : 'Unknown error';
+                        serverError(res, msg);
+                    });
+                break;
+            }
+
             default:
                 notFound(res);
         }
@@ -681,6 +764,23 @@ function recoverInterruptedSwaps(
             }
         }
     }
+}
+
+/** Converts a hex string to Uint8Array. */
+function hexToUint8(hex: string): Uint8Array {
+    const bytes = new Uint8Array(hex.length / 2);
+    for (let i = 0; i < bytes.length; i++) {
+        const hi = hex.charCodeAt(i * 2);
+        const lo = hex.charCodeAt(i * 2 + 1);
+        bytes[i] = (hexNibble(hi) << 4) | hexNibble(lo);
+    }
+    return bytes;
+}
+
+function hexNibble(c: number): number {
+    if (c >= 48 && c <= 57) return c - 48;
+    if (c >= 97 && c <= 102) return c - 87;
+    return 0;
 }
 
 main().catch((err: unknown) => {

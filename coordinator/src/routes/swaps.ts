@@ -19,6 +19,7 @@ import {
 import { StorageService } from '../storage.js';
 import { randomBytes } from 'node:crypto';
 import { getFeeAddress, setFeeAddress, verifyPreimage } from '../monero-module.js';
+import { ed25519PublicFromPrivate, verifyCrossCurveDleq } from '../crypto/index.js';
 
 /** Returns a structured success response. */
 function success<T>(data: T): IApiResponse<T> {
@@ -93,8 +94,8 @@ function parsePagination(url: URL): IPaginationParams {
  * Strips sensitive fields (preimage) from a swap record before sending to clients.
  * The preimage is ONLY delivered via WebSocket, never via HTTP.
  */
-function sanitizeSwapForApi(swap: ISwapRecord): Omit<ISwapRecord, 'preimage' | 'claim_token'> & { preimage: null; claim_token: null } {
-    return { ...swap, preimage: null, claim_token: null };
+function sanitizeSwapForApi(swap: ISwapRecord): Omit<ISwapRecord, 'preimage' | 'claim_token' | 'alice_view_key' | 'bob_view_key'> & { preimage: null; claim_token: null; alice_view_key: null; bob_view_key: null } {
+    return { ...swap, preimage: null, claim_token: null, alice_view_key: null, bob_view_key: null };
 }
 
 /** Handler: GET /api/health */
@@ -253,6 +254,7 @@ export async function handleSubmitSecret(
     }
 
     let secret: string;
+    let aliceViewKey: string | undefined;
     try {
         const parsed = await readBody(req);
         if (
@@ -265,6 +267,11 @@ export async function handleSubmitSecret(
             return;
         }
         secret = (parsed as { secret: string }).secret.trim().toLowerCase();
+        // Optional: Alice's view key for trustless mode
+        const candidate = parsed as Record<string, unknown>;
+        if (typeof candidate['aliceViewKey'] === 'string') {
+            aliceViewKey = candidate['aliceViewKey'].trim().toLowerCase();
+        }
     } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : 'Invalid request';
         jsonResponse(res, 400, fail('INVALID_BODY', msg));
@@ -274,6 +281,12 @@ export async function handleSubmitSecret(
     // Validate format: 64 hex characters
     if (!/^[0-9a-f]{64}$/.test(secret)) {
         jsonResponse(res, 400, fail('VALIDATION', 'Secret must be exactly 64 hex characters'));
+        return;
+    }
+
+    // Validate view key format if provided
+    if (aliceViewKey !== undefined && !/^[0-9a-f]{64}$/.test(aliceViewKey)) {
+        jsonResponse(res, 400, fail('VALIDATION', 'aliceViewKey must be exactly 64 hex characters'));
         return;
     }
 
@@ -290,7 +303,7 @@ export async function handleSubmitSecret(
     // Idempotent: if same preimage is already stored, return success
     if (swap.preimage !== null && swap.preimage.length > 0) {
         if (swap.preimage === secret) {
-            jsonResponse(res, 200, success({ stored: true }));
+            jsonResponse(res, 200, success({ stored: true, trustless: swap.trustless_mode === 1 }));
             return;
         }
         // Different preimage for same swap — reject
@@ -298,11 +311,25 @@ export async function handleSubmitSecret(
         return;
     }
 
-    // Store the preimage
-    storage.updateSwap(swapId, { preimage: secret });
+    // Build update params
+    const updateParams: Record<string, string | number | null> = { preimage: secret };
+
+    // If Alice provides a view key, enable trustless mode and derive her ed25519 pub from the secret
+    if (aliceViewKey) {
+        const secretBytes = hexToBytes(secret);
+        const alicePub = ed25519PublicFromPrivate(secretBytes);
+        const alicePubHex = bytesToHex(alicePub);
+        updateParams['trustless_mode'] = 1;
+        updateParams['alice_ed25519_pub'] = alicePubHex;
+        updateParams['alice_view_key'] = aliceViewKey;
+        console.log(`[Routes] Trustless mode enabled for swap ${swapId} (Alice pub: ${alicePubHex.slice(0, 16)}...)`);
+    }
+
+    // Store the preimage (and trustless fields if present)
+    storage.updateSwap(swapId, updateParams as import('../types.js').IUpdateSwapParams);
     console.log(`[Routes] Secret stored for swap ${swapId}`);
 
-    jsonResponse(res, 200, success({ stored: true }));
+    jsonResponse(res, 200, success({ stored: true, trustless: !!aliceViewKey }));
 }
 
 /** Handler: POST /api/swaps (create a new swap record — coordinator internal use) */
@@ -451,4 +478,137 @@ export async function handleSetFeeAddress(
         const message = err instanceof Error ? err.message : 'Validation error';
         jsonResponse(res, 400, fail('VALIDATION', message));
     }
+}
+
+/**
+ * Handler: POST /api/swaps/:id/keys
+ *
+ * Accepts Bob's key material for trustless mode:
+ *   { bobEd25519PubKey: string, bobViewKey: string, bobDleqProof: string }
+ *
+ * The swap must already be in trustless mode (Alice submitted aliceViewKey with secret).
+ * Once Bob's keys are stored, the coordinator can compute the shared Monero address.
+ */
+export async function handleSubmitKeys(
+    req: IncomingMessage,
+    res: ServerResponse,
+    storage: StorageService,
+    swapId: string,
+): Promise<void> {
+    const swap = storage.getSwap(swapId);
+    if (!swap) {
+        jsonResponse(res, 404, fail('NOT_FOUND', `Swap ${swapId} not found`));
+        return;
+    }
+
+    // Must be in trustless mode
+    if (swap.trustless_mode !== 1) {
+        jsonResponse(res, 409, fail('NOT_TRUSTLESS', 'Swap is not in trustless mode — Alice must submit aliceViewKey with secret first'));
+        return;
+    }
+
+    // Only accept keys when swap is TAKEN or later pre-XMR states
+    const ACCEPT_KEYS_STATES = new Set([
+        SwapStatus.TAKEN,
+        SwapStatus.XMR_LOCKING,
+        SwapStatus.XMR_LOCKED,
+    ]);
+    if (!ACCEPT_KEYS_STATES.has(swap.status)) {
+        jsonResponse(res, 409, fail('INVALID_STATE', `Swap is in state ${swap.status} — cannot accept keys`));
+        return;
+    }
+
+    // Reject if Bob's keys are already set
+    if (swap.bob_ed25519_pub && swap.bob_ed25519_pub.length > 0) {
+        jsonResponse(res, 200, success({ stored: true, message: 'Bob keys already stored' }));
+        return;
+    }
+
+    let bobPub: string;
+    let bobViewKey: string;
+    let bobDleqProof: string;
+    try {
+        const parsed = await readBody(req);
+        const candidate = parsed as Record<string, unknown>;
+        if (
+            typeof candidate['bobEd25519PubKey'] !== 'string' ||
+            typeof candidate['bobViewKey'] !== 'string' ||
+            typeof candidate['bobDleqProof'] !== 'string'
+        ) {
+            jsonResponse(res, 400, fail('VALIDATION', 'Required: bobEd25519PubKey, bobViewKey, bobDleqProof (all hex strings)'));
+            return;
+        }
+        bobPub = candidate['bobEd25519PubKey'].trim().toLowerCase();
+        bobViewKey = candidate['bobViewKey'].trim().toLowerCase();
+        bobDleqProof = candidate['bobDleqProof'].trim().toLowerCase();
+    } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : 'Invalid request';
+        jsonResponse(res, 400, fail('INVALID_BODY', msg));
+        return;
+    }
+
+    // Validate formats: 64 hex chars for keys, variable length for proof
+    if (!/^[0-9a-f]{64}$/.test(bobPub)) {
+        jsonResponse(res, 400, fail('VALIDATION', 'bobEd25519PubKey must be exactly 64 hex characters'));
+        return;
+    }
+    if (!/^[0-9a-f]{64}$/.test(bobViewKey)) {
+        jsonResponse(res, 400, fail('VALIDATION', 'bobViewKey must be exactly 64 hex characters'));
+        return;
+    }
+    if (bobDleqProof.length > 0 && !/^[0-9a-f]*$/.test(bobDleqProof)) {
+        jsonResponse(res, 400, fail('VALIDATION', 'bobDleqProof must be hex-encoded'));
+        return;
+    }
+
+    // V1: DLEQ verification is a placeholder (accepts all proofs)
+    // V2 will verify the cross-curve DLEQ proof here
+    const proofBytes = bobDleqProof.length > 0 ? hexToBytes(bobDleqProof) : new Uint8Array(0);
+    const pubBytes = hexToBytes(bobPub);
+    if (!verifyCrossCurveDleq(pubBytes, new Uint8Array(33), proofBytes)) {
+        jsonResponse(res, 400, fail('DLEQ_INVALID', 'Cross-curve DLEQ proof verification failed'));
+        return;
+    }
+
+    // Store Bob's key material
+    storage.updateSwap(swapId, {
+        bob_ed25519_pub: bobPub,
+        bob_view_key: bobViewKey,
+        bob_dleq_proof: bobDleqProof,
+    });
+    console.log(`[Routes] Bob's keys stored for trustless swap ${swapId} (pub: ${bobPub.slice(0, 16)}...)`);
+
+    jsonResponse(res, 200, success({ stored: true }));
+}
+
+// ---------------------------------------------------------------------------
+// Hex conversion helpers
+// ---------------------------------------------------------------------------
+
+function hexToBytes(hex: string): Uint8Array {
+    const bytes = new Uint8Array(hex.length / 2);
+    for (let i = 0; i < bytes.length; i++) {
+        const hi = hex.charCodeAt(i * 2);
+        const lo = hex.charCodeAt(i * 2 + 1);
+        bytes[i] = (hexCharToNibble(hi) << 4) | hexCharToNibble(lo);
+    }
+    return bytes;
+}
+
+function hexCharToNibble(c: number): number {
+    // 0-9: 48-57, a-f: 97-102
+    if (c >= 48 && c <= 57) return c - 48;
+    if (c >= 97 && c <= 102) return c - 87;
+    return 0;
+}
+
+function bytesToHex(bytes: Uint8Array): string {
+    let hex = '';
+    for (let i = 0; i < bytes.length; i++) {
+        const b = bytes[i];
+        if (b !== undefined) {
+            hex += b.toString(16).padStart(2, '0');
+        }
+    }
+    return hex;
 }
