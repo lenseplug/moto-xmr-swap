@@ -453,9 +453,12 @@ function startXmrLocking(
 }
 
 async function main(): Promise<void> {
-    // Warn about missing admin key
+    // Validate admin key
     if (ADMIN_API_KEY.length === 0) {
         console.warn('[Coordinator] *** WARNING *** ADMIN_API_KEY is not set. Admin endpoints (POST /api/swaps, PUT /api/fee-address) will reject all requests.');
+    } else if (ADMIN_API_KEY.length < 32) {
+        console.error('[Coordinator] ADMIN_API_KEY must be at least 32 characters. Refusing to start with a weak key.');
+        process.exit(1);
     }
 
     const storage = await StorageService.getInstance(DB_PATH);

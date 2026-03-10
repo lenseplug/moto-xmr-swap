@@ -63,7 +63,12 @@ const SWAP_VAULT_ABI: BitcoinInterfaceAbi = [
     ...OP_NET_ABI,
 ] as unknown as BitcoinInterfaceAbi;
 
-/** Maps on-chain numeric status values to coordinator SwapStatus. */
+/**
+ * Maps on-chain numeric status values to coordinator SwapStatus.
+ * On-chain status 2 = "claimed by counterparty" maps to MOTO_CLAIMING
+ * (not COMPLETED). COMPLETED is a coordinator-only terminal state that
+ * requires additional processing (e.g., Alice sweeping XMR).
+ */
 function mapOnChainStatus(raw: bigint): SwapStatus {
     switch (raw) {
         case 0n:
@@ -71,7 +76,7 @@ function mapOnChainStatus(raw: bigint): SwapStatus {
         case 1n:
             return SwapStatus.TAKEN;
         case 2n:
-            return SwapStatus.COMPLETED;
+            return SwapStatus.MOTO_CLAIMING;
         case 3n:
             return SwapStatus.REFUNDED;
         default:
@@ -112,6 +117,9 @@ export class OpnetWatcher {
     private pollTimer: NodeJS.Timeout | null = null;
     private running = false;
     private lastKnownSwapCount: bigint = 0n;
+
+    /** Cached contract instance to avoid recreation on every poll. */
+    private cachedContract: ISwapVaultContract | null = null;
 
     public constructor(storage: StorageService, stateMachine: SwapStateMachine) {
         this.storage = storage;
@@ -171,14 +179,17 @@ export class OpnetWatcher {
         }, POLL_INTERVAL_MS);
     }
 
-    /** Returns a typed SwapVault contract instance. */
+    /** Returns a cached, typed SwapVault contract instance. */
     private getSwapContract(): ISwapVaultContract {
-        return getContract<ISwapVaultContract>(
-            CONTRACT_ADDRESS,
-            SWAP_VAULT_ABI,
-            this.provider,
-            networks.opnetTestnet,
-        );
+        if (!this.cachedContract) {
+            this.cachedContract = getContract<ISwapVaultContract>(
+                CONTRACT_ADDRESS,
+                SWAP_VAULT_ABI,
+                this.provider,
+                networks.opnetTestnet,
+            );
+        }
+        return this.cachedContract;
     }
 
     private async checkForNewSwaps(): Promise<void> {
@@ -326,10 +337,10 @@ export class OpnetWatcher {
 
         // Don't regress coordinator-managed intermediate states.
         // The on-chain contract maps TAKEN for all of XMR_LOCKING/XMR_LOCKED/MOTO_CLAIMING.
-        // Allow COMPLETED/REFUNDED to pass through (terminal transitions from on-chain).
+        // Allow MOTO_CLAIMING/REFUNDED to pass through (terminal transitions from on-chain).
         if (
             OpnetWatcher.COORDINATOR_ONLY_STATES.has(existing.status) &&
-            onChainMappedStatus !== SwapStatus.COMPLETED &&
+            onChainMappedStatus !== SwapStatus.MOTO_CLAIMING &&
             onChainMappedStatus !== SwapStatus.REFUNDED
         ) {
             return;
@@ -348,12 +359,17 @@ export class OpnetWatcher {
             ? { status: onChainMappedStatus, counterparty: onChain.counterparty }
             : { status: onChainMappedStatus };
 
-        // Set claim/refund TX markers for terminal transitions so state machine guards are satisfied
-        if (onChainMappedStatus === SwapStatus.COMPLETED && !existing.opnet_claim_tx) {
-            this.storage.updateSwap(swapIdStr, { opnet_claim_tx: 'on-chain-confirmed' });
-        }
+        // Set refund TX marker for terminal transitions so state machine guards are satisfied
         if (onChainMappedStatus === SwapStatus.REFUNDED && !existing.opnet_refund_tx) {
             this.storage.updateSwap(swapIdStr, { opnet_refund_tx: 'on-chain-confirmed' });
+        }
+
+        // On-chain CLAIMED (status 2) → MOTO_CLAIMING, then immediately → COMPLETED.
+        // Set opnet_claim_tx to satisfy the COMPLETED guard.
+        if (onChainMappedStatus === SwapStatus.MOTO_CLAIMING) {
+            if (!existing.opnet_claim_tx) {
+                this.storage.updateSwap(swapIdStr, { opnet_claim_tx: 'on-chain-confirmed' });
+            }
         }
 
         const updated = this.storage.updateSwap(swapIdStr, updates, prevStatus);
@@ -361,6 +377,22 @@ export class OpnetWatcher {
         console.log(
             `[OPNet Watcher] Swap ${swapIdStr}: ${prevStatus} → ${onChainMappedStatus}`,
         );
+
+        // After transitioning to MOTO_CLAIMING, immediately transition to COMPLETED.
+        // On-chain CLAIMED means the claim TX is confirmed — the swap is done.
+        if (onChainMappedStatus === SwapStatus.MOTO_CLAIMING) {
+            const current = this.storage.getSwap(swapIdStr);
+            if (current && this.stateMachine.canTransition(SwapStatus.MOTO_CLAIMING, SwapStatus.COMPLETED)) {
+                const completed = this.storage.updateSwap(
+                    swapIdStr,
+                    { status: SwapStatus.COMPLETED },
+                    SwapStatus.MOTO_CLAIMING,
+                    'On-chain claim confirmed',
+                );
+                this.stateMachine.notifyTransition(completed, SwapStatus.MOTO_CLAIMING, SwapStatus.COMPLETED);
+                console.log(`[OPNet Watcher] Swap ${swapIdStr}: MOTO_CLAIMING → COMPLETED (on-chain confirmed)`);
+            }
+        }
     }
 
     /**
