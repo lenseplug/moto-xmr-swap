@@ -539,8 +539,9 @@ export class RealMoneroService implements IMoneroService {
 export function createMoneroService(): IMoneroService {
     const useMock = (process.env['MONERO_MOCK'] ?? 'false').toLowerCase() === 'true';
     if (useMock) {
-        if (process.env['NODE_ENV'] === 'production') {
-            throw new Error('MONERO_MOCK=true is forbidden in production (NODE_ENV=production)');
+        const requireTls = (process.env['REQUIRE_TLS'] ?? 'false').toLowerCase() === 'true';
+        if (process.env['NODE_ENV'] === 'production' || requireTls) {
+            throw new Error('MONERO_MOCK=true is forbidden in production (NODE_ENV=production or REQUIRE_TLS=true)');
         }
         console.warn('[Monero] *** MOCK MODE *** Using MockMoneroService (MONERO_MOCK=true)');
         return new MockMoneroService();
