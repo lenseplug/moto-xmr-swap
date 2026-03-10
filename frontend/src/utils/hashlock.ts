@@ -3,6 +3,7 @@
  * Uses SHA-256 (Bitcoin's hash function, not Keccak-256).
  * All operations use Uint8Array — never Buffer.
  */
+import { generateEd25519KeyPair } from './ed25519';
 import type { LocalSwapSecret } from '../types/swap';
 
 const LOCAL_SECRETS_KEY = 'moto_xmr_swap_secrets';
@@ -28,6 +29,42 @@ export async function generateSecretAndHashLock(): Promise<{
     const hashLock = BigInt('0x' + hashHex);
 
     return { secret: secretHex, hashLock, hashLockHex: hashHex };
+}
+
+/**
+ * Generates a trustless swap secret using ed25519 key generation.
+ *
+ * In trustless mode, Alice's ed25519 private spend key IS the secret.
+ * hash_lock = SHA-256(spend_private_key).
+ * A separate ed25519 view keypair is generated for monitoring.
+ *
+ * When Bob claims MOTO (revealing the preimage), the coordinator can reconstruct
+ * the full Monero spend key: s_full = s_alice + s_bob.
+ *
+ * @returns The secret (hex), hashLock (bigint), view key (hex), and ed25519 pub key (hex).
+ */
+export async function generateTrustlessSecret(): Promise<{
+    readonly secret: string;
+    readonly hashLock: bigint;
+    readonly hashLockHex: string;
+    readonly aliceViewKey: string;
+    readonly aliceEd25519Pub: string;
+}> {
+    // Generate Alice's spend keypair — private key is the HTLC preimage
+    const spendKeyPair = generateEd25519KeyPair();
+    const secret = uint8ArrayToHex(spendKeyPair.privateKey);
+    const aliceEd25519Pub = uint8ArrayToHex(spendKeyPair.publicKey);
+
+    // Generate Alice's view keypair — shared with coordinator for XMR monitoring
+    const viewKeyPair = generateEd25519KeyPair();
+    const aliceViewKey = uint8ArrayToHex(viewKeyPair.privateKey);
+
+    // hash_lock = SHA-256(spend_private_key)
+    const hashBytes = await crypto.subtle.digest('SHA-256', spendKeyPair.privateKey.buffer as ArrayBuffer);
+    const hashHex = uint8ArrayToHex(new Uint8Array(hashBytes));
+    const hashLock = BigInt('0x' + hashHex);
+
+    return { secret, hashLock, hashLockHex: hashHex, aliceViewKey, aliceEd25519Pub };
 }
 
 /**
@@ -84,13 +121,19 @@ export function secretHexToBigint(secretHex: string): bigint {
  * @param secret - The secret preimage hex
  * @param hashLock - The hash lock hex
  */
-export function saveLocalSwapSecret(swapId: string, secret: string, hashLock: string): void {
+export function saveLocalSwapSecret(
+    swapId: string,
+    secret: string,
+    hashLock: string,
+    aliceViewKey?: string,
+): void {
     const secrets = loadLocalSwapSecrets();
     const entry: LocalSwapSecret = {
         swapId,
         secret,
         hashLock,
         createdAt: Date.now(),
+        ...(aliceViewKey !== undefined ? { aliceViewKey } : {}),
     };
     secrets.push(entry);
     localStorage.setItem(LOCAL_SECRETS_KEY, JSON.stringify(secrets));

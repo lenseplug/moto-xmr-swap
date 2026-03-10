@@ -13,3 +13,4 @@ contract/build/
 .claude/
 build-result.json
 frontend/src/**/*.js
+frontend/vite.config.js

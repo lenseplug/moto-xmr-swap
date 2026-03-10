@@ -107,8 +107,8 @@ export class SwapWebSocketServer {
      * @param swap - The updated swap record.
      */
     public broadcastSwapUpdate(swap: ISwapRecord): void {
-        // Sanitize: strip preimage and claim_token from public broadcast
-        const sanitized = { ...swap, preimage: null, claim_token: null };
+        // Sanitize: strip secrets from public broadcast
+        const sanitized = { ...swap, preimage: null, claim_token: null, alice_view_key: null, bob_view_key: null };
         const message: IWsMessage = { type: 'swap_update', data: sanitized };
         this.broadcast(message);
     }
@@ -174,8 +174,8 @@ export class SwapWebSocketServer {
         });
 
         const activeSwaps = this.storage.getActiveSwaps();
-        // Sanitize: strip preimage and claim_token from public broadcast
-        const sanitized = activeSwaps.map((s) => ({ ...s, preimage: null, claim_token: null }));
+        // Sanitize: strip secrets from public broadcast
+        const sanitized = activeSwaps.map((s) => ({ ...s, preimage: null, claim_token: null, alice_view_key: null, bob_view_key: null }));
         const initMsg: IWsMessage = { type: 'active_swaps', data: sanitized };
         this.sendToClient(ws, initMsg);
 

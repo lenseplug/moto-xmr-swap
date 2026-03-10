@@ -5,7 +5,7 @@ import React, { useState, useCallback } from 'react';
 import { useWalletConnect } from '@btc-vision/walletconnect';
 import { networks } from '@btc-vision/bitcoin';
 import { getSwapVaultContract, getMotoContract, parseMotoAmount, parseXmrAmount, splitXmrAddress, getProvider } from '../services/opnet';
-import { generateSecretAndHashLock, saveLocalSwapSecret, secretHexToBigint } from '../utils/hashlock';
+import { generateTrustlessSecret, saveLocalSwapSecret, secretHexToBigint } from '../utils/hashlock';
 import { submitSwapSecret } from '../services/coordinator';
 import { PrivacyBanner } from './PrivacyBanner';
 import { ExplorerLinks } from './ExplorerLinks';
@@ -147,11 +147,11 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
                 await new Promise<void>((r) => setTimeout(r, 3000));
             }
 
-            // Step 3: Generate secret + hash-lock
+            // Step 3: Generate trustless ed25519 keys + hash-lock
             setStep('creating');
-            setStatusMessage('Generating hash-lock...');
+            setStatusMessage('Generating trustless keys...');
 
-            const { secret, hashLock, hashLockHex } = await generateSecretAndHashLock();
+            const { secret, hashLock, hashLockHex, aliceViewKey } = await generateTrustlessSecret();
 
             // Step 4: Encode XMR address
             const xmrHex = form.xmrAddress.trim();
@@ -222,13 +222,13 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
                 }
             }
 
-            // Store secret locally
-            saveLocalSwapSecret(swapId.toString(), secret, hashLockHex);
+            // Store secret + view key locally
+            saveLocalSwapSecret(swapId.toString(), secret, hashLockHex, aliceViewKey);
             void secretHexToBigint(secret);
 
-            // Submit secret to coordinator (non-fatal if it fails — SwapStatus retries)
+            // Submit secret + view key to coordinator (non-fatal if it fails — SwapStatus retries)
             try {
-                await submitSwapSecret(swapId.toString(), secret);
+                await submitSwapSecret(swapId.toString(), secret, aliceViewKey);
             } catch {
                 console.warn('Failed to submit secret to coordinator — will retry on status page');
             }
@@ -277,7 +277,7 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
                     Create Swap
                 </h2>
                 <p style={{ fontSize: '0.875rem', color: 'var(--color-text-secondary)' }}>
-                    Offer MOTO tokens in exchange for Monero. A hash-time lock is generated locally.
+                    Offer MOTO tokens in exchange for Monero. Trustless ed25519 keys are generated locally.
                 </p>
             </div>
 
@@ -473,7 +473,7 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
                                     marginTop: '6px',
                                 }}
                             >
-                                Your secret has been saved locally. Do not clear localStorage until the swap is
+                                Trustless keys saved locally. Do not clear localStorage until the swap is
                                 complete.
                             </p>
                             <ExplorerLinks txId={txResult.txId} address={walletAddress ?? undefined} />

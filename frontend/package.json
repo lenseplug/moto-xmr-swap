@@ -10,11 +10,12 @@
         "typecheck": "tsc --noEmit"
     },
     "dependencies": {
-        "@btc-vision/bitcoin": "rc",
         "@btc-vision/bip32": "latest",
+        "@btc-vision/bitcoin": "rc",
         "@btc-vision/ecpair": "latest",
         "@btc-vision/transaction": "rc",
         "@btc-vision/walletconnect": "latest",
+        "@noble/curves": "^2.0.1",
         "opnet": "rc",
         "react": "^19.0.0",
         "react-dom": "^19.0.0"

@@ -234,12 +234,12 @@ export async function handleSubmitSecret(
         return;
     }
 
-    // Only accept secrets for swaps that have been taken.
-    // OPEN is rejected — storing the preimage before anyone takes the swap
-    // increases exposure window if the database is compromised.
-    // TAKEN: normal submission flow.
-    // XMR_LOCKING/XMR_LOCKED: allow re-submission (preimage already stored — idempotent).
+    // Accept secrets for OPEN (Alice submits right after creation), TAKEN (normal flow),
+    // and later pre-claim states (idempotent re-submission).
+    // In trustless mode, the preimage alone doesn't enable theft without
+    // also calling claim() on-chain, so early storage is acceptable.
     const ACCEPT_SECRET_STATES = new Set([
+        SwapStatus.OPEN,
         SwapStatus.TAKEN,
         SwapStatus.XMR_LOCKING,
         SwapStatus.XMR_LOCKED,

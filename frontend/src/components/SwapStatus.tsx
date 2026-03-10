@@ -64,20 +64,21 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
     // Combined preimage: prefer local secret, fall back to WebSocket preimage
     const claimablePreimage = localSecret?.secret ?? wsPreimage;
 
-    // Retry submitting secret to coordinator if we have it locally but coordinator may not
+    // Retry submitting secret to coordinator if we have it locally but coordinator may not.
+    // Only mark as retried if the submission actually succeeds.
     const secretRetried = useRef(false);
     useEffect(() => {
         if (secretRetried.current) return;
         if (!localSecret) return;
 
-        // If the coordinator doesn't have the preimage, try to submit it
+        // If the coordinator doesn't have the preimage, try to submit it.
+        // Submit on 'created' or 'taken' — coordinator accepts OPEN and TAKEN states.
         if (coordinatorStatus !== null) {
-            // coordinatorStatus comes from the GET endpoint (preimage is null there)
-            // Submit if swap is OPEN or TAKEN — coordinator will check for dupes
             const step = coordinatorStatus.step;
             if (step === 'created' || step === 'taken') {
-                secretRetried.current = true;
-                void submitSwapSecret(swapId.toString(), localSecret.secret);
+                void submitSwapSecret(swapId.toString(), localSecret.secret, localSecret.aliceViewKey).then((ok) => {
+                    if (ok) secretRetried.current = true;
+                });
             }
         }
     }, [localSecret, coordinatorStatus, swapId]);
@@ -477,9 +478,28 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
                         fontSize: '0.875rem',
                     }}
                 >
-                    <p style={{ fontWeight: 600, color: 'rgba(200, 180, 255, 0.9)', marginBottom: '4px' }}>
-                        Coordinator Update
-                    </p>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px' }}>
+                        <p style={{ fontWeight: 600, color: 'rgba(200, 180, 255, 0.9)' }}>
+                            Coordinator Update
+                        </p>
+                        {coordinatorStatus.trustlessMode && (
+                            <span
+                                style={{
+                                    fontSize: '0.65rem',
+                                    fontWeight: 700,
+                                    color: 'var(--color-text-success)',
+                                    background: 'rgba(0, 230, 118, 0.1)',
+                                    padding: '2px 8px',
+                                    borderRadius: '999px',
+                                    border: '1px solid rgba(0, 230, 118, 0.25)',
+                                    textTransform: 'uppercase',
+                                    letterSpacing: '0.06em',
+                                }}
+                            >
+                                Trustless
+                            </span>
+                        )}
+                    </div>
                     <p style={{ color: 'var(--color-text-secondary)' }}>
                         {coordinatorStatus.message}
                     </p>
@@ -487,6 +507,12 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
                         <p style={{ fontFamily: 'var(--font-mono)', fontSize: '0.75rem', color: 'var(--color-text-muted)', marginTop: '6px' }}>
                             XMR TX: {coordinatorStatus.xmrTxId.slice(0, 20)}...
                         </p>
+                    )}
+                    {coordinatorStatus.trustlessMode && coordinatorStatus.aliceEd25519Pub && coordinatorStatus.bobEd25519Pub && (
+                        <div style={{ marginTop: '8px', fontSize: '0.72rem', fontFamily: 'var(--font-mono)', color: 'var(--color-text-muted)' }}>
+                            <p>Alice key: {coordinatorStatus.aliceEd25519Pub.slice(0, 16)}...{coordinatorStatus.aliceEd25519Pub.slice(-8)}</p>
+                            <p>Bob key: {coordinatorStatus.bobEd25519Pub.slice(0, 16)}...{coordinatorStatus.bobEd25519Pub.slice(-8)}</p>
+                        </div>
                     )}
                 </div>
             )}

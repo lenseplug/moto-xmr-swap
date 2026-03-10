@@ -14,6 +14,7 @@
     "dependencies": {
         "@btc-vision/bitcoin": "rc",
         "@btc-vision/transaction": "rc",
+        "@noble/curves": "^2.0.1",
         "opnet": "rc",
         "sql.js": "^1.12.0",
         "ws": "^8.18.0"
