@@ -13,6 +13,15 @@ import {
     SwapStatus,
     TERMINAL_STATES,
 } from './types.js';
+import { encryptIfPresent, decryptIfPresent } from './encryption.js';
+
+/** Fields that are encrypted at rest. */
+const ENCRYPTED_FIELDS: ReadonlySet<string> = new Set([
+    'preimage',
+    'claim_token',
+    'alice_view_key',
+    'bob_view_key',
+]);
 
 const CREATE_SWAPS_TABLE = `
 CREATE TABLE IF NOT EXISTS swaps (
@@ -60,14 +69,22 @@ CREATE INDEX IF NOT EXISTS idx_history_swap_id ON state_history (swap_id);
 /** Row returned from a sql.js query — values are positional. */
 type SqlRow = (string | number | null | Uint8Array)[];
 
-/** Converts a sql.js result row into a plain object using column names. */
+/**
+ * Converts a sql.js result row into a plain object using column names.
+ * Decrypts encrypted fields transparently.
+ */
 function rowToObject(columns: string[], row: SqlRow): Record<string, string | number | null> {
     const obj: Record<string, string | number | null> = {};
     for (let i = 0; i < columns.length; i++) {
         const col = columns[i];
         const val = row[i];
         if (col !== undefined) {
-            obj[col] = val instanceof Uint8Array ? null : (val ?? null);
+            let resolved = val instanceof Uint8Array ? null : (val ?? null);
+            // Decrypt encrypted fields
+            if (ENCRYPTED_FIELDS.has(col) && typeof resolved === 'string') {
+                resolved = decryptIfPresent(resolved);
+            }
+            obj[col] = resolved;
         }
     }
     return obj;
@@ -162,7 +179,7 @@ export class StorageService {
         }
         if (updates.preimage !== undefined) {
             setClauses.push('preimage = ?');
-            values.push(updates.preimage);
+            values.push(encryptIfPresent(updates.preimage) ?? null);
         }
         if (updates.counterparty !== undefined) {
             setClauses.push('counterparty = ?');
@@ -194,7 +211,7 @@ export class StorageService {
         }
         if (updates.claim_token !== undefined) {
             setClauses.push('claim_token = ?');
-            values.push(updates.claim_token);
+            values.push(encryptIfPresent(updates.claim_token) ?? null);
         }
         if (updates.trustless_mode !== undefined) {
             setClauses.push('trustless_mode = ?');
@@ -206,7 +223,7 @@ export class StorageService {
         }
         if (updates.alice_view_key !== undefined) {
             setClauses.push('alice_view_key = ?');
-            values.push(updates.alice_view_key);
+            values.push(encryptIfPresent(updates.alice_view_key) ?? null);
         }
         if (updates.bob_ed25519_pub !== undefined) {
             setClauses.push('bob_ed25519_pub = ?');
@@ -214,7 +231,7 @@ export class StorageService {
         }
         if (updates.bob_view_key !== undefined) {
             setClauses.push('bob_view_key = ?');
-            values.push(updates.bob_view_key);
+            values.push(encryptIfPresent(updates.bob_view_key) ?? null);
         }
         if (updates.bob_dleq_proof !== undefined) {
             setClauses.push('bob_dleq_proof = ?');

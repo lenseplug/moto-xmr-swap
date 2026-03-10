@@ -140,9 +140,9 @@ export interface IUpdateSwapParams {
     readonly claim_token?: string | null;
     readonly trustless_mode?: number;
     readonly alice_ed25519_pub?: string;
-    readonly alice_view_key?: string;
+    readonly alice_view_key?: string | null;
     readonly bob_ed25519_pub?: string;
-    readonly bob_view_key?: string;
+    readonly bob_view_key?: string | null;
     readonly bob_dleq_proof?: string;
 }
 

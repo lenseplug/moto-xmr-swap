@@ -12,7 +12,73 @@ import type { SwapWebSocketServer } from './websocket.js';
 const XMR_REQUIRED_CONFIRMATIONS = 10;
 
 // ---------------------------------------------------------------------------
-// Fee address management (unchanged)
+// Monero address validation
+// ---------------------------------------------------------------------------
+
+/** Valid Base58 characters used by Monero (no 0, O, I, l). */
+const MONERO_BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+const MONERO_BASE58_SET = new Set(MONERO_BASE58_ALPHABET);
+
+interface IAddrType {
+    readonly prefix: string;
+    readonly length: number;
+}
+
+/** Valid address types with their expected lengths and prefix chars. */
+const MONERO_ADDR_TYPES: ReadonlyArray<IAddrType> = [
+    // Mainnet
+    { prefix: '4', length: 95 },  // standard
+    { prefix: '8', length: 95 },  // subaddress
+    { prefix: '4', length: 106 }, // integrated
+    // Stagenet
+    { prefix: '5', length: 95 },
+    { prefix: '7', length: 95 },
+    { prefix: '5', length: 106 },
+    // Testnet
+    { prefix: '9', length: 95 },
+    { prefix: 'B', length: 95 },
+    { prefix: 'A', length: 106 },
+];
+
+/**
+ * Validates a Monero address format.
+ * Checks: length, prefix, Base58 character set.
+ *
+ * @param address - The Monero address string.
+ * @returns null if valid, error string if invalid.
+ */
+export function validateMoneroAddress(address: string): string | null {
+    if (address.length === 0) {
+        return 'Address must not be empty';
+    }
+
+    // Check length: 95 (standard/subaddress) or 106 (integrated)
+    if (address.length !== 95 && address.length !== 106) {
+        return `Invalid address length: ${address.length} (expected 95 or 106)`;
+    }
+
+    // Check Base58 character set
+    for (let i = 0; i < address.length; i++) {
+        if (!MONERO_BASE58_SET.has(address[i] as string)) {
+            return `Invalid character '${address[i]}' at position ${i} — not valid Monero Base58`;
+        }
+    }
+
+    // Check prefix matches a known network type
+    const firstChar = address[0];
+    const validPrefix = MONERO_ADDR_TYPES.some(
+        (t) => t.prefix === firstChar && t.length === address.length,
+    );
+
+    if (!validPrefix) {
+        return `Invalid address prefix '${firstChar}' for length ${address.length}`;
+    }
+
+    return null;
+}
+
+// ---------------------------------------------------------------------------
+// Fee address management
 // ---------------------------------------------------------------------------
 
 let xmrFeeAddress: string = process.env['XMR_FEE_ADDRESS'] ?? '';
@@ -23,17 +89,9 @@ export function getFeeAddress(): string {
 
 export function setFeeAddress(address: string): void {
     const trimmed = address.trim();
-    if (trimmed.length === 0) {
-        throw new Error('Fee address must not be empty');
-    }
-    // Basic Monero address format validation:
-    // Mainnet: starts with '4' (95 chars) or '8' (95 chars subaddress)
-    // Stagenet/Testnet: starts with '5' or '7' (95 chars)
-    if (trimmed.length !== 95 && trimmed.length !== 106) {
-        throw new Error('Invalid Monero address length (expected 95 or 106 characters)');
-    }
-    if (!/^[45789]/.test(trimmed)) {
-        throw new Error('Invalid Monero address prefix (expected 4, 5, 7, 8, or 9)');
+    const error = validateMoneroAddress(trimmed);
+    if (error !== null) {
+        throw new Error(`Invalid Monero fee address: ${error}`);
     }
     console.log(`[Monero] Fee address updated: ${trimmed.slice(0, 12)}...${trimmed.slice(-6)}`);
     xmrFeeAddress = trimmed;

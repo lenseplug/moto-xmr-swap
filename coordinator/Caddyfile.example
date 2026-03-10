@@ -1,0 +1,23 @@
+# Sample Caddyfile for TLS-terminating reverse proxy.
+# Caddy automatically obtains and renews Let's Encrypt certificates.
+#
+# Usage:
+#   1. Install Caddy: https://caddyserver.com/docs/install
+#   2. Copy this file to Caddyfile and edit the domain
+#   3. Run: caddy run
+#
+# The coordinator runs on localhost:3001 (HTTP).
+# Caddy handles HTTPS termination and WebSocket upgrade.
+
+swap.yourdomain.com {
+    # Reverse proxy to coordinator HTTP server
+    reverse_proxy localhost:3001
+
+    # Headers for security
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "strict-origin-when-cross-origin"
+    }
+}

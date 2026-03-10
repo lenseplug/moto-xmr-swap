@@ -7,7 +7,7 @@ import { networks } from '@btc-vision/bitcoin';
 import { getSwapVaultContract, formatTokenAmount, formatXmrAmount } from '../services/opnet';
 import { calculateXmrFee, calculateXmrTotal } from '../types/swap';
 import { getCoordinatorSwapStatus, submitSwapSecret } from '../services/coordinator';
-import { getLocalSwapSecret, getClaimToken, secretHexToBigint } from '../utils/hashlock';
+import { getLocalSwapSecret, getClaimToken, clearLocalSwapSecret, clearClaimToken, secretHexToBigint } from '../utils/hashlock';
 import { useSwap, useBlockNumber } from '../hooks/useSwaps';
 import { useCoordinatorWs } from '../hooks/useCoordinatorWs';
 import type { CoordinatorStatus } from '../types/swap';
@@ -82,6 +82,15 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
             }
         }
     }, [localSecret, coordinatorStatus, swapId]);
+
+    // Clean up secrets when swap reaches terminal state (CLAIMED or REFUNDED)
+    useEffect(() => {
+        if (swap === null) return;
+        if (swap.status === 2n || swap.status === 3n) {
+            clearLocalSwapSecret(swapId.toString());
+            clearClaimToken(swapId.toString());
+        }
+    }, [swap, swapId]);
 
     // Poll coordinator
     useEffect(() => {

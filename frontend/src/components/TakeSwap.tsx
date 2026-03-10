@@ -8,7 +8,7 @@ import { getSwapVaultContract, formatTokenAmount, formatXmrAmount } from '../ser
 import { joinXmrAddress } from '../services/opnet';
 import { notifySwapTaken, submitBobKeys } from '../services/coordinator';
 import { saveClaimToken } from '../utils/hashlock';
-import { generateEd25519KeyPair } from '../utils/ed25519';
+import { generateEd25519KeyPair, signBobKeyProof } from '../utils/ed25519';
 import { uint8ArrayToHex } from '../utils/hashlock';
 import { useSwap, useBlockNumber } from '../hooks/useSwaps';
 import { SWAP_STATUS_LABELS, calculateXmrFee, calculateXmrTotal } from '../types/swap';
@@ -97,14 +97,19 @@ export function TakeSwap({ swapId, onBack, onTaken }: TakeSwapProps): React.Reac
                 saveClaimToken(swapId.toString(), takeResult.claimToken);
             }
 
-            // Generate Bob's ed25519 keys and submit for trustless swap
+            // Generate Bob's ed25519 keys and submit with proof-of-knowledge
             try {
                 const bobSpendKey = generateEd25519KeyPair();
-                const bobViewKey = generateEd25519KeyPair();
+                const bobViewKeyPair = generateEd25519KeyPair();
+                const keyProof = await signBobKeyProof(
+                    bobSpendKey.privateKey,
+                    bobSpendKey.publicKey,
+                    swapId.toString(),
+                );
                 await submitBobKeys(swapId.toString(), {
                     bobEd25519PubKey: uint8ArrayToHex(bobSpendKey.publicKey),
-                    bobViewKey: uint8ArrayToHex(bobViewKey.privateKey),
-                    bobDleqProof: '', // V1: DLEQ proof not implemented
+                    bobViewKey: uint8ArrayToHex(bobViewKeyPair.privateKey),
+                    bobKeyProof: uint8ArrayToHex(keyProof),
                 });
             } catch {
                 console.warn('Failed to submit Bob keys — coordinator may operate without trustless mode');

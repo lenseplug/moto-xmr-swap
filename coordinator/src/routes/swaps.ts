@@ -19,7 +19,7 @@ import {
 import { StorageService } from '../storage.js';
 import { randomBytes } from 'node:crypto';
 import { getFeeAddress, setFeeAddress, verifyPreimage } from '../monero-module.js';
-import { ed25519PublicFromPrivate, verifyCrossCurveDleq } from '../crypto/index.js';
+import { ed25519PublicFromPrivate, verifyBobKeyProof } from '../crypto/index.js';
 
 /** Returns a structured success response. */
 function success<T>(data: T): IApiResponse<T> {
@@ -526,28 +526,28 @@ export async function handleSubmitKeys(
 
     let bobPub: string;
     let bobViewKey: string;
-    let bobDleqProof: string;
+    let bobKeyProof: string;
     try {
         const parsed = await readBody(req);
         const candidate = parsed as Record<string, unknown>;
         if (
             typeof candidate['bobEd25519PubKey'] !== 'string' ||
             typeof candidate['bobViewKey'] !== 'string' ||
-            typeof candidate['bobDleqProof'] !== 'string'
+            typeof candidate['bobKeyProof'] !== 'string'
         ) {
-            jsonResponse(res, 400, fail('VALIDATION', 'Required: bobEd25519PubKey, bobViewKey, bobDleqProof (all hex strings)'));
+            jsonResponse(res, 400, fail('VALIDATION', 'Required: bobEd25519PubKey, bobViewKey, bobKeyProof (all hex strings)'));
             return;
         }
         bobPub = candidate['bobEd25519PubKey'].trim().toLowerCase();
         bobViewKey = candidate['bobViewKey'].trim().toLowerCase();
-        bobDleqProof = candidate['bobDleqProof'].trim().toLowerCase();
+        bobKeyProof = candidate['bobKeyProof'].trim().toLowerCase();
     } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : 'Invalid request';
         jsonResponse(res, 400, fail('INVALID_BODY', msg));
         return;
     }
 
-    // Validate formats: 64 hex chars for keys, variable length for proof
+    // Validate formats
     if (!/^[0-9a-f]{64}$/.test(bobPub)) {
         jsonResponse(res, 400, fail('VALIDATION', 'bobEd25519PubKey must be exactly 64 hex characters'));
         return;
@@ -556,27 +556,27 @@ export async function handleSubmitKeys(
         jsonResponse(res, 400, fail('VALIDATION', 'bobViewKey must be exactly 64 hex characters'));
         return;
     }
-    if (bobDleqProof.length > 0 && !/^[0-9a-f]*$/.test(bobDleqProof)) {
-        jsonResponse(res, 400, fail('VALIDATION', 'bobDleqProof must be hex-encoded'));
+    // Key proof must be exactly 128 hex chars (64 bytes: R || s)
+    if (!/^[0-9a-f]{128}$/.test(bobKeyProof)) {
+        jsonResponse(res, 400, fail('VALIDATION', 'bobKeyProof must be exactly 128 hex characters (64 bytes)'));
         return;
     }
 
-    // V1: DLEQ verification is a placeholder (accepts all proofs)
-    // V2 will verify the cross-curve DLEQ proof here
-    const proofBytes = bobDleqProof.length > 0 ? hexToBytes(bobDleqProof) : new Uint8Array(0);
+    // Verify Bob's proof-of-knowledge: proves he knows the private key behind bobPub
+    const proofBytes = hexToBytes(bobKeyProof);
     const pubBytes = hexToBytes(bobPub);
-    if (!verifyCrossCurveDleq(pubBytes, new Uint8Array(33), proofBytes)) {
-        jsonResponse(res, 400, fail('DLEQ_INVALID', 'Cross-curve DLEQ proof verification failed'));
+    if (!verifyBobKeyProof(pubBytes, proofBytes, swapId)) {
+        jsonResponse(res, 400, fail('KEY_PROOF_INVALID', 'Bob key proof-of-knowledge verification failed — cannot prove ownership of submitted public key'));
         return;
     }
 
-    // Store Bob's key material
+    // Store Bob's key material (proof stored in bob_dleq_proof column for backward compat)
     storage.updateSwap(swapId, {
         bob_ed25519_pub: bobPub,
         bob_view_key: bobViewKey,
-        bob_dleq_proof: bobDleqProof,
+        bob_dleq_proof: bobKeyProof,
     });
-    console.log(`[Routes] Bob's keys stored for trustless swap ${swapId} (pub: ${bobPub.slice(0, 16)}...)`);
+    console.log(`[Routes] Bob's keys verified and stored for trustless swap ${swapId} (pub: ${bobPub.slice(0, 16)}...)`);
 
     jsonResponse(res, 200, success({ stored: true }));
 }

@@ -126,7 +126,7 @@ export interface LocalSwapSecret {
 export interface BobKeyMaterial {
     readonly bobEd25519PubKey: string;
     readonly bobViewKey: string;
-    readonly bobDleqProof: string;
+    readonly bobKeyProof: string;
 }
 
 /**

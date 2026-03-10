@@ -11,8 +11,7 @@ export {
 } from './keys.js';
 
 export {
-    verifyCrossCurveDleq,
-    generateCrossCurveDleqProof,
+    verifyBobKeyProof,
 } from './dleq.js';
 
 export type {

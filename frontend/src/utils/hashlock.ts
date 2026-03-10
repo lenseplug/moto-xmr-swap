@@ -6,6 +6,11 @@
 import { generateEd25519KeyPair } from './ed25519';
 import type { LocalSwapSecret } from '../types/swap';
 
+/**
+ * Secrets and claim tokens use sessionStorage (cleared on tab close)
+ * to minimize exposure window. The coordinator holds the preimage as
+ * a fallback — users don't need to persist secrets across sessions.
+ */
 const LOCAL_SECRETS_KEY = 'moto_xmr_swap_secrets';
 const CLAIM_TOKENS_KEY = 'moto_xmr_claim_tokens';
 
@@ -136,15 +141,15 @@ export function saveLocalSwapSecret(
         ...(aliceViewKey !== undefined ? { aliceViewKey } : {}),
     };
     secrets.push(entry);
-    localStorage.setItem(LOCAL_SECRETS_KEY, JSON.stringify(secrets));
+    sessionStorage.setItem(LOCAL_SECRETS_KEY, JSON.stringify(secrets));
 }
 
 /**
- * Loads all locally stored swap secrets.
+ * Loads all session-stored swap secrets.
  */
 export function loadLocalSwapSecrets(): LocalSwapSecret[] {
     try {
-        const raw = localStorage.getItem(LOCAL_SECRETS_KEY);
+        const raw = sessionStorage.getItem(LOCAL_SECRETS_KEY);
         if (!raw) return [];
         return JSON.parse(raw) as LocalSwapSecret[];
     } catch {
@@ -163,7 +168,22 @@ export function getLocalSwapSecret(swapId: string): LocalSwapSecret | null {
 }
 
 /**
- * Saves a claim_token for a swap in localStorage.
+ * Removes the secret for a specific swap ID from sessionStorage.
+ * Call this when a swap reaches a terminal state (COMPLETED, REFUNDED, EXPIRED).
+ *
+ * @param swapId - The swap ID (decimal string)
+ */
+export function clearLocalSwapSecret(swapId: string): void {
+    try {
+        const secrets = loadLocalSwapSecrets().filter((s) => s.swapId !== swapId);
+        sessionStorage.setItem(LOCAL_SECRETS_KEY, JSON.stringify(secrets));
+    } catch {
+        // sessionStorage unavailable — ignore
+    }
+}
+
+/**
+ * Saves a claim_token for a swap in sessionStorage.
  * The claim_token is used to authenticate WebSocket subscriptions.
  *
  * @param swapId - The swap ID (decimal string)
@@ -171,12 +191,12 @@ export function getLocalSwapSecret(swapId: string): LocalSwapSecret | null {
  */
 export function saveClaimToken(swapId: string, claimToken: string): void {
     try {
-        const raw = localStorage.getItem(CLAIM_TOKENS_KEY);
+        const raw = sessionStorage.getItem(CLAIM_TOKENS_KEY);
         const tokens: Record<string, string> = raw ? (JSON.parse(raw) as Record<string, string>) : {};
         tokens[swapId] = claimToken;
-        localStorage.setItem(CLAIM_TOKENS_KEY, JSON.stringify(tokens));
+        sessionStorage.setItem(CLAIM_TOKENS_KEY, JSON.stringify(tokens));
     } catch {
-        // localStorage unavailable — ignore
+        // sessionStorage unavailable — ignore
     }
 }
 
@@ -187,11 +207,28 @@ export function saveClaimToken(swapId: string, claimToken: string): void {
  */
 export function getClaimToken(swapId: string): string | null {
     try {
-        const raw = localStorage.getItem(CLAIM_TOKENS_KEY);
+        const raw = sessionStorage.getItem(CLAIM_TOKENS_KEY);
         if (!raw) return null;
         const tokens = JSON.parse(raw) as Record<string, string>;
         return tokens[swapId] ?? null;
     } catch {
         return null;
+    }
+}
+
+/**
+ * Removes the claim_token for a specific swap ID from sessionStorage.
+ *
+ * @param swapId - The swap ID (decimal string)
+ */
+export function clearClaimToken(swapId: string): void {
+    try {
+        const raw = sessionStorage.getItem(CLAIM_TOKENS_KEY);
+        if (!raw) return;
+        const tokens = JSON.parse(raw) as Record<string, string>;
+        delete tokens[swapId];
+        sessionStorage.setItem(CLAIM_TOKENS_KEY, JSON.stringify(tokens));
+    } catch {
+        // sessionStorage unavailable — ignore
     }
 }

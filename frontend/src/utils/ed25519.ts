@@ -76,3 +76,59 @@ function scalarToBytes(scalar: bigint): Uint8Array {
     }
     return bytes;
 }
+
+/**
+ * Generates a Schnorr proof-of-knowledge for Bob's ed25519 key.
+ * Proves Bob knows the private scalar behind his public key, preventing
+ * crafted-key attacks on the shared Monero address.
+ *
+ * Protocol:
+ *   challenge = SHA-256("bob-key-proof:" || swapId)
+ *   k = random, R = k*G
+ *   e = SHA-256(R || bobPub || challenge) mod l
+ *   s = (k + e * bobPriv) mod l
+ *   proof = R (32 bytes) || s (32 bytes)
+ *
+ * @param bobPrivateKey - Bob's ed25519 private scalar (32 bytes).
+ * @param bobPublicKey - Bob's ed25519 public key (32 bytes).
+ * @param swapId - The swap ID string.
+ * @returns The proof as Uint8Array (64 bytes: R || s).
+ */
+export async function signBobKeyProof(
+    bobPrivateKey: Uint8Array,
+    bobPublicKey: Uint8Array,
+    swapId: string,
+): Promise<Uint8Array> {
+    // 1. Compute deterministic challenge
+    const challengeData = new TextEncoder().encode('bob-key-proof:' + swapId);
+    const challengeBuffer = await crypto.subtle.digest('SHA-256', challengeData);
+    const challenge = new Uint8Array(challengeBuffer);
+
+    // 2. Generate random nonce k
+    const kRaw = crypto.getRandomValues(new Uint8Array(32));
+    const k = bytesToScalar(kRaw) % ED25519_ORDER;
+
+    // 3. Compute R = k * G
+    const R = ed25519.Point.BASE.multiply(k);
+    const R_bytes = R.toBytes();
+
+    // 4. Compute e = SHA-256(R || bobPub || challenge) mod l
+    const hashInput = new Uint8Array(32 + 32 + 32);
+    hashInput.set(R_bytes, 0);
+    hashInput.set(bobPublicKey, 32);
+    hashInput.set(challenge, 64);
+    const eBuffer = await crypto.subtle.digest('SHA-256', hashInput);
+    const e = bytesToScalar(new Uint8Array(eBuffer)) % ED25519_ORDER;
+
+    // 5. Compute s = (k + e * bobPriv) mod l
+    const x = bytesToScalar(bobPrivateKey) % ED25519_ORDER;
+    const s = (k + e * x) % ED25519_ORDER;
+    const s_bytes = scalarToBytes(s);
+
+    // 6. Proof = R || s
+    const proof = new Uint8Array(64);
+    proof.set(R_bytes, 0);
+    proof.set(s_bytes, 32);
+
+    return proof;
+}

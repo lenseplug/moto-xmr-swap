@@ -23,9 +23,11 @@ import { type ISwapRecord, SwapStatus } from './types.js';
 import {
     createMoneroService,
     notifyXmrConfirmed,
+    validateMoneroAddress,
     type IMoneroService,
 } from './monero-module.js';
 import { computeSharedMoneroAddress } from './crypto/index.js';
+import { initEncryption } from './encryption.js';
 
 const PORT = parseInt(process.env['PORT'] ?? '3001', 10);
 const DB_PATH = process.env['DB_PATH'] ?? 'coordinator.db';
@@ -48,8 +50,8 @@ const ADMIN_API_KEY = process.env['ADMIN_API_KEY'] ?? '';
 // ---------------------------------------------------------------------------
 
 const RATE_LIMIT_WINDOW_MS = 60_000;
-const RATE_LIMIT_MAX_WRITE = 10; // write requests per minute
-const RATE_LIMIT_MAX_READ = 60; // read requests per minute
+const RATE_LIMIT_MAX_WRITE = 5; // write requests per minute (strict for mainnet)
+const RATE_LIMIT_MAX_READ = 30; // read requests per minute
 
 interface IRateLimitEntry {
     readCount: number;
@@ -58,6 +60,15 @@ interface IRateLimitEntry {
 }
 
 const requestCounts = new Map<string, IRateLimitEntry>();
+
+/** Returns seconds until the rate limit window resets for a given IP, or 0 if not limited. */
+function getRateLimitRetryAfter(ip: string): number {
+    const entry = requestCounts.get(ip);
+    if (!entry) return 0;
+    const now = Date.now();
+    if (now > entry.resetAt) return 0;
+    return Math.ceil((entry.resetAt - now) / 1000);
+}
 
 function checkRateLimit(ip: string, isWrite: boolean): boolean {
     const now = Date.now();
@@ -107,12 +118,23 @@ function getClientIp(req: IncomingMessage): string {
 // CORS helpers
 // ---------------------------------------------------------------------------
 
-/** Adds CORS headers using the configured allowed origin. */
+/** Adds CORS and security headers to all responses. */
 function addCorsHeaders(res: ServerResponse): void {
+    // CORS
     res.setHeader('Access-Control-Allow-Origin', ALLOWED_ORIGIN);
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
     res.setHeader('Access-Control-Max-Age', '86400');
+    // Security headers
+    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains; preload');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('X-XSS-Protection', '0'); // Modern browsers: CSP supersedes this
+    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    res.setHeader(
+        'Content-Security-Policy',
+        "default-src 'none'; frame-ancestors 'none'",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -208,14 +230,17 @@ function notFound(res: ServerResponse): void {
     res.end(body);
 }
 
-/** Sends a plain 429 JSON response. */
-function tooManyRequests(res: ServerResponse): void {
+/** Sends a plain 429 JSON response with Retry-After header. */
+function tooManyRequests(res: ServerResponse, retryAfterSec: number): void {
     const body = JSON.stringify({
         success: false,
         data: null,
         error: { code: 'RATE_LIMITED', message: 'Too many requests', retryable: true },
     });
-    res.writeHead(429, { 'Content-Type': 'application/json' });
+    res.writeHead(429, {
+        'Content-Type': 'application/json',
+        'Retry-After': String(Math.max(1, retryAfterSec)),
+    });
     res.end(body);
 }
 
@@ -381,6 +406,12 @@ function startXmrLocking(
                 subaddrIndex = lockResult.subaddrIndex;
             }
 
+            // Validate the generated/computed XMR address before storing
+            const addrError = validateMoneroAddress(xmrLockAddress);
+            if (addrError !== null) {
+                throw new Error(`Generated invalid XMR lock address: ${addrError}`);
+            }
+
             // Set xmr_lock_tx to 'pending' to satisfy the state guard, plus store the address
             storage.updateSwap(swapId, {
                 xmr_lock_tx: 'pending',
@@ -453,6 +484,23 @@ function startXmrLocking(
 }
 
 async function main(): Promise<void> {
+    // Initialize field-level encryption
+    initEncryption();
+
+    // HTTPS/TLS enforcement: in production, require TLS termination (reverse proxy)
+    const requireTls = (process.env['REQUIRE_TLS'] ?? 'false').toLowerCase() === 'true';
+    if (requireTls) {
+        const corsOrigin = process.env['CORS_ORIGIN'] ?? '';
+        if (!corsOrigin.startsWith('https://')) {
+            console.error(
+                '[Coordinator] REQUIRE_TLS=true but CORS_ORIGIN does not start with https://. ' +
+                'Deploy behind a TLS-terminating reverse proxy (nginx/Caddy) and set CORS_ORIGIN=https://your-domain.',
+            );
+            process.exit(1);
+        }
+        console.log('[Coordinator] TLS enforcement enabled — CORS_ORIGIN is HTTPS.');
+    }
+
     // Validate admin key
     if (ADMIN_API_KEY.length === 0) {
         console.warn('[Coordinator] *** WARNING *** ADMIN_API_KEY is not set. Admin endpoints (POST /api/swaps, PUT /api/fee-address) will reject all requests.');
@@ -479,10 +527,13 @@ async function main(): Promise<void> {
             wsServer?.clearPendingPreimage(swap.swap_id);
             moneroService.stopMonitoring(swap.swap_id);
             xmrLockingInProgress.delete(swap.swap_id);
-            // Scrub sensitive data from DB — preimage and claim_token are no longer needed
-            if (swap.preimage || swap.claim_token) {
-                storage.updateSwap(swap.swap_id, { preimage: null, claim_token: null });
-            }
+            // Scrub ALL sensitive data from DB — no longer needed after terminal state
+            storage.updateSwap(swap.swap_id, {
+                preimage: null,
+                claim_token: null,
+                alice_view_key: null,
+                bob_view_key: null,
+            } as import('./types.js').IUpdateSwapParams);
         }
 
         // When a swap transitions to TAKEN, try to start XMR locking
@@ -505,7 +556,7 @@ async function main(): Promise<void> {
         const isWrite = req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH';
 
         if (!checkRateLimit(ip, isWrite)) {
-            tooManyRequests(res);
+            tooManyRequests(res, getRateLimitRetryAfter(ip));
             return;
         }
 
