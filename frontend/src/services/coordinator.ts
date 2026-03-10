@@ -4,13 +4,13 @@
  */
 import type { BobKeyMaterial, CoordinatorHealth, CoordinatorStatus } from '../types/swap';
 
-const COORDINATOR_BASE = import.meta.env.VITE_COORDINATOR_URL as string;
+const COORDINATOR_BASE = import.meta.env.VITE_COORDINATOR_URL;
 
 // In production builds, enforce HTTPS to prevent secret leakage via MITM
 if (import.meta.env.PROD && COORDINATOR_BASE && !COORDINATOR_BASE.startsWith('https://')) {
-    console.error(
-        '[Coordinator] CRITICAL: VITE_COORDINATOR_URL must use https:// in production. ' +
-        `Current value starts with "${COORDINATOR_BASE.slice(0, 8)}". Secrets sent over HTTP can be intercepted.`,
+    throw new Error(
+        '[SECURITY] VITE_COORDINATOR_URL must use https:// in production. ' +
+        'Secrets sent over HTTP can be intercepted by network attackers.',
     );
 }
 

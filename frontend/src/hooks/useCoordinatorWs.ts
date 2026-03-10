@@ -5,13 +5,13 @@
  */
 import { useState, useEffect, useRef, useCallback } from 'react';
 
-const WS_URL = (import.meta.env.VITE_COORDINATOR_WS_URL ?? 'ws://localhost:3001') as string;
+const WS_URL = (import.meta.env.VITE_COORDINATOR_WS_URL ?? 'ws://localhost:3001');
 const RECONNECT_DELAY_MS = 3000;
 
 // In production, enforce WSS to prevent claim token and preimage interception
 if (import.meta.env.PROD && WS_URL && !WS_URL.startsWith('wss://')) {
-    console.error(
-        '[WebSocket] CRITICAL: VITE_COORDINATOR_WS_URL must use wss:// in production. ' +
+    throw new Error(
+        '[SECURITY] VITE_COORDINATOR_WS_URL must use wss:// in production. ' +
         'Claim tokens and preimages sent over ws:// can be intercepted.',
     );
 }
@@ -49,7 +49,7 @@ async function verifyPreimage(preimageHex: string, expectedHashLockHex: string):
         for (let i = 0; i < preimageBytes.length; i++) {
             preimageBytes[i] = parseInt(preimageHex.slice(i * 2, i * 2 + 2), 16);
         }
-        const hashBuf = await crypto.subtle.digest('SHA-256', preimageBytes.buffer as ArrayBuffer);
+        const hashBuf = await crypto.subtle.digest('SHA-256', preimageBytes);
         const hashHex = Array.from(new Uint8Array(hashBuf))
             .map((b) => b.toString(16).padStart(2, '0'))
             .join('');

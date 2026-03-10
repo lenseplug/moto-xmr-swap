@@ -485,7 +485,7 @@ function startXmrLocking(
 
 async function main(): Promise<void> {
     // Initialize field-level encryption
-    initEncryption();
+    const encryptionEnabled = initEncryption();
 
     // HTTPS/TLS enforcement: in production, require TLS termination (reverse proxy)
     const requireTls = (process.env['REQUIRE_TLS'] ?? 'false').toLowerCase() === 'true';
@@ -498,7 +498,15 @@ async function main(): Promise<void> {
             );
             process.exit(1);
         }
-        console.log('[Coordinator] TLS enforcement enabled — CORS_ORIGIN is HTTPS.');
+        // In production (TLS mode), encryption is mandatory — no plaintext preimages
+        if (!encryptionEnabled) {
+            console.error(
+                '[Coordinator] REQUIRE_TLS=true but ENCRYPTION_KEY is not set. ' +
+                'Field-level encryption is MANDATORY in production to protect preimages and view keys at rest.',
+            );
+            process.exit(1);
+        }
+        console.log('[Coordinator] TLS enforcement enabled — CORS_ORIGIN is HTTPS, encryption active.');
     }
 
     // Validate admin key
