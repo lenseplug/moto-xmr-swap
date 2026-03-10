@@ -5,7 +5,7 @@ import React, { useState, useCallback } from 'react';
 import { useWalletConnect } from '@btc-vision/walletconnect';
 import { networks } from '@btc-vision/bitcoin';
 import { getSwapVaultContract, getMotoContract, parseMotoAmount, parseXmrAmount, splitXmrAddress, getProvider } from '../services/opnet';
-import { generateTrustlessSecret, saveLocalSwapSecret, secretHexToBigint } from '../utils/hashlock';
+import { generateTrustlessSecret, saveLocalSwapSecret, secretHexToBigint, hashSecret } from '../utils/hashlock';
 import { submitSwapSecret } from '../services/coordinator';
 import { PrivacyBanner } from './PrivacyBanner';
 import { ExplorerLinks } from './ExplorerLinks';
@@ -152,6 +152,12 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
             setStatusMessage('Generating trustless keys...');
 
             const { secret, hashLock, hashLockHex, aliceViewKey } = await generateTrustlessSecret();
+
+            // Verify secret matches hashLock locally (defensive assertion)
+            const verifyHash = await hashSecret(secret);
+            if (verifyHash !== hashLock) {
+                throw new Error('BUG: SHA-256(secret) does not match hashLock — key generation failed');
+            }
 
             // Step 4: Encode XMR address
             const xmrHex = form.xmrAddress.trim();

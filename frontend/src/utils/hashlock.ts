@@ -190,6 +190,11 @@ export function clearLocalSwapSecret(swapId: string): void {
  * @param claimToken - The 64-char hex claim token from the coordinator
  */
 export function saveClaimToken(swapId: string, claimToken: string): void {
+    // Validate token format: must be exactly 64 hex characters (256-bit random)
+    if (!/^[0-9a-f]{64}$/i.test(claimToken)) {
+        console.error('[saveClaimToken] Invalid claim token format — rejecting');
+        return;
+    }
     try {
         const raw = sessionStorage.getItem(CLAIM_TOKENS_KEY);
         const tokens: Record<string, string> = raw ? (JSON.parse(raw) as Record<string, string>) : {};

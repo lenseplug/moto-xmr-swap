@@ -5,6 +5,7 @@ import { getContract, JSONRpcProvider, IOP20Contract, OP_20_ABI } from 'opnet';
 import type { BitcoinInterfaceAbi } from 'opnet';
 import { networks } from '@btc-vision/bitcoin';
 import { Address } from '@btc-vision/transaction';
+import { keccak_256 } from '@noble/hashes/sha3.js';
 import { SwapVaultAbi } from './swap-abi';
 import type { ISwapVault } from './swap-abi';
 
@@ -245,9 +246,20 @@ export function parseXmrAddress(input: string): string {
     const decoded = base58Decode(trimmed);
 
     // Monero standard address: 1 byte network + 32 spend + 32 view + 4 checksum = 69 bytes
-    // We want the 64-byte middle (spend + view keys)
-    if (decoded.length < 65) {
-        throw new Error(`Decoded address too short: ${decoded.length} bytes (expected >= 65)`);
+    // Integrated address: 1 byte network + 32 spend + 32 view + 8 payment_id + 4 checksum = 77 bytes
+    if (decoded.length < 69) {
+        throw new Error(`Decoded address too short: ${decoded.length} bytes (expected >= 69)`);
+    }
+
+    // Validate Keccak-256 checksum (last 4 bytes of decoded = first 4 bytes of hash(prefix + keys))
+    const checksumOffset = decoded.length - 4;
+    const addressPayload = decoded.slice(0, checksumOffset);
+    const expectedChecksum = decoded.slice(checksumOffset);
+    const actualChecksum = keccak_256(addressPayload).slice(0, 4);
+    for (let i = 0; i < 4; i++) {
+        if (expectedChecksum[i] !== actualChecksum[i]) {
+            throw new Error('Invalid Monero address: checksum mismatch (typo in address?)');
+        }
     }
 
     // Extract spend key (bytes 1-32) and view key (bytes 33-64)

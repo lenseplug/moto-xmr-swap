@@ -59,7 +59,8 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
     const claimToken = getClaimToken(swapId.toString());
 
     // WebSocket connection for real-time preimage delivery (authenticated)
-    const { preimage: wsPreimage } = useCoordinatorWs(swapId.toString(), claimToken);
+    // Pass hashLock so received preimages are verified before acceptance
+    const { preimage: wsPreimage } = useCoordinatorWs(swapId.toString(), claimToken, localSecret?.hashLock ?? null);
 
     // Combined preimage: prefer local secret, fall back to WebSocket preimage
     const claimablePreimage = localSecret?.secret ?? wsPreimage;
