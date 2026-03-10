@@ -3,10 +3,10 @@
  */
 import React, { useState, useCallback } from 'react';
 import { useWalletConnect } from '@btc-vision/walletconnect';
-import { Address } from '@btc-vision/transaction';
 import { networks } from '@btc-vision/bitcoin';
 import { getSwapVaultContract, getMotoContract, parseMotoAmount, parseXmrAmount, splitXmrAddress, getProvider } from '../services/opnet';
 import { generateSecretAndHashLock, saveLocalSwapSecret, secretHexToBigint } from '../utils/hashlock';
+import { submitSwapSecret } from '../services/coordinator';
 import { PrivacyBanner } from './PrivacyBanner';
 import { ExplorerLinks } from './ExplorerLinks';
 
@@ -35,7 +35,7 @@ interface TxResult {
  * Create swap form with allowance check and hash-lock generation.
  */
 export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactElement {
-    const { publicKey, hashedMLDSAKey, walletAddress } = useWalletConnect();
+    const { publicKey, address: senderAddress, walletAddress } = useWalletConnect();
 
     const isConnected = publicKey !== null;
 
@@ -80,7 +80,7 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
     }, [form]);
 
     const handleSubmit = useCallback(async (): Promise<void> => {
-        if (!isConnected || !walletAddress || !publicKey || !hashedMLDSAKey) {
+        if (!isConnected || !walletAddress || !publicKey || !senderAddress) {
             setFormError('Please connect your wallet first');
             return;
         }
@@ -95,8 +95,6 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
             setFormError('Contract addresses not configured. Set VITE_SWAP_VAULT_ADDRESS and VITE_MOTO_TOKEN_ADDRESS.');
             return;
         }
-
-        const senderAddress = Address.fromString(hashedMLDSAKey, publicKey);
         const motoAmount = parseMotoAmount(form.motoAmount);
         const xmrAmount = parseXmrAmount(form.xmrAmount);
         const timeoutBlocks = BigInt(parseInt(form.timeoutBlocks, 10));
@@ -109,8 +107,6 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
             setStatusMessage('Checking MOTO allowance...');
 
             // Initialise both contracts first so we can resolve the vault's Address.
-            // Address.fromString() with a single arg is forbidden — contract addresses must be
-            // resolved via the contract instance's async contractAddress getter.
             const swapContract = getSwapVaultContract(SWAP_VAULT_ADDRESS, senderAddress);
             const vaultAddress = await swapContract.contractAddress;
 
@@ -158,7 +154,6 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
             const { secret, hashLock, hashLockHex } = await generateSecretAndHashLock();
 
             // Step 4: Encode XMR address
-            // Pass the raw hex string — splitXmrAddress pads to 128 chars internally.
             const xmrHex = form.xmrAddress.trim();
             const { hi: xmrAddressHi, lo: xmrAddressLo } = splitXmrAddress(xmrHex);
 
@@ -231,6 +226,13 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
             saveLocalSwapSecret(swapId.toString(), secret, hashLockHex);
             void secretHexToBigint(secret);
 
+            // Submit secret to coordinator (non-fatal if it fails — SwapStatus retries)
+            try {
+                await submitSwapSecret(swapId.toString(), secret);
+            } catch {
+                console.warn('Failed to submit secret to coordinator — will retry on status page');
+            }
+
             setTxResult({ txId, swapId });
             setStep('done');
             onSwapCreated(swapId);
@@ -242,7 +244,7 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
         isConnected,
         walletAddress,
         publicKey,
-        hashedMLDSAKey,
+        senderAddress,
         form,
         validateForm,
         onSwapCreated,
@@ -334,14 +336,15 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
                             disabled={isProcessing || step === 'done'}
                         />
                         <p style={{ fontSize: '0.75rem', color: 'var(--color-text-muted)', marginTop: '4px' }}>
-                            XMR amount you want to receive (12 decimal places)
+                            XMR amount you want to receive (12 decimal places).
+                            The taker pays an additional 0.87% fee on top of this amount.
                         </p>
                     </div>
 
                     {/* XMR Address */}
                     <div>
                         <label htmlFor="xmr-address" style={fieldLabel}>
-                            Your Monero Address (hex)
+                            Your Monero Address
                         </label>
                         <PrivacyBanner />
                         <input
@@ -349,14 +352,13 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
                             type="text"
                             className="input-field input-mono"
                             style={{ marginTop: '10px' }}
-                            placeholder="4ab35e... (64-char hex)"
+                            placeholder="4... (standard Monero address)"
                             value={form.xmrAddress}
                             onChange={handleFieldChange('xmrAddress')}
                             disabled={isProcessing || step === 'done'}
-                            maxLength={64}
                         />
                         <p style={{ fontSize: '0.75rem', color: 'var(--color-text-muted)', marginTop: '4px' }}>
-                            Enter your XMR address as 64-char hex (remove the checksum byte)
+                            Standard Monero address (starts with 4) or 128-char hex
                         </p>
                     </div>
 
@@ -406,7 +408,7 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
                                 alignItems: 'center',
                                 gap: '10px',
                                 padding: '12px 14px',
-                                background: 'rgba(0, 229, 255, 0.06)',
+                                background: 'rgba(232, 115, 42, 0.06)',
                                 border: '1px solid var(--color-border-default)',
                                 borderRadius: 'var(--radius-md)',
                                 fontSize: '0.875rem',
@@ -418,7 +420,7 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
                                     width: '6px',
                                     height: '6px',
                                     borderRadius: '50%',
-                                    background: 'var(--color-cyan)',
+                                    background: 'var(--color-orange)',
                                 }}
                             />
                             {statusMessage}

@@ -3,13 +3,13 @@
  */
 import React, { useState, useCallback } from 'react';
 import { useWalletConnect } from '@btc-vision/walletconnect';
-import { Address } from '@btc-vision/transaction';
 import { networks } from '@btc-vision/bitcoin';
 import { getSwapVaultContract, formatTokenAmount, formatXmrAmount } from '../services/opnet';
 import { joinXmrAddress } from '../services/opnet';
 import { notifySwapTaken } from '../services/coordinator';
+import { saveClaimToken } from '../utils/hashlock';
 import { useSwap, useBlockNumber } from '../hooks/useSwaps';
-import { SWAP_STATUS_LABELS } from '../types/swap';
+import { SWAP_STATUS_LABELS, calculateXmrFee, calculateXmrTotal } from '../types/swap';
 import { ExplorerLinks } from './ExplorerLinks';
 import { SkeletonBlock } from './SkeletonRow';
 
@@ -25,7 +25,7 @@ interface TakeSwapProps {
  * TakeSwap view — displays swap details and the "Take Swap" action.
  */
 export function TakeSwap({ swapId, onBack, onTaken }: TakeSwapProps): React.ReactElement {
-    const { publicKey, hashedMLDSAKey, walletAddress } = useWalletConnect();
+    const { publicKey, address: senderAddress, walletAddress } = useWalletConnect();
     const isConnected = publicKey !== null;
     const { swap, isLoading, error: loadError } = useSwap(swapId);
     const currentBlock = useBlockNumber();
@@ -35,7 +35,7 @@ export function TakeSwap({ swapId, onBack, onTaken }: TakeSwapProps): React.Reac
     const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
     const handleTake = useCallback(async (): Promise<void> => {
-        if (!isConnected || !walletAddress || !publicKey || !hashedMLDSAKey) {
+        if (!isConnected || !walletAddress || !publicKey || !senderAddress) {
             setErrorMsg('Connect your wallet first');
             return;
         }
@@ -59,7 +59,6 @@ export function TakeSwap({ swapId, onBack, onTaken }: TakeSwapProps): React.Reac
         setErrorMsg(null);
 
         try {
-            const senderAddress = Address.fromString(hashedMLDSAKey, publicKey);
             const contract = getSwapVaultContract(SWAP_VAULT_ADDRESS, senderAddress);
 
             const sim = await contract.takeSwap(swapId);
@@ -90,8 +89,11 @@ export function TakeSwap({ swapId, onBack, onTaken }: TakeSwapProps): React.Reac
 
             setTxId(resultTxId);
 
-            // Notify coordinator to begin XMR locking
-            void notifySwapTaken(swapId.toString(), resultTxId);
+            // Notify coordinator to begin XMR locking and capture claim_token
+            const takeResult = await notifySwapTaken(swapId.toString(), resultTxId);
+            if (takeResult.claimToken) {
+                saveClaimToken(swapId.toString(), takeResult.claimToken);
+            }
 
             setStep('done');
             onTaken(swapId);
@@ -99,7 +101,7 @@ export function TakeSwap({ swapId, onBack, onTaken }: TakeSwapProps): React.Reac
             setStep('error');
             setErrorMsg(err instanceof Error ? err.message : 'Unknown error');
         }
-    }, [isConnected, walletAddress, publicKey, hashedMLDSAKey, swap, swapId, onTaken]);
+    }, [isConnected, walletAddress, publicKey, senderAddress, swap, swapId, onTaken]);
 
     const blocksLeft =
         swap !== null && currentBlock !== null && swap.refundBlock > currentBlock
@@ -200,9 +202,21 @@ export function TakeSwap({ swapId, onBack, onTaken }: TakeSwapProps): React.Reac
                                 </span>,
                             )}
                             {detailRow(
-                                'XMR You Provide',
-                                <span style={{ color: 'var(--color-text-warning)', fontWeight: 700 }}>
+                                'XMR Amount',
+                                <span style={{ fontWeight: 600 }}>
                                     {formatXmrAmount(swap.xmrAmount)} XMR
+                                </span>,
+                            )}
+                            {detailRow(
+                                'Fee (0.87%)',
+                                <span style={{ color: 'var(--color-text-muted)', fontSize: '0.85rem' }}>
+                                    +{formatXmrAmount(calculateXmrFee(swap.xmrAmount))} XMR
+                                </span>,
+                            )}
+                            {detailRow(
+                                'Total XMR to Lock',
+                                <span style={{ color: 'var(--color-text-warning)', fontWeight: 700 }}>
+                                    {formatXmrAmount(calculateXmrTotal(swap.xmrAmount))} XMR
                                 </span>,
                             )}
                             {detailRow(
@@ -257,7 +271,7 @@ export function TakeSwap({ swapId, onBack, onTaken }: TakeSwapProps): React.Reac
                                     alignItems: 'center',
                                     gap: '10px',
                                     padding: '12px 14px',
-                                    background: 'rgba(0, 229, 255, 0.06)',
+                                    background: 'rgba(232, 115, 42, 0.06)',
                                     border: '1px solid var(--color-border-default)',
                                     borderRadius: 'var(--radius-md)',
                                     fontSize: '0.875rem',
@@ -270,7 +284,7 @@ export function TakeSwap({ swapId, onBack, onTaken }: TakeSwapProps): React.Reac
                                         width: '6px',
                                         height: '6px',
                                         borderRadius: '50%',
-                                        background: 'var(--color-cyan)',
+                                        background: 'var(--color-orange)',
                                     }}
                                 />
                                 Waiting for wallet signature...

@@ -1,5 +1,5 @@
 /**
- * App header with wallet connection and tab navigation.
+ * App header — OP_NET branded with wallet connection and tab navigation.
  */
 import React from 'react';
 import { useWalletConnect, SupportedWallets } from '@btc-vision/walletconnect';
@@ -12,7 +12,7 @@ interface HeaderProps {
 }
 
 /**
- * Main application header with wallet connector and navigation tabs.
+ * OP_NET-branded header with navigation tabs and wallet connector.
  */
 export function Header({ activeTab, onTabChange }: HeaderProps): React.ReactElement {
     const { publicKey, walletAddress, connectToWallet, disconnect } = useWalletConnect();
@@ -40,10 +40,10 @@ export function Header({ activeTab, onTabChange }: HeaderProps): React.ReactElem
                 position: 'sticky',
                 top: 0,
                 zIndex: 'var(--z-header)' as React.CSSProperties['zIndex'],
-                background: 'rgba(7, 7, 17, 0.92)',
+                background: 'rgba(10, 10, 15, 0.95)',
                 backdropFilter: 'blur(12px)',
                 WebkitBackdropFilter: 'blur(12px)',
-                borderBottom: '1px solid var(--color-border-subtle)',
+                borderBottom: '1px solid rgba(232, 115, 42, 0.12)',
             }}
         >
             <div
@@ -62,38 +62,27 @@ export function Header({ activeTab, onTabChange }: HeaderProps): React.ReactElem
                         gap: '24px',
                     }}
                 >
-                    {/* Logo + Network */}
+                    {/* OP_NET Logo */}
                     <div style={{ display: 'flex', alignItems: 'center', gap: '16px', flexShrink: 0 }}>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                            <div
-                                style={{
-                                    width: '32px',
-                                    height: '32px',
-                                    background: 'linear-gradient(135deg, #00e5ff 0%, #7c3aed 100%)',
-                                    borderRadius: '8px',
-                                    display: 'flex',
-                                    alignItems: 'center',
-                                    justifyContent: 'center',
-                                    fontSize: '14px',
-                                    fontWeight: 700,
-                                    color: '#fff',
-                                    fontFamily: 'var(--font-mono)',
-                                }}
-                            >
-                                M
-                            </div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                            {/* OP_NET Logo */}
+                            <img
+                                src="/opnet-logo.jpg"
+                                alt="OP_NET"
+                                width={36}
+                                height={36}
+                                style={{ borderRadius: '6px' }}
+                            />
                             <span
                                 style={{
-                                    fontFamily: 'var(--font-mono)',
+                                    fontFamily: 'var(--font-display)',
                                     fontWeight: 700,
-                                    fontSize: '1rem',
+                                    fontSize: '1.15rem',
                                     color: 'var(--color-text-primary)',
-                                    letterSpacing: '0.02em',
+                                    letterSpacing: '0.04em',
                                 }}
                             >
-                                MOTO
-                                <span style={{ color: 'var(--color-text-muted)', fontWeight: 400 }}>/</span>
-                                XMR
+                                <span style={{ color: 'var(--color-orange)' }}>OP</span>NET
                             </span>
                         </div>
 
@@ -103,8 +92,8 @@ export function Header({ activeTab, onTabChange }: HeaderProps): React.ReactElem
                                 alignItems: 'center',
                                 gap: '6px',
                                 padding: '3px 10px',
-                                background: 'rgba(0, 229, 255, 0.08)',
-                                border: '1px solid rgba(0, 229, 255, 0.2)',
+                                background: 'rgba(232, 115, 42, 0.08)',
+                                border: '1px solid rgba(232, 115, 42, 0.2)',
                                 borderRadius: '999px',
                             }}
                         >
@@ -127,7 +116,7 @@ export function Header({ activeTab, onTabChange }: HeaderProps): React.ReactElem
                                     fontFamily: 'var(--font-mono)',
                                 }}
                             >
-                                OPNet Testnet
+                                Testnet
                             </span>
                         </div>
                     </div>
@@ -155,11 +144,11 @@ export function Header({ activeTab, onTabChange }: HeaderProps): React.ReactElem
                                     border: 'none',
                                     background:
                                         activeTab === tab.id
-                                            ? 'rgba(0, 229, 255, 0.12)'
+                                            ? 'rgba(232, 115, 42, 0.12)'
                                             : 'transparent',
                                     color:
                                         activeTab === tab.id
-                                            ? 'var(--color-text-accent)'
+                                            ? 'var(--color-orange-light)'
                                             : 'var(--color-text-secondary)',
                                     fontFamily: 'var(--font-display)',
                                     fontSize: '0.9rem',
@@ -168,7 +157,7 @@ export function Header({ activeTab, onTabChange }: HeaderProps): React.ReactElem
                                     transition: 'all var(--transition-fast)',
                                     borderBottom:
                                         activeTab === tab.id
-                                            ? '2px solid var(--color-cyan)'
+                                            ? '2px solid var(--color-orange)'
                                             : '2px solid transparent',
                                     minHeight: '36px',
                                     whiteSpace: 'nowrap',
@@ -198,7 +187,7 @@ export function Header({ activeTab, onTabChange }: HeaderProps): React.ReactElem
                                 <div
                                     style={{
                                         padding: '6px 14px',
-                                        background: 'rgba(0, 229, 255, 0.06)',
+                                        background: 'rgba(232, 115, 42, 0.06)',
                                         border: '1px solid var(--color-border-default)',
                                         borderRadius: 'var(--radius-md)',
                                         fontFamily: 'var(--font-mono)',

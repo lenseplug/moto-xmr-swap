@@ -6,6 +6,7 @@ import { useSwaps, useBlockNumber } from '../hooks/useSwaps';
 import { formatTokenAmount, formatXmrAmount } from '../services/opnet';
 import { SWAP_STATUS_LABELS } from '../types/swap';
 import type { SwapData, SortField, SortDirection } from '../types/swap';
+import { calculateXmrFee, calculateXmrTotal } from '../types/swap';
 import { SkeletonRow } from './SkeletonRow';
 
 const MOTO_DECIMALS = 18;
@@ -281,7 +282,7 @@ export function OrderBook({ onTakeSwap }: OrderBookProps): React.ReactElement {
                                                 }}
                                                 onMouseEnter={(e) => {
                                                     (e.currentTarget as HTMLTableRowElement).style.background =
-                                                        'rgba(0, 229, 255, 0.03)';
+                                                        'rgba(232, 115, 42, 0.03)';
                                                 }}
                                                 onMouseLeave={(e) => {
                                                     (e.currentTarget as HTMLTableRowElement).style.background =
@@ -306,7 +307,10 @@ export function OrderBook({ onTakeSwap }: OrderBookProps): React.ReactElement {
                                                     </span>
                                                 </td>
 
-                                                <td style={tdStyle}>
+                                                <td
+                                                    style={tdStyle}
+                                                    title={`Total to lock: ${formatXmrAmount(calculateXmrTotal(swap.xmrAmount))} XMR (incl. 0.87% fee: ${formatXmrAmount(calculateXmrFee(swap.xmrAmount))} XMR)`}
+                                                >
                                                     <span
                                                         className="tabular-nums"
                                                         style={{ fontWeight: 600 }}
@@ -321,6 +325,16 @@ export function OrderBook({ onTakeSwap }: OrderBookProps): React.ReactElement {
                                                         }}
                                                     >
                                                         XMR
+                                                    </span>
+                                                    <span
+                                                        style={{
+                                                            display: 'block',
+                                                            fontSize: '0.7rem',
+                                                            color: 'var(--color-text-muted)',
+                                                            marginTop: '2px',
+                                                        }}
+                                                    >
+                                                        +{formatXmrAmount(calculateXmrFee(swap.xmrAmount))} fee
                                                     </span>
                                                 </td>
 

@@ -6,6 +6,7 @@
 import type { LocalSwapSecret } from '../types/swap';
 
 const LOCAL_SECRETS_KEY = 'moto_xmr_swap_secrets';
+const CLAIM_TOKENS_KEY = 'moto_xmr_claim_tokens';
 
 /**
  * Generates a cryptographically random 32-byte secret and computes its SHA-256 hash.
@@ -116,4 +117,38 @@ export function loadLocalSwapSecrets(): LocalSwapSecret[] {
 export function getLocalSwapSecret(swapId: string): LocalSwapSecret | null {
     const secrets = loadLocalSwapSecrets();
     return secrets.find((s) => s.swapId === swapId) ?? null;
+}
+
+/**
+ * Saves a claim_token for a swap in localStorage.
+ * The claim_token is used to authenticate WebSocket subscriptions.
+ *
+ * @param swapId - The swap ID (decimal string)
+ * @param claimToken - The 64-char hex claim token from the coordinator
+ */
+export function saveClaimToken(swapId: string, claimToken: string): void {
+    try {
+        const raw = localStorage.getItem(CLAIM_TOKENS_KEY);
+        const tokens: Record<string, string> = raw ? (JSON.parse(raw) as Record<string, string>) : {};
+        tokens[swapId] = claimToken;
+        localStorage.setItem(CLAIM_TOKENS_KEY, JSON.stringify(tokens));
+    } catch {
+        // localStorage unavailable — ignore
+    }
+}
+
+/**
+ * Retrieves the claim_token for a specific swap ID.
+ *
+ * @param swapId - The swap ID (decimal string)
+ */
+export function getClaimToken(swapId: string): string | null {
+    try {
+        const raw = localStorage.getItem(CLAIM_TOKENS_KEY);
+        if (!raw) return null;
+        const tokens = JSON.parse(raw) as Record<string, string>;
+        return tokens[swapId] ?? null;
+    } catch {
+        return null;
+    }
 }

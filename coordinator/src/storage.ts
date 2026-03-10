@@ -23,6 +23,8 @@ CREATE TABLE IF NOT EXISTS swaps (
     refund_block INTEGER NOT NULL,
     moto_amount TEXT NOT NULL,
     xmr_amount TEXT NOT NULL,
+    xmr_fee TEXT NOT NULL DEFAULT '0',
+    xmr_total TEXT NOT NULL DEFAULT '0',
     xmr_address TEXT,
     depositor TEXT NOT NULL,
     counterparty TEXT,
@@ -32,6 +34,8 @@ CREATE TABLE IF NOT EXISTS swaps (
     opnet_refund_tx TEXT,
     xmr_lock_tx TEXT,
     xmr_lock_confirmations INTEGER DEFAULT 0,
+    xmr_subaddr_index INTEGER,
+    claim_token TEXT,
     created_at TEXT DEFAULT (datetime('now')),
     updated_at TEXT DEFAULT (datetime('now'))
 );
@@ -112,14 +116,16 @@ export class StorageService {
     public createSwap(params: ICreateSwapParams): ISwapRecord {
         this.exec(
             `INSERT INTO swaps
-                (swap_id, hash_lock, refund_block, moto_amount, xmr_amount, xmr_address, depositor, opnet_create_tx)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+                (swap_id, hash_lock, refund_block, moto_amount, xmr_amount, xmr_fee, xmr_total, xmr_address, depositor, opnet_create_tx)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             [
                 params.swap_id,
                 params.hash_lock,
                 params.refund_block,
                 params.moto_amount,
                 params.xmr_amount,
+                params.xmr_fee,
+                params.xmr_total,
                 params.xmr_address ?? null,
                 params.depositor,
                 params.opnet_create_tx ?? null,
@@ -181,6 +187,14 @@ export class StorageService {
         if (updates.xmr_address !== undefined) {
             setClauses.push('xmr_address = ?');
             values.push(updates.xmr_address);
+        }
+        if (updates.xmr_subaddr_index !== undefined) {
+            setClauses.push('xmr_subaddr_index = ?');
+            values.push(updates.xmr_subaddr_index);
+        }
+        if (updates.claim_token !== undefined) {
+            setClauses.push('claim_token = ?');
+            values.push(updates.claim_token);
         }
 
         if (setClauses.length > 1) {
@@ -286,9 +300,21 @@ export class StorageService {
         this.exec(CREATE_STATE_HISTORY_TABLE);
         this.exec(CREATE_INDEXES);
 
+        // Migrations: add columns if missing (existing DBs)
+        this.migrateAddColumn('swaps', 'claim_token', 'TEXT');
+        this.migrateAddColumn('swaps', 'xmr_subaddr_index', 'INTEGER');
+
         this.saveTimer = setInterval(() => {
             this.persistToDisk();
         }, 5000);
+    }
+
+    private migrateAddColumn(table: string, column: string, type: string): void {
+        try {
+            this.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+        } catch {
+            // Column already exists — ignore
+        }
     }
 
     private getDb(): Database {
@@ -327,6 +353,10 @@ export class StorageService {
         this.exec(
             'INSERT INTO state_history (swap_id, from_state, to_state, metadata) VALUES (?, ?, ?, ?)',
             [swapId, fromState, toState, metadata ?? null],
+        );
+        // Prune old history entries (keep last 10,000 rows)
+        this.exec(
+            'DELETE FROM state_history WHERE id NOT IN (SELECT id FROM state_history ORDER BY id DESC LIMIT 10000)',
         );
         this.scheduleSave();
     }

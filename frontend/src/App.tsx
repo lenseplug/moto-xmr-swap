@@ -59,13 +59,44 @@ export default function App(): React.ReactElement {
         <>
             <Header activeTab={activeTab} onTabChange={handleTabChange} />
 
+            {/* Title Banner */}
+            <div
+                style={{
+                    textAlign: 'center',
+                    padding: '40px 24px 20px',
+                }}
+            >
+                <h1
+                    style={{
+                        fontSize: 'clamp(1.8rem, 4vw, 2.8rem)',
+                        fontWeight: 700,
+                        letterSpacing: '0.04em',
+                        lineHeight: 1.2,
+                    }}
+                >
+                    <span style={{ color: 'var(--color-purple-light)' }}>MOTO</span>
+                    <span style={{ color: 'var(--color-text-muted)', margin: '0 12px' }}>&gt;</span>
+                    <span style={{ color: 'var(--color-orange)' }}>XMR</span>
+                    <span style={{ color: 'var(--color-text-primary)', marginLeft: '12px' }}>SWAP</span>
+                </h1>
+                <p
+                    style={{
+                        color: 'var(--color-text-secondary)',
+                        fontSize: '0.9rem',
+                        marginTop: '8px',
+                    }}
+                >
+                    Trustless atomic exchange — Bitcoin L1 to Monero
+                </p>
+            </div>
+
             <main
                 style={{
                     flex: 1,
                     maxWidth: '1200px',
                     width: '100%',
                     margin: '0 auto',
-                    padding: '32px 24px 64px',
+                    padding: '12px 24px 64px',
                 }}
             >
                 {view.kind === 'tab' && view.tab === 'orderbook' && (
@@ -93,39 +124,26 @@ export default function App(): React.ReactElement {
                 )}
             </main>
 
-            <footer
+            {/* Powered by OPNET */}
+            <div
                 style={{
-                    borderTop: '1px solid var(--color-border-subtle)',
-                    padding: '20px 24px',
                     textAlign: 'center',
-                    fontSize: '0.78rem',
-                    color: 'var(--color-text-muted)',
+                    padding: '40px 24px 16px',
                 }}
             >
-                MOTO-XMR Swap — Trustless atomic exchange on OPNet Testnet.
-                <span style={{ marginLeft: '16px' }}>
-                    <a
-                        href="https://mempool.opnet.org/testnet4"
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="explorer-link"
-                        style={{ display: 'inline-flex' }}
-                    >
-                        Mempool
-                    </a>
-                </span>
-                <span style={{ marginLeft: '12px' }}>
-                    <a
-                        href="https://opscan.org/?network=op_testnet"
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="explorer-link"
-                        style={{ display: 'inline-flex' }}
-                    >
-                        OPScan
-                    </a>
-                </span>
-            </footer>
+                <p
+                    style={{
+                        fontSize: 'clamp(1.2rem, 2.5vw, 1.8rem)',
+                        fontWeight: 700,
+                        color: 'var(--color-text-primary)',
+                    }}
+                >
+                    Powered by{' '}
+                    <span style={{ color: 'var(--color-orange)' }}>OPNET</span>
+                </p>
+            </div>
+
+            <footer style={{ padding: '24px' }} />
         </>
     );
 }

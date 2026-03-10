@@ -2,6 +2,60 @@
  * Shared types for the MOTO-XMR Coordinator.
  */
 
+/** Swap fee in basis points (0.87% = 87 bps). Paid by the taker on the XMR side. */
+export const FEE_BPS = 87;
+
+/** Basis-point denominator. */
+const BPS_DENOMINATOR = 10_000n;
+
+/** Minimum XMR amount in piconero (0.001 XMR = 1,000,000,000 piconero). */
+export const MIN_XMR_AMOUNT_PICONERO = 1_000_000_000n;
+
+/** Regex matching a valid non-negative integer string (no leading zeros except "0" itself). */
+const VALID_AMOUNT_RE = /^(0|[1-9]\d*)$/;
+
+/**
+ * Safely parses an amount string to BigInt.
+ * Returns null if the string is not a valid non-negative integer.
+ */
+export function safeParseAmount(value: string): bigint | null {
+    if (!VALID_AMOUNT_RE.test(value)) return null;
+    return BigInt(value);
+}
+
+/**
+ * Calculates the XMR fee for a given amount in atomic units (piconero string).
+ * fee = (amount * FEE_BPS) / 10000
+ *
+ * @param xmrAmount - XMR amount as a decimal string of atomic units.
+ * @returns The fee as a decimal string of atomic units.
+ * @throws if xmrAmount is not a valid positive integer string.
+ */
+export function calculateXmrFee(xmrAmount: string): string {
+    const amount = safeParseAmount(xmrAmount);
+    if (amount === null || amount <= 0n) {
+        throw new Error(`Invalid XMR amount: must be a positive integer string, got "${xmrAmount}"`);
+    }
+    const fee = (amount * BigInt(FEE_BPS)) / BPS_DENOMINATOR;
+    return fee.toString();
+}
+
+/**
+ * Calculates XMR amount + fee.
+ *
+ * @param xmrAmount - XMR amount as a decimal string of atomic units.
+ * @returns The total (amount + fee) as a decimal string.
+ * @throws if xmrAmount is not a valid positive integer string.
+ */
+export function calculateXmrTotal(xmrAmount: string): string {
+    const amount = safeParseAmount(xmrAmount);
+    if (amount === null || amount <= 0n) {
+        throw new Error(`Invalid XMR amount: must be a positive integer string, got "${xmrAmount}"`);
+    }
+    const fee = (amount * BigInt(FEE_BPS)) / BPS_DENOMINATOR;
+    return (amount + fee).toString();
+}
+
 /** All possible states of a swap in the coordinator state machine. */
 export enum SwapStatus {
     OPEN = 'OPEN',
@@ -29,6 +83,8 @@ export interface ISwapRecord {
     readonly refund_block: number;
     readonly moto_amount: string;
     readonly xmr_amount: string;
+    readonly xmr_fee: string;
+    readonly xmr_total: string;
     readonly xmr_address: string | null;
     readonly depositor: string;
     readonly counterparty: string | null;
@@ -38,6 +94,8 @@ export interface ISwapRecord {
     readonly opnet_refund_tx: string | null;
     readonly xmr_lock_tx: string | null;
     readonly xmr_lock_confirmations: number;
+    readonly xmr_subaddr_index: number | null;
+    readonly claim_token: string | null;
     readonly created_at: string;
     readonly updated_at: string;
 }
@@ -49,6 +107,8 @@ export interface ICreateSwapParams {
     readonly refund_block: number;
     readonly moto_amount: string;
     readonly xmr_amount: string;
+    readonly xmr_fee: string;
+    readonly xmr_total: string;
     readonly xmr_address: string | null;
     readonly depositor: string;
     readonly opnet_create_tx: string | null;
@@ -57,13 +117,15 @@ export interface ICreateSwapParams {
 /** Fields that can be updated on an existing swap. */
 export interface IUpdateSwapParams {
     readonly status?: SwapStatus;
-    readonly preimage?: string;
+    readonly preimage?: string | null;
     readonly counterparty?: string;
     readonly opnet_claim_tx?: string;
     readonly opnet_refund_tx?: string;
     readonly xmr_lock_tx?: string;
     readonly xmr_lock_confirmations?: number;
     readonly xmr_address?: string;
+    readonly xmr_subaddr_index?: number;
+    readonly claim_token?: string | null;
 }
 
 /** A state history entry. */
@@ -112,6 +174,7 @@ export interface IWsPreimageReady {
 export interface IWsClientMessage {
     readonly type: 'subscribe';
     readonly swapId: string;
+    readonly claimToken?: string;
 }
 
 /** WebSocket message shape. */

@@ -1,14 +1,15 @@
 /**
  * SwapStatus component — state machine visualization for a swap's lifecycle.
  */
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useWalletConnect } from '@btc-vision/walletconnect';
-import { Address } from '@btc-vision/transaction';
 import { networks } from '@btc-vision/bitcoin';
 import { getSwapVaultContract, formatTokenAmount, formatXmrAmount } from '../services/opnet';
-import { getCoordinatorSwapStatus } from '../services/coordinator';
-import { getLocalSwapSecret, secretHexToBigint } from '../utils/hashlock';
+import { calculateXmrFee, calculateXmrTotal } from '../types/swap';
+import { getCoordinatorSwapStatus, submitSwapSecret } from '../services/coordinator';
+import { getLocalSwapSecret, getClaimToken, secretHexToBigint } from '../utils/hashlock';
 import { useSwap, useBlockNumber } from '../hooks/useSwaps';
+import { useCoordinatorWs } from '../hooks/useCoordinatorWs';
 import type { CoordinatorStatus } from '../types/swap';
 import { ExplorerLinks } from './ExplorerLinks';
 import { SkeletonBlock } from './SkeletonRow';
@@ -41,7 +42,7 @@ function stepIndex(step: StepKey): number {
  * Renders the swap state machine progress and relevant actions.
  */
 export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElement {
-    const { publicKey, hashedMLDSAKey, walletAddress } = useWalletConnect();
+    const { publicKey, address: senderAddress, walletAddress } = useWalletConnect();
     const isConnected = publicKey !== null;
     const { swap, isLoading, error: loadError } = useSwap(swapId);
     const currentBlock = useBlockNumber();
@@ -53,6 +54,33 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
     const [actionError, setActionError] = useState<string | null>(null);
 
     const localSecret = getLocalSwapSecret(swapId.toString());
+
+    // Retrieve claim_token for authenticated WebSocket subscription
+    const claimToken = getClaimToken(swapId.toString());
+
+    // WebSocket connection for real-time preimage delivery (authenticated)
+    const { preimage: wsPreimage } = useCoordinatorWs(swapId.toString(), claimToken);
+
+    // Combined preimage: prefer local secret, fall back to WebSocket preimage
+    const claimablePreimage = localSecret?.secret ?? wsPreimage;
+
+    // Retry submitting secret to coordinator if we have it locally but coordinator may not
+    const secretRetried = useRef(false);
+    useEffect(() => {
+        if (secretRetried.current) return;
+        if (!localSecret) return;
+
+        // If the coordinator doesn't have the preimage, try to submit it
+        if (coordinatorStatus !== null) {
+            // coordinatorStatus comes from the GET endpoint (preimage is null there)
+            // Submit if swap is OPEN or TAKEN — coordinator will check for dupes
+            const step = coordinatorStatus.step;
+            if (step === 'created' || step === 'taken') {
+                secretRetried.current = true;
+                void submitSwapSecret(swapId.toString(), localSecret.secret);
+            }
+        }
+    }, [localSecret, coordinatorStatus, swapId]);
 
     // Poll coordinator
     useEffect(() => {
@@ -104,12 +132,12 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
     const canRefund = swap !== null && (swap.status === 0n || swap.status === 1n) && isExpired;
 
     const handleClaim = useCallback(async (): Promise<void> => {
-        if (!isConnected || !walletAddress || !publicKey || !hashedMLDSAKey) {
+        if (!isConnected || !walletAddress || !publicKey || !senderAddress) {
             setActionError('Connect your wallet first');
             return;
         }
-        if (localSecret === null) {
-            setActionError('No local secret found. Cannot claim from this device.');
+        if (!claimablePreimage) {
+            setActionError('No secret available. Cannot claim from this device.');
             return;
         }
         if (!SWAP_VAULT_ADDRESS) {
@@ -121,9 +149,8 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
         setActionError(null);
 
         try {
-            const senderAddress = Address.fromString(hashedMLDSAKey, publicKey);
             const contract = getSwapVaultContract(SWAP_VAULT_ADDRESS, senderAddress);
-            const preimage = secretHexToBigint(localSecret.secret);
+            const preimage = secretHexToBigint(claimablePreimage);
 
             const sim = await contract.claim(swapId, preimage);
             if ('error' in sim) throw new Error(`Simulation failed: ${String(sim.error)}`);
@@ -153,10 +180,10 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
             setClaimStep('error');
             setActionError(err instanceof Error ? err.message : 'Unknown error');
         }
-    }, [isConnected, walletAddress, publicKey, hashedMLDSAKey, localSecret, swapId]);
+    }, [isConnected, walletAddress, publicKey, senderAddress, claimablePreimage, swapId]);
 
     const handleRefund = useCallback(async (): Promise<void> => {
-        if (!isConnected || !walletAddress || !publicKey || !hashedMLDSAKey) {
+        if (!isConnected || !walletAddress || !publicKey || !senderAddress) {
             setActionError('Connect your wallet first');
             return;
         }
@@ -169,7 +196,7 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
         setActionError(null);
 
         try {
-            const senderAddress = Address.fromString(hashedMLDSAKey, publicKey);
+            // senderAddress from walletconnect context (already resolved)
             const contract = getSwapVaultContract(SWAP_VAULT_ADDRESS, senderAddress);
 
             const sim = await contract.refund(swapId);
@@ -199,7 +226,7 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
             setRefundStep('error');
             setActionError(err instanceof Error ? err.message : 'Unknown error');
         }
-    }, [isConnected, walletAddress, publicKey, hashedMLDSAKey, swapId]);
+    }, [isConnected, walletAddress, publicKey, senderAddress, swapId]);
 
     return (
         <div style={{ maxWidth: '560px' }}>
@@ -272,7 +299,7 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
                                             bottom: '0',
                                             width: '2px',
                                             background: isDone
-                                                ? 'var(--color-cyan)'
+                                                ? 'var(--color-orange)'
                                                 : 'var(--color-border-subtle)',
                                         }}
                                     />
@@ -290,15 +317,15 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
                                         justifyContent: 'center',
                                         border: `2px solid ${
                                             isDone
-                                                ? 'var(--color-cyan)'
+                                                ? 'var(--color-orange)'
                                                 : isActive
-                                                  ? 'var(--color-cyan)'
+                                                  ? 'var(--color-orange)'
                                                   : 'var(--color-border-subtle)'
                                         }`,
                                         background: isDone
-                                            ? 'var(--color-cyan)'
+                                            ? 'var(--color-orange)'
                                             : isActive
-                                              ? 'rgba(0, 229, 255, 0.12)'
+                                              ? 'rgba(232, 115, 42, 0.12)'
                                               : 'transparent',
                                         zIndex: 1,
                                     }}
@@ -345,10 +372,10 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
                                                     fontSize: '0.7rem',
                                                     fontWeight: 600,
                                                     color: 'var(--color-text-accent)',
-                                                    background: 'rgba(0, 229, 255, 0.1)',
+                                                    background: 'rgba(232, 115, 42, 0.1)',
                                                     padding: '1px 6px',
                                                     borderRadius: '999px',
-                                                    border: '1px solid rgba(0, 229, 255, 0.2)',
+                                                    border: '1px solid rgba(232, 115, 42, 0.2)',
                                                     textTransform: 'uppercase',
                                                     letterSpacing: '0.05em',
                                                 }}
@@ -401,6 +428,18 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
                             </p>
                         </div>
                         <div>
+                            <p style={{ fontSize: '0.75rem', color: 'var(--color-text-muted)', marginBottom: '4px', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Fee (0.87%)</p>
+                            <p className="tabular-nums" style={{ fontSize: '0.9rem', color: 'var(--color-text-secondary)' }}>
+                                +{formatXmrAmount(calculateXmrFee(swap.xmrAmount))} XMR
+                            </p>
+                        </div>
+                        <div>
+                            <p style={{ fontSize: '0.75rem', color: 'var(--color-text-muted)', marginBottom: '4px', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Total XMR (Taker Locks)</p>
+                            <p className="tabular-nums" style={{ fontWeight: 700, fontSize: '1.1rem', color: 'var(--color-text-warning)' }}>
+                                {formatXmrAmount(calculateXmrTotal(swap.xmrAmount))}
+                            </p>
+                        </div>
+                        <div>
                             <p style={{ fontSize: '0.75rem', color: 'var(--color-text-muted)', marginBottom: '4px', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Blocks Left</p>
                             <p
                                 className="tabular-nums"
@@ -447,6 +486,60 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
                     {coordinatorStatus.xmrTxId !== undefined && (
                         <p style={{ fontFamily: 'var(--font-mono)', fontSize: '0.75rem', color: 'var(--color-text-muted)', marginTop: '6px' }}>
                             XMR TX: {coordinatorStatus.xmrTxId.slice(0, 20)}...
+                        </p>
+                    )}
+                </div>
+            )}
+
+            {/* XMR Lock Address */}
+            {coordinatorStatus !== null &&
+                coordinatorStatus.xmrLockAddress !== undefined &&
+                (coordinatorStatus.step === 'xmr_locking' || coordinatorStatus.step === 'xmr_locked') && (
+                <div
+                    style={{
+                        padding: '16px',
+                        background: 'rgba(255, 152, 0, 0.06)',
+                        border: '1px solid rgba(255, 152, 0, 0.25)',
+                        borderRadius: 'var(--radius-md)',
+                        marginBottom: '16px',
+                    }}
+                >
+                    <p style={{ fontSize: '0.75rem', color: 'var(--color-text-muted)', marginBottom: '6px', textTransform: 'uppercase', letterSpacing: '0.05em', fontWeight: 600 }}>
+                        XMR Lock Address
+                    </p>
+                    <div
+                        style={{
+                            padding: '10px 12px',
+                            background: 'rgba(0,0,0,0.2)',
+                            borderRadius: 'var(--radius-sm)',
+                            fontFamily: 'var(--font-mono)',
+                            fontSize: '0.72rem',
+                            wordBreak: 'break-all',
+                            color: 'var(--color-text-primary)',
+                            cursor: 'pointer',
+                            userSelect: 'all',
+                        }}
+                        title="Click to select"
+                    >
+                        {coordinatorStatus.xmrLockAddress}
+                    </div>
+                    {swap !== null && (
+                        <p style={{ fontSize: '0.78rem', color: 'var(--color-text-secondary)', marginTop: '8px' }}>
+                            Send <strong>{formatXmrAmount(calculateXmrTotal(swap.xmrAmount))}</strong> XMR to this address
+                        </p>
+                    )}
+                    {coordinatorStatus.xmrLockConfirmations !== undefined && (
+                        <p
+                            style={{
+                                fontSize: '0.82rem',
+                                fontWeight: 600,
+                                color: coordinatorStatus.xmrLockConfirmations >= 10
+                                    ? 'var(--color-text-success)'
+                                    : 'var(--color-text-warning)',
+                                marginTop: '6px',
+                            }}
+                        >
+                            Confirmations: {coordinatorStatus.xmrLockConfirmations} / 10
                         </p>
                     )}
                 </div>
@@ -505,7 +598,7 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
             )}
 
             {/* Claim action */}
-            {localSecret !== null && swap !== null && swap.status === 1n && claimStep === 'idle' && (
+            {claimablePreimage !== null && swap !== null && swap.status === 1n && claimStep === 'idle' && (
                 <button
                     className="btn btn-primary btn-lg"
                     style={{ width: '100%', marginBottom: '12px' }}
@@ -544,7 +637,7 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
                 <div
                     style={{
                         padding: '16px',
-                        background: 'rgba(0, 229, 255, 0.06)',
+                        background: 'rgba(232, 115, 42, 0.06)',
                         border: '1px solid var(--color-border-default)',
                         borderRadius: 'var(--radius-md)',
                         textAlign: 'center',

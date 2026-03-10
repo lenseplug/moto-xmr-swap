@@ -77,7 +77,32 @@ export interface CoordinatorStatus {
         | 'error';
     readonly message: string;
     readonly xmrTxId?: string;
+    readonly xmrFee?: string;
+    readonly xmrTotal?: string;
+    readonly xmrLockAddress?: string;
+    readonly xmrLockConfirmations?: number;
     readonly updatedAt: number;
+}
+
+/** Swap fee in basis points (0.87%). */
+export const FEE_BPS = 87n;
+
+/** Basis-point denominator. */
+const BPS_DENOMINATOR = 10_000n;
+
+/**
+ * Calculates the XMR taker fee from an on-chain xmrAmount (piconero bigint).
+ * fee = (amount * 87) / 10000
+ */
+export function calculateXmrFee(xmrAmount: bigint): bigint {
+    return (xmrAmount * FEE_BPS) / BPS_DENOMINATOR;
+}
+
+/**
+ * Calculates xmrAmount + fee.
+ */
+export function calculateXmrTotal(xmrAmount: bigint): bigint {
+    return xmrAmount + calculateXmrFee(xmrAmount);
 }
 
 /**

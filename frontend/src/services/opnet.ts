@@ -159,16 +159,113 @@ export function parseXmrAmount(display: string): bigint {
     return whole * 10n ** 12n + frac;
 }
 
+/** Base58 alphabet used by Monero addresses. */
+const BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+
+/** Monero base58 encoded-block-size → decoded-byte-count mapping. */
+const ENCODED_BLOCK_SIZES: Record<number, number> = {
+    0: 0, 2: 1, 3: 2, 5: 3, 6: 4, 7: 5, 9: 6, 10: 7, 11: 8,
+};
+
 /**
- * Encodes a 128-bit XMR address (Monero address) as two 128-bit big-endian chunks.
- * Monero addresses are 128 bytes total (256 bits → split into hi/lo 128-bit parts).
- *
- * @param xmrAddressHex - 64-char hex string (256-bit XMR address)
+ * Decodes a single Monero base58 block to `targetBytes` bytes.
  */
-export function splitXmrAddress(xmrAddressHex: string): { hi: bigint; lo: bigint } {
-    // Monero addresses are 64 bytes (128 hex chars). Pad to full 128-char width
-    // then split into two 256-bit (64-char) halves.
-    const clean = xmrAddressHex.replace(/^0x/, '').padStart(128, '0');
+function decodeBlock(block: string, targetBytes: number): Uint8Array {
+    let num = 0n;
+    for (const char of block) {
+        const idx = BASE58_ALPHABET.indexOf(char);
+        if (idx === -1) throw new Error(`Invalid base58 character: ${char}`);
+        num = num * 58n + BigInt(idx);
+    }
+    const out = new Uint8Array(targetBytes);
+    for (let i = targetBytes - 1; i >= 0; i--) {
+        out[i] = Number(num & 0xffn);
+        num >>= 8n;
+    }
+    return out;
+}
+
+/**
+ * Decodes a Monero base58 string (block-encoded) to a Uint8Array.
+ * Monero splits bytes into 8-byte blocks, each encoded as 11 base58 chars,
+ * with a shorter final block.
+ */
+function base58Decode(input: string): Uint8Array {
+    const fullBlocks = Math.floor(input.length / 11);
+    const lastBlockChars = input.length % 11;
+    const lastBlockBytes = ENCODED_BLOCK_SIZES[lastBlockChars];
+
+    if (lastBlockBytes === undefined) {
+        throw new Error(`Invalid Monero base58 length: ${input.length}`);
+    }
+
+    const totalBytes = fullBlocks * 8 + lastBlockBytes;
+    const result = new Uint8Array(totalBytes);
+    let offset = 0;
+
+    for (let i = 0; i < fullBlocks; i++) {
+        const chunk = input.slice(i * 11, i * 11 + 11);
+        result.set(decodeBlock(chunk, 8), offset);
+        offset += 8;
+    }
+
+    if (lastBlockChars > 0) {
+        const lastChunk = input.slice(fullBlocks * 11);
+        result.set(decodeBlock(lastChunk, lastBlockBytes), offset);
+    }
+
+    return result;
+}
+
+/**
+ * Returns true if the string looks like a hex-encoded address (only 0-9, a-f, A-F).
+ */
+function isHexString(s: string): boolean {
+    return /^(0x)?[0-9a-fA-F]+$/.test(s);
+}
+
+/**
+ * Parses a Monero address (base58 or hex) and returns the 64-byte payload
+ * (32-byte spend key + 32-byte view key) as a hex string.
+ *
+ * Accepts:
+ *  - Standard Monero address (95-char base58, starts with 4)
+ *  - Monero testnet/stagenet address (95-char base58, starts with 5, 7, 9, etc.)
+ *  - Raw hex (64-128 hex chars)
+ */
+export function parseXmrAddress(input: string): string {
+    const trimmed = input.trim().replace(/^0x/, '');
+
+    // If it looks like hex, use as-is
+    if (isHexString(trimmed)) {
+        return trimmed;
+    }
+
+    // Otherwise try base58 decode (standard Monero address)
+    const decoded = base58Decode(trimmed);
+
+    // Monero standard address: 1 byte network + 32 spend + 32 view + 4 checksum = 69 bytes
+    // We want the 64-byte middle (spend + view keys)
+    if (decoded.length < 65) {
+        throw new Error(`Decoded address too short: ${decoded.length} bytes (expected >= 65)`);
+    }
+
+    // Extract spend key (bytes 1-32) and view key (bytes 33-64)
+    const payload = decoded.slice(1, 65);
+    return Array.from(payload)
+        .map((b) => b.toString(16).padStart(2, '0'))
+        .join('');
+}
+
+/**
+ * Encodes a Monero address (base58 or hex) as two 256-bit big-endian values
+ * for on-chain storage.
+ *
+ * @param xmrAddress - Standard Monero address (base58) or 128-char hex
+ */
+export function splitXmrAddress(xmrAddress: string): { hi: bigint; lo: bigint } {
+    const hex = parseXmrAddress(xmrAddress);
+    const clean = hex.padStart(128, '0');
     const hi = BigInt('0x' + clean.slice(0, 64));
     const lo = BigInt('0x' + clean.slice(64, 128));
     return { hi, lo };

@@ -2,74 +2,65 @@
  * OPNet watcher — polls the SwapVault contract for on-chain state changes.
  */
 
-import { getContract, JSONRpcProvider, type BitcoinInterfaceAbi } from 'opnet';
+import { getContract, JSONRpcProvider, ABIDataTypes, BitcoinAbiTypes, OP_NET_ABI, type BitcoinInterfaceAbi, type IOP_NETContract, type CallResult } from 'opnet';
 import { networks } from '@btc-vision/bitcoin';
-import { type IOnChainSwap, type ISwapRecord, type IUpdateSwapParams, SwapStatus } from './types.js';
+import type { Address } from '@btc-vision/transaction';
+import { type IOnChainSwap, type ISwapRecord, type IUpdateSwapParams, SwapStatus, calculateXmrFee, calculateXmrTotal } from './types.js';
 import { StorageService } from './storage.js';
 import { SwapStateMachine } from './state-machine.js';
 
-/** Type alias for the swap vault contract interface used internally. */
-type SwapVaultContract = {
-    getSwapCount: () => Promise<{ decoded: [bigint] } | { error: string }>;
-    getSwap: (id: bigint) => Promise<
-        | {
-              decoded: [
-                  bigint,
-                  bigint,
-                  bigint,
-                  bigint,
-                  string,
-                  string,
-                  bigint,
-                  bigint,
-                  bigint,
-              ];
-          }
-        | { error: string }
-    >;
-};
+/** Typed SwapVault contract interface for coordinator-side reads. */
+interface ISwapVaultContract extends IOP_NETContract {
+    getSwapCount(): Promise<CallResult<{ count: bigint }>>;
+    getSwap(swapId: bigint): Promise<CallResult<{
+        hashLock: bigint;
+        refundBlock: bigint;
+        amount: bigint;
+        xmrAmount: bigint;
+        depositor: Address;
+        counterparty: Address;
+        status: bigint;
+        xmrAddressHi: bigint;
+        xmrAddressLo: bigint;
+    }>>;
+}
 
 const OPNET_RPC_URL = 'https://testnet.opnet.org';
 const POLL_INTERVAL_MS = 15_000;
 const MAX_RETRY_DELAY_MS = 30_000;
 const CONTRACT_ADDRESS = process.env['SWAP_CONTRACT_ADDRESS'] ?? '';
 
-/** Minimal SwapVault ABI for coordinator-side reads. */
+/** SwapVault ABI using proper ABIDataTypes enum values. */
 const SWAP_VAULT_ABI: BitcoinInterfaceAbi = [
     {
         name: 'getSwapCount',
-        type: 'Function',
-        payable: false,
-        onlyOwner: false,
         inputs: [],
-        outputs: [{ name: 'count', type: 'UINT256' }],
+        outputs: [{ name: 'count', type: ABIDataTypes.UINT256 }],
+        type: BitcoinAbiTypes.Function,
     },
     {
         name: 'getSwap',
-        type: 'Function',
-        payable: false,
-        onlyOwner: false,
-        inputs: [{ name: 'swapId', type: 'UINT256' }],
+        inputs: [{ name: 'swapId', type: ABIDataTypes.UINT256 }],
         outputs: [
-            { name: 'hashLock', type: 'UINT256' },
-            { name: 'refundBlock', type: 'UINT256' },
-            { name: 'amount', type: 'UINT256' },
-            { name: 'xmrAmount', type: 'UINT256' },
-            { name: 'depositor', type: 'ADDRESS' },
-            { name: 'counterparty', type: 'ADDRESS' },
-            { name: 'status', type: 'UINT256' },
-            { name: 'xmrAddressHi', type: 'UINT256' },
-            { name: 'xmrAddressLo', type: 'UINT256' },
+            { name: 'hashLock', type: ABIDataTypes.UINT256 },
+            { name: 'refundBlock', type: ABIDataTypes.UINT256 },
+            { name: 'amount', type: ABIDataTypes.UINT256 },
+            { name: 'xmrAmount', type: ABIDataTypes.UINT256 },
+            { name: 'depositor', type: ABIDataTypes.ADDRESS },
+            { name: 'counterparty', type: ABIDataTypes.ADDRESS },
+            { name: 'status', type: ABIDataTypes.UINT256 },
+            { name: 'xmrAddressHi', type: ABIDataTypes.UINT256 },
+            { name: 'xmrAddressLo', type: ABIDataTypes.UINT256 },
         ],
+        type: BitcoinAbiTypes.Function,
     },
     {
         name: 'getActiveSwaps',
-        type: 'Function',
-        payable: false,
-        onlyOwner: false,
         inputs: [],
-        outputs: [{ name: 'swapIds', type: 'UINT256_ARRAY' }],
+        outputs: [{ name: 'swapIds', type: ABIDataTypes.ARRAY_OF_UINT256 }],
+        type: BitcoinAbiTypes.Function,
     },
+    ...OP_NET_ABI,
 ] as unknown as BitcoinInterfaceAbi;
 
 /** Maps on-chain numeric status values to coordinator SwapStatus. */
@@ -180,26 +171,30 @@ export class OpnetWatcher {
         }, POLL_INTERVAL_MS);
     }
 
+    /** Returns a typed SwapVault contract instance. */
+    private getSwapContract(): ISwapVaultContract {
+        return getContract<ISwapVaultContract>(
+            CONTRACT_ADDRESS,
+            SWAP_VAULT_ABI,
+            this.provider,
+            networks.opnetTestnet,
+        );
+    }
+
     private async checkForNewSwaps(): Promise<void> {
         if (!CONTRACT_ADDRESS) return;
 
         try {
-            const rawContract = getContract(
-                CONTRACT_ADDRESS,
-                SWAP_VAULT_ABI,
-                this.provider,
-                networks.opnetTestnet,
-            );
-            const contract = rawContract as unknown as SwapVaultContract;
-
+            const contract = this.getSwapContract();
             const countResult = await withRetry(() => contract.getSwapCount());
 
             if ('error' in countResult) {
-                console.error(`[OPNet Watcher] getSwapCount error: ${countResult.error}`);
+                const errMsg = (countResult as { error: string }).error;
+                console.error(`[OPNet Watcher] getSwapCount error: ${errMsg}`);
                 return;
             }
 
-            const count = countResult.decoded[0];
+            const count = countResult.properties.count;
             if (count === undefined) return;
 
             if (count > this.lastKnownSwapCount) {
@@ -217,7 +212,7 @@ export class OpnetWatcher {
     private async syncSwapRange(
         from: bigint,
         to: bigint,
-        contract: SwapVaultContract,
+        contract: ISwapVaultContract,
     ): Promise<void> {
         for (let i = from; i < to; i++) {
             try {
@@ -237,13 +232,7 @@ export class OpnetWatcher {
         if (activeSwaps.length === 0) return;
 
         try {
-            const rawContract = getContract(
-                CONTRACT_ADDRESS,
-                SWAP_VAULT_ABI,
-                this.provider,
-                networks.opnetTestnet,
-            );
-            const contract = rawContract as unknown as SwapVaultContract;
+            const contract = this.getSwapContract();
 
             for (const swap of activeSwaps) {
                 try {
@@ -266,44 +255,44 @@ export class OpnetWatcher {
 
     private async fetchAndUpsertSwap(
         swapId: bigint,
-        contract: SwapVaultContract,
+        contract: ISwapVaultContract,
     ): Promise<void> {
         const result = await withRetry(() => contract.getSwap(swapId));
 
         if ('error' in result) {
-            console.warn(`[OPNet Watcher] getSwap(${swapId}) error: ${result.error}`);
+            const errMsg = (result as { error: string }).error;
+            console.warn(`[OPNet Watcher] getSwap(${swapId}) error: ${errMsg}`);
             return;
         }
 
-        const [
-            hashLock,
-            refundBlock,
-            amount,
-            xmrAmount,
-            depositor,
-            counterparty,
-            onChainStatus,
-            xmrAddressHi,
-            xmrAddressLo,
-        ] = result.decoded;
-
-        if (hashLock === undefined) return;
+        const props = result.properties;
 
         const onChain: IOnChainSwap = {
             swapId,
-            hashLock: hashLock ?? 0n,
-            refundBlock: refundBlock ?? 0n,
-            amount: amount ?? 0n,
-            xmrAmount: xmrAmount ?? 0n,
-            depositor: depositor ?? '',
-            counterparty: counterparty ?? '',
-            status: onChainStatus ?? 0n,
-            xmrAddressHi: xmrAddressHi ?? 0n,
-            xmrAddressLo: xmrAddressLo ?? 0n,
+            hashLock: props.hashLock ?? 0n,
+            refundBlock: props.refundBlock ?? 0n,
+            amount: props.amount ?? 0n,
+            xmrAmount: props.xmrAmount ?? 0n,
+            depositor: props.depositor?.toString() ?? '',
+            counterparty: props.counterparty?.toString() ?? '',
+            status: props.status ?? 0n,
+            xmrAddressHi: props.xmrAddressHi ?? 0n,
+            xmrAddressLo: props.xmrAddressLo ?? 0n,
         };
 
         this.upsertFromOnChain(onChain);
     }
+
+    /**
+     * Coordinator-only intermediate states that should NOT be overwritten
+     * by on-chain status polling. The on-chain contract only knows
+     * OPEN/TAKEN/COMPLETED/REFUNDED, but the coordinator has richer states.
+     */
+    private static readonly COORDINATOR_ONLY_STATES: ReadonlySet<SwapStatus> = new Set([
+        SwapStatus.XMR_LOCKING,
+        SwapStatus.XMR_LOCKED,
+        SwapStatus.MOTO_CLAIMING,
+    ]);
 
     private upsertFromOnChain(onChain: IOnChainSwap): void {
         const swapIdStr = onChain.swapId.toString();
@@ -311,17 +300,38 @@ export class OpnetWatcher {
         const onChainMappedStatus = mapOnChainStatus(onChain.status);
 
         if (!existing) {
+            const xmrAmountStr = onChain.xmrAmount.toString();
+            if (onChain.xmrAmount <= 0n) {
+                console.warn(`[OPNet Watcher] Skipping swap ${swapIdStr} — xmrAmount is zero or negative`);
+                return;
+            }
+            const xmrFee = calculateXmrFee(xmrAmountStr);
+            const xmrTotal = calculateXmrTotal(xmrAmountStr);
+
             this.storage.createSwap({
                 swap_id: swapIdStr,
                 hash_lock: onChain.hashLock.toString(16).padStart(64, '0'),
                 refund_block: Number(onChain.refundBlock),
                 moto_amount: onChain.amount.toString(),
-                xmr_amount: onChain.xmrAmount.toString(),
+                xmr_amount: xmrAmountStr,
+                xmr_fee: xmrFee,
+                xmr_total: xmrTotal,
                 xmr_address: null,
                 depositor: onChain.depositor,
                 opnet_create_tx: null,
             });
-            console.log(`[OPNet Watcher] Created swap record for on-chain swap ${swapIdStr}`);
+            console.log(`[OPNet Watcher] Created swap record for on-chain swap ${swapIdStr} (fee: ${xmrFee}, total: ${xmrTotal})`);
+            return;
+        }
+
+        // Don't regress coordinator-managed intermediate states.
+        // The on-chain contract maps TAKEN for all of XMR_LOCKING/XMR_LOCKED/MOTO_CLAIMING.
+        // Allow COMPLETED/REFUNDED to pass through (terminal transitions from on-chain).
+        if (
+            OpnetWatcher.COORDINATOR_ONLY_STATES.has(existing.status) &&
+            onChainMappedStatus !== SwapStatus.COMPLETED &&
+            onChainMappedStatus !== SwapStatus.REFUNDED
+        ) {
             return;
         }
 
@@ -337,6 +347,14 @@ export class OpnetWatcher {
         const updates: IUpdateSwapParams = hasNewCounterparty
             ? { status: onChainMappedStatus, counterparty: onChain.counterparty }
             : { status: onChainMappedStatus };
+
+        // Set claim/refund TX markers for terminal transitions so state machine guards are satisfied
+        if (onChainMappedStatus === SwapStatus.COMPLETED && !existing.opnet_claim_tx) {
+            this.storage.updateSwap(swapIdStr, { opnet_claim_tx: 'on-chain-confirmed' });
+        }
+        if (onChainMappedStatus === SwapStatus.REFUNDED && !existing.opnet_refund_tx) {
+            this.storage.updateSwap(swapIdStr, { opnet_refund_tx: 'on-chain-confirmed' });
+        }
 
         const updated = this.storage.updateSwap(swapIdStr, updates, prevStatus);
         this.stateMachine.notifyTransition(updated, prevStatus, onChainMappedStatus);

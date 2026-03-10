@@ -19,11 +19,11 @@ const VALID_TRANSITIONS: ReadonlyMap<SwapStatus, ReadonlySet<SwapStatus>> = new 
     ],
     [
         SwapStatus.XMR_LOCKING,
-        new Set([SwapStatus.XMR_LOCKED, SwapStatus.EXPIRED]),
+        new Set([SwapStatus.XMR_LOCKED, SwapStatus.COMPLETED, SwapStatus.REFUNDED]),
     ],
     [
         SwapStatus.XMR_LOCKED,
-        new Set([SwapStatus.MOTO_CLAIMING, SwapStatus.EXPIRED]),
+        new Set([SwapStatus.MOTO_CLAIMING, SwapStatus.COMPLETED, SwapStatus.REFUNDED]),
     ],
     [
         SwapStatus.MOTO_CLAIMING,

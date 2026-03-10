@@ -40,41 +40,48 @@ export function useSwaps(): UseSwapsResult {
 
         try {
             const contract = getSwapVaultContract(SWAP_VAULT_ADDRESS);
-            const activeResult = await contract.getActiveSwaps();
+            const countResult = await contract.getSwapCount();
 
-            if ('error' in activeResult) {
-                throw new Error(String(activeResult.error));
+            if ('error' in countResult) {
+                throw new Error(String(countResult.error));
             }
 
-            const rawIds = activeResult.properties.swapIds as unknown;
-            const swapIds: bigint[] = Array.isArray(rawIds) ? (rawIds as bigint[]) : [];
-
+            const count = countResult.properties.count ?? 0n;
             const swapDataArr: SwapData[] = [];
 
-            for (const swapId of swapIds) {
-                const result = await contract.getSwap(swapId);
-                if ('error' in result) continue;
+            for (let i = 0n; i < count; i++) {
+                try {
+                    const result = await contract.getSwap(i);
+                    if ('error' in result) continue;
 
-                const p = result.properties;
-                const depositorStr = typeof p.depositor === 'object' && p.depositor !== null
-                    ? (p.depositor as { toString(): string }).toString()
-                    : String(p.depositor);
-                const counterpartyStr = typeof p.counterparty === 'object' && p.counterparty !== null
-                    ? (p.counterparty as { toString(): string }).toString()
-                    : String(p.counterparty);
+                    const p = result.properties;
 
-                swapDataArr.push({
-                    swapId,
-                    hashLock: p.hashLock,
-                    refundBlock: p.refundBlock,
-                    amount: p.amount,
-                    xmrAmount: p.xmrAmount,
-                    depositor: depositorStr,
-                    counterparty: counterpartyStr,
-                    status: p.status,
-                    xmrAddressHi: p.xmrAddressHi,
-                    xmrAddressLo: p.xmrAddressLo,
-                });
+                    // Only include non-terminal swaps (OPEN=0, TAKEN=1)
+                    if (p.status > 1n) continue;
+
+                    const depositorStr = typeof p.depositor === 'object' && p.depositor !== null
+                        ? (p.depositor as { toString(): string }).toString()
+                        : String(p.depositor);
+                    const counterpartyStr = typeof p.counterparty === 'object' && p.counterparty !== null
+                        ? (p.counterparty as { toString(): string }).toString()
+                        : String(p.counterparty);
+
+                    swapDataArr.push({
+                        swapId: i,
+                        hashLock: p.hashLock,
+                        refundBlock: p.refundBlock,
+                        amount: p.amount,
+                        xmrAmount: p.xmrAmount,
+                        depositor: depositorStr,
+                        counterparty: counterpartyStr,
+                        status: p.status,
+                        xmrAddressHi: p.xmrAddressHi,
+                        xmrAddressLo: p.xmrAddressLo,
+                    });
+                } catch {
+                    // Skip individual swap fetch errors
+                    continue;
+                }
             }
 
             if (!mountedRef.current) return;

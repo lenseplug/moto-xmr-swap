@@ -39,13 +39,22 @@ export async function getCoordinatorSwapStatus(swapId: string): Promise<Coordina
 }
 
 /**
+ * Result of notifying the coordinator about a taken swap.
+ */
+export interface TakeSwapResult {
+    readonly ok: boolean;
+    readonly claimToken: string | null;
+}
+
+/**
  * Notifies the coordinator that a swap has been taken on-chain.
  * This triggers the coordinator to begin locking XMR.
+ * Returns the claim_token for authenticated WebSocket subscription.
  *
  * @param swapId - The swap ID as a decimal string
  * @param txId - The Bitcoin transaction ID of the takeSwap call
  */
-export async function notifySwapTaken(swapId: string, txId: string): Promise<boolean> {
+export async function notifySwapTaken(swapId: string, txId: string): Promise<TakeSwapResult> {
     try {
         const res = await fetch(`${COORDINATOR_BASE}/api/swaps/${swapId}/take`, {
             method: 'POST',
@@ -53,9 +62,12 @@ export async function notifySwapTaken(swapId: string, txId: string): Promise<boo
             body: JSON.stringify({ opnetTxId: txId }),
             signal: AbortSignal.timeout(10000),
         });
-        return res.ok;
+        if (!res.ok) return { ok: false, claimToken: null };
+        const body = (await res.json()) as { data?: { claim_token?: string } };
+        const claimToken = body.data?.claim_token ?? null;
+        return { ok: true, claimToken };
     } catch {
-        return false;
+        return { ok: false, claimToken: null };
     }
 }
 
@@ -71,5 +83,27 @@ export async function getAllCoordinatorStatuses(): Promise<CoordinatorStatus[]> 
         return (await res.json()) as CoordinatorStatus[];
     } catch {
         return [];
+    }
+}
+
+/**
+ * Submits the swap secret (preimage) to the coordinator.
+ * The coordinator verifies SHA-256(secret) matches the on-chain hash lock.
+ *
+ * @param swapId - The swap ID as a decimal string
+ * @param secret - The 64-char hex preimage
+ * @returns true if the secret was accepted
+ */
+export async function submitSwapSecret(swapId: string, secret: string): Promise<boolean> {
+    try {
+        const res = await fetch(`${COORDINATOR_BASE}/api/swaps/${swapId}/secret`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ secret }),
+            signal: AbortSignal.timeout(10000),
+        });
+        return res.ok;
+    } catch {
+        return false;
     }
 }

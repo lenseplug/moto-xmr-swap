@@ -183,7 +183,7 @@ export function MySwaps({ onViewStatus }: MySwapsProps): React.ReactElement {
                 <div
                     style={{
                         padding: '12px 14px',
-                        background: 'rgba(0, 229, 255, 0.04)',
+                        background: 'rgba(232, 115, 42, 0.04)',
                         border: '1px solid var(--color-border-subtle)',
                         borderRadius: 'var(--radius-md)',
                         fontSize: '0.78rem',
