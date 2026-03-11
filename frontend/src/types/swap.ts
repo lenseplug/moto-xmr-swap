@@ -127,6 +127,7 @@ export interface BobKeyMaterial {
     readonly bobEd25519PubKey: string;
     readonly bobViewKey: string;
     readonly bobKeyProof: string;
+    readonly bobSpendKey: string;
 }
 
 /**

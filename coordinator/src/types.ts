@@ -74,6 +74,17 @@ export const TERMINAL_STATES: ReadonlySet<SwapStatus> = new Set([
     SwapStatus.REFUNDED,
 ]);
 
+/**
+ * Settled states — swaps that should not appear in active listings or be
+ * resumed on restart. Includes TERMINAL_STATES plus EXPIRED (which can
+ * only transition to REFUNDED via on-chain refund confirmation).
+ */
+export const SETTLED_STATES: ReadonlySet<SwapStatus> = new Set([
+    SwapStatus.COMPLETED,
+    SwapStatus.REFUNDED,
+    SwapStatus.EXPIRED,
+]);
+
 /** A swap record as stored in SQLite and returned by the API. */
 export interface ISwapRecord {
     readonly id: number;
@@ -106,8 +117,14 @@ export interface ISwapRecord {
     readonly bob_ed25519_pub: string | null;
     /** Bob's ed25519 private view key (64 hex chars). */
     readonly bob_view_key: string | null;
+    /** Bob's ed25519 private spend key (64 hex chars). Needed for sweep. */
+    readonly bob_spend_key: string | null;
     /** Bob's DLEQ proof (hex). */
     readonly bob_dleq_proof: string | null;
+    /** Alice's XMR payout address (where her XMR portion is sent after completion). */
+    readonly alice_xmr_payout: string | null;
+    /** Sweep status: null = not attempted, 'pending' = queued, 'done' = swept, 'failed:reason' = error. */
+    readonly sweep_status: string | null;
     readonly created_at: string;
     readonly updated_at: string;
 }
@@ -124,6 +141,7 @@ export interface ICreateSwapParams {
     readonly xmr_address: string | null;
     readonly depositor: string;
     readonly opnet_create_tx: string | null;
+    readonly alice_xmr_payout: string | null;
 }
 
 /** Fields that can be updated on an existing swap. */
@@ -143,7 +161,10 @@ export interface IUpdateSwapParams {
     readonly alice_view_key?: string | null;
     readonly bob_ed25519_pub?: string;
     readonly bob_view_key?: string | null;
+    readonly bob_spend_key?: string | null;
     readonly bob_dleq_proof?: string;
+    readonly alice_xmr_payout?: string;
+    readonly sweep_status?: string | null;
 }
 
 /** A state history entry. */

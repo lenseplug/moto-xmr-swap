@@ -9,6 +9,7 @@ import {
     type ICreateSwapParams,
     type IPaginationParams,
     type ISwapRecord,
+    type IUpdateSwapParams,
     type ITakeSwapBody,
     SwapStatus,
     calculateXmrFee,
@@ -17,9 +18,39 @@ import {
     MIN_XMR_AMOUNT_PICONERO,
 } from '../types.js';
 import { StorageService } from '../storage.js';
+import { SwapStateMachine } from '../state-machine.js';
+import { SwapWebSocketServer } from '../websocket.js';
 import { randomBytes } from 'node:crypto';
-import { getFeeAddress, setFeeAddress, verifyPreimage } from '../monero-module.js';
+import { getFeeAddress, setFeeAddress, verifyPreimage, validateMoneroAddress } from '../monero-module.js';
 import { ed25519PublicFromPrivate, verifyBobKeyProof } from '../crypto/index.js';
+
+// ---------------------------------------------------------------------------
+// Per-swap operation lock to prevent TOCTOU races
+// ---------------------------------------------------------------------------
+
+const swapOperationLocks = new Map<string, Promise<void>>();
+
+/**
+ * Serializes concurrent operations on the same swap.
+ * Prevents TOCTOU race conditions where two requests check state simultaneously.
+ */
+async function withSwapLock<T>(swapId: string, fn: () => Promise<T>): Promise<T> {
+    const prev = swapOperationLocks.get(swapId) ?? Promise.resolve();
+    let releaseLock!: () => void;
+    const lockPromise = new Promise<void>((resolve) => { releaseLock = resolve; });
+    swapOperationLocks.set(swapId, lockPromise);
+
+    await prev;
+
+    try {
+        return await fn();
+    } finally {
+        releaseLock();
+        if (swapOperationLocks.get(swapId) === lockPromise) {
+            swapOperationLocks.delete(swapId);
+        }
+    }
+}
 
 /** Returns a structured success response. */
 function success<T>(data: T): IApiResponse<T> {
@@ -85,8 +116,10 @@ function jsonResponse<T>(res: ServerResponse, statusCode: number, body: IApiResp
 
 /** Extracts pagination params from URL query string. */
 function parsePagination(url: URL): IPaginationParams {
-    const page = Math.max(1, parseInt(url.searchParams.get('page') ?? '1', 10));
-    const limit = Math.min(100, Math.max(1, parseInt(url.searchParams.get('limit') ?? '20', 10)));
+    const rawPage = parseInt(url.searchParams.get('page') ?? '1', 10);
+    const rawLimit = parseInt(url.searchParams.get('limit') ?? '20', 10);
+    const page = Math.max(1, Number.isFinite(rawPage) ? rawPage : 1);
+    const limit = Math.min(100, Math.max(1, Number.isFinite(rawLimit) ? rawLimit : 20));
     return { page, limit };
 }
 
@@ -94,8 +127,8 @@ function parsePagination(url: URL): IPaginationParams {
  * Strips sensitive fields (preimage) from a swap record before sending to clients.
  * The preimage is ONLY delivered via WebSocket, never via HTTP.
  */
-function sanitizeSwapForApi(swap: ISwapRecord): Omit<ISwapRecord, 'preimage' | 'claim_token' | 'alice_view_key' | 'bob_view_key'> & { preimage: null; claim_token: null; alice_view_key: null; bob_view_key: null } {
-    return { ...swap, preimage: null, claim_token: null, alice_view_key: null, bob_view_key: null };
+function sanitizeSwapForApi(swap: ISwapRecord): Omit<ISwapRecord, 'preimage' | 'claim_token' | 'alice_view_key' | 'bob_view_key' | 'bob_spend_key'> & { preimage: null; claim_token: null; alice_view_key: null; bob_view_key: null; bob_spend_key: null } {
+    return { ...swap, preimage: null, claim_token: null, alice_view_key: null, bob_view_key: null, bob_spend_key: null };
 }
 
 /** Handler: GET /api/health */
@@ -145,74 +178,77 @@ export async function handleTakeSwap(
     storage: StorageService,
     swapId: string,
 ): Promise<void> {
-    const swap = storage.getSwap(swapId);
-    if (!swap) {
-        jsonResponse(res, 404, fail('NOT_FOUND', `Swap ${swapId} not found`));
-        return;
-    }
-
-    // Allow take when OPEN, TAKEN, XMR_LOCKING, or XMR_LOCKED.
-    // The OPNet watcher may transition to TAKEN and startXmrLocking may progress
-    // to XMR_LOCKING/XMR_LOCKED before Bob's POST /take arrives (race condition).
-    // The double-take guard below prevents multiple claim_token assignments.
-    const TAKE_ALLOWED_STATES: ReadonlySet<SwapStatus> = new Set([
-        SwapStatus.OPEN,
-        SwapStatus.TAKEN,
-        SwapStatus.XMR_LOCKING,
-        SwapStatus.XMR_LOCKED,
-    ]);
-    if (!TAKE_ALLOWED_STATES.has(swap.status)) {
-        jsonResponse(res, 409, fail('INVALID_STATE', `Swap cannot be taken (current: ${swap.status})`));
-        return;
-    }
-
-    // Prevent double-take: reject if claim_token already assigned
-    if (swap.claim_token && swap.claim_token.length > 0) {
-        jsonResponse(res, 409, fail('ALREADY_TAKEN', 'Swap has already been taken'));
-        return;
-    }
-
-    let body: ITakeSwapBody;
-    try {
-        const parsed = await readBody(req);
-        if (
-            typeof parsed !== 'object' ||
-            parsed === null ||
-            !('opnetTxId' in parsed) ||
-            typeof (parsed as { opnetTxId: unknown }).opnetTxId !== 'string'
-        ) {
-            jsonResponse(res, 400, fail('VALIDATION', 'opnetTxId (string) is required'));
+    // Per-swap lock prevents TOCTOU race: two concurrent take requests
+    // can no longer both pass the claim_token check simultaneously.
+    return withSwapLock(swapId, async () => {
+        const swap = storage.getSwap(swapId);
+        if (!swap) {
+            jsonResponse(res, 404, fail('NOT_FOUND', `Swap ${swapId} not found`));
             return;
         }
-        body = parsed as ITakeSwapBody;
-    } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : 'Invalid request';
-        jsonResponse(res, 400, fail('INVALID_BODY', msg));
-        return;
-    }
 
-    if (!body.opnetTxId || body.opnetTxId.trim().length === 0) {
-        jsonResponse(res, 400, fail('VALIDATION', 'opnetTxId must not be empty'));
-        return;
-    }
+        // Allow take when OPEN, TAKEN, XMR_LOCKING, or XMR_LOCKED.
+        // The OPNet watcher may transition to TAKEN and startXmrLocking may progress
+        // to XMR_LOCKING/XMR_LOCKED before Bob's POST /take arrives (race condition).
+        // The double-take guard below prevents multiple claim_token assignments.
+        const TAKE_ALLOWED_STATES: ReadonlySet<SwapStatus> = new Set([
+            SwapStatus.OPEN,
+            SwapStatus.TAKEN,
+            SwapStatus.XMR_LOCKING,
+            SwapStatus.XMR_LOCKED,
+        ]);
+        if (!TAKE_ALLOWED_STATES.has(swap.status)) {
+            jsonResponse(res, 409, fail('INVALID_STATE', `Swap cannot be taken (current: ${swap.status})`));
+            return;
+        }
 
-    // Re-check claim_token after the await (TOCTOU guard):
-    // Another concurrent request may have set it during readBody().
-    const freshSwap = storage.getSwap(swapId);
-    if (freshSwap && freshSwap.claim_token && freshSwap.claim_token.length > 0) {
-        jsonResponse(res, 409, fail('ALREADY_TAKEN', 'Swap has already been taken'));
-        return;
-    }
+        // Prevent double-take: reject if claim_token already assigned
+        if (swap.claim_token && swap.claim_token.length > 0) {
+            jsonResponse(res, 409, fail('ALREADY_TAKEN', 'Swap has already been taken'));
+            return;
+        }
 
-    // Generate a one-time claim_token for authenticated WebSocket subscription
-    const claimToken = randomBytes(32).toString('hex');
-    storage.updateSwap(swapId, { claim_token: claimToken });
+        let body: ITakeSwapBody;
+        try {
+            const parsed = await readBody(req);
+            if (
+                typeof parsed !== 'object' ||
+                parsed === null ||
+                !('opnetTxId' in parsed) ||
+                typeof (parsed as { opnetTxId: unknown }).opnetTxId !== 'string'
+            ) {
+                jsonResponse(res, 400, fail('VALIDATION', 'opnetTxId (string) is required'));
+                return;
+            }
+            body = parsed as ITakeSwapBody;
+        } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : 'Invalid request';
+            jsonResponse(res, 400, fail('INVALID_BODY', msg));
+            return;
+        }
 
-    jsonResponse(res, 200, success({
-        swap: sanitizeSwapForApi(freshSwap ?? swap),
-        opnetTxId: body.opnetTxId.trim(),
-        claim_token: claimToken,
-    }));
+        if (!body.opnetTxId || body.opnetTxId.trim().length === 0) {
+            jsonResponse(res, 400, fail('VALIDATION', 'opnetTxId must not be empty'));
+            return;
+        }
+
+        // Re-check under lock (defense-in-depth)
+        const freshSwap = storage.getSwap(swapId);
+        if (freshSwap && freshSwap.claim_token && freshSwap.claim_token.length > 0) {
+            jsonResponse(res, 409, fail('ALREADY_TAKEN', 'Swap has already been taken'));
+            return;
+        }
+
+        // Generate a one-time claim_token for authenticated WebSocket subscription
+        const claimToken = randomBytes(32).toString('hex');
+        storage.updateSwap(swapId, { claim_token: claimToken });
+
+        jsonResponse(res, 200, success({
+            swap: sanitizeSwapForApi(freshSwap ?? swap),
+            opnetTxId: body.opnetTxId.trim(),
+            claim_token: claimToken,
+        }));
+    });
 }
 
 /**
@@ -228,108 +264,103 @@ export async function handleSubmitSecret(
     storage: StorageService,
     swapId: string,
 ): Promise<void> {
-    const swap = storage.getSwap(swapId);
-    if (!swap) {
-        jsonResponse(res, 404, fail('NOT_FOUND', `Swap ${swapId} not found`));
-        return;
-    }
-
-    // Accept secrets for OPEN (Alice submits right after creation), TAKEN (normal flow),
-    // and later pre-claim states (idempotent re-submission).
-    // The preimage alone doesn't enable theft without also calling claim()
-    // on-chain, so early storage is acceptable.
-    const ACCEPT_SECRET_STATES = new Set([
-        SwapStatus.OPEN,
-        SwapStatus.TAKEN,
-        SwapStatus.XMR_LOCKING,
-        SwapStatus.XMR_LOCKED,
-    ]);
-    if (!ACCEPT_SECRET_STATES.has(swap.status)) {
-        jsonResponse(
-            res,
-            409,
-            fail('INVALID_STATE', `Swap is in state ${swap.status} — cannot accept secret`),
-        );
-        return;
-    }
-
-    let secret: string;
-    let aliceViewKey: string | undefined;
-    try {
-        const parsed = await readBody(req);
-        if (
-            typeof parsed !== 'object' ||
-            parsed === null ||
-            !('secret' in parsed) ||
-            typeof (parsed as { secret: unknown }).secret !== 'string'
-        ) {
-            jsonResponse(res, 400, fail('VALIDATION', 'secret (string) is required'));
+    // Per-swap lock prevents concurrent preimage submissions from both
+    // passing the null check before either stores.
+    return withSwapLock(swapId, async () => {
+        const swap = storage.getSwap(swapId);
+        if (!swap) {
+            jsonResponse(res, 404, fail('NOT_FOUND', `Swap ${swapId} not found`));
             return;
         }
-        secret = (parsed as { secret: string }).secret.trim().toLowerCase();
-        // Optional: Alice's view key for split-key mode
-        const candidate = parsed as Record<string, unknown>;
-        if (typeof candidate['aliceViewKey'] === 'string') {
-            aliceViewKey = candidate['aliceViewKey'].trim().toLowerCase();
-        }
-    } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : 'Invalid request';
-        jsonResponse(res, 400, fail('INVALID_BODY', msg));
-        return;
-    }
 
-    // Validate format: 64 hex characters
-    if (!/^[0-9a-f]{64}$/.test(secret)) {
-        jsonResponse(res, 400, fail('VALIDATION', 'Secret must be exactly 64 hex characters'));
-        return;
-    }
-
-    // Validate view key format if provided
-    if (aliceViewKey !== undefined && !/^[0-9a-f]{64}$/.test(aliceViewKey)) {
-        jsonResponse(res, 400, fail('VALIDATION', 'aliceViewKey must be exactly 64 hex characters'));
-        return;
-    }
-
-    // Critical security check: SHA-256(secret) must match hash_lock
-    if (!verifyPreimage(secret, swap.hash_lock)) {
-        jsonResponse(
-            res,
-            400,
-            fail('HASH_MISMATCH', 'SHA-256(secret) does not match the swap hash lock'),
-        );
-        return;
-    }
-
-    // Idempotent: if same preimage is already stored, return success
-    if (swap.preimage !== null && swap.preimage.length > 0) {
-        if (swap.preimage === secret) {
-            jsonResponse(res, 200, success({ stored: true, trustless: swap.trustless_mode === 1 }));
+        // Accept secrets for OPEN (Alice submits right after creation), TAKEN (normal flow),
+        // and later pre-claim states (idempotent re-submission).
+        const ACCEPT_SECRET_STATES = new Set([
+            SwapStatus.OPEN,
+            SwapStatus.TAKEN,
+            SwapStatus.XMR_LOCKING,
+            SwapStatus.XMR_LOCKED,
+        ]);
+        if (!ACCEPT_SECRET_STATES.has(swap.status)) {
+            jsonResponse(
+                res,
+                409,
+                fail('INVALID_STATE', `Swap is in state ${swap.status} — cannot accept secret`),
+            );
             return;
         }
-        // Different preimage for same swap — reject
-        jsonResponse(res, 409, fail('ALREADY_SET', 'A different preimage is already stored for this swap'));
-        return;
-    }
 
-    // Build update params
-    const updateParams: Record<string, string | number | null> = { preimage: secret };
+        let secret: string;
+        let aliceViewKey: string | undefined;
+        try {
+            const parsed = await readBody(req);
+            if (
+                typeof parsed !== 'object' ||
+                parsed === null ||
+                !('secret' in parsed) ||
+                typeof (parsed as { secret: unknown }).secret !== 'string'
+            ) {
+                jsonResponse(res, 400, fail('VALIDATION', 'secret (string) is required'));
+                return;
+            }
+            secret = (parsed as { secret: string }).secret.trim().toLowerCase();
+            const candidate = parsed as Record<string, unknown>;
+            if (typeof candidate['aliceViewKey'] === 'string') {
+                aliceViewKey = candidate['aliceViewKey'].trim().toLowerCase();
+            }
+        } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : 'Invalid request';
+            jsonResponse(res, 400, fail('INVALID_BODY', msg));
+            return;
+        }
 
-    // If Alice provides a view key, enable split-key mode and derive her ed25519 pub from the secret
-    if (aliceViewKey) {
-        const secretBytes = hexToBytes(secret);
-        const alicePub = ed25519PublicFromPrivate(secretBytes);
-        const alicePubHex = bytesToHex(alicePub);
-        updateParams['trustless_mode'] = 1; // DB column name kept for migration compat
-        updateParams['alice_ed25519_pub'] = alicePubHex;
-        updateParams['alice_view_key'] = aliceViewKey;
-        console.log(`[Routes] Split-key mode enabled for swap ${swapId} (Alice pub: ${alicePubHex.slice(0, 16)}...)`);
-    }
+        if (!/^[0-9a-f]{64}$/.test(secret)) {
+            jsonResponse(res, 400, fail('VALIDATION', 'Secret must be exactly 64 hex characters'));
+            return;
+        }
 
-    // Store the preimage (and split-key fields if present)
-    storage.updateSwap(swapId, updateParams as import('../types.js').IUpdateSwapParams);
-    console.log(`[Routes] Secret stored for swap ${swapId}`);
+        if (aliceViewKey !== undefined && !/^[0-9a-f]{64}$/.test(aliceViewKey)) {
+            jsonResponse(res, 400, fail('VALIDATION', 'aliceViewKey must be exactly 64 hex characters'));
+            return;
+        }
 
-    jsonResponse(res, 200, success({ stored: true, trustless: !!aliceViewKey }));
+        if (!verifyPreimage(secret, swap.hash_lock)) {
+            jsonResponse(
+                res,
+                400,
+                fail('HASH_MISMATCH', 'SHA-256(secret) does not match the swap hash lock'),
+            );
+            return;
+        }
+
+        // Re-check preimage under lock (defense-in-depth)
+        const freshSwap = storage.getSwap(swapId);
+        if (freshSwap && freshSwap.preimage !== null && freshSwap.preimage.length > 0) {
+            if (freshSwap.preimage === secret) {
+                jsonResponse(res, 200, success({ stored: true, trustless: freshSwap.trustless_mode === 1 }));
+                return;
+            }
+            jsonResponse(res, 409, fail('ALREADY_SET', 'A different preimage is already stored for this swap'));
+            return;
+        }
+
+        const updateParams: Record<string, string | number | null> = { preimage: secret };
+
+        if (aliceViewKey) {
+            const secretBytes = hexToBytes(secret);
+            const alicePub = ed25519PublicFromPrivate(secretBytes);
+            const alicePubHex = bytesToHex(alicePub);
+            updateParams['trustless_mode'] = 1;
+            updateParams['alice_ed25519_pub'] = alicePubHex;
+            updateParams['alice_view_key'] = aliceViewKey;
+            console.log(`[Routes] Split-key mode enabled for swap ${swapId}`);
+        }
+
+        storage.updateSwap(swapId, updateParams as import('../types.js').IUpdateSwapParams);
+        console.log(`[Routes] Secret stored for swap ${swapId}`);
+
+        jsonResponse(res, 200, success({ stored: true, trustless: !!aliceViewKey }));
+    });
 }
 
 /** Handler: POST /api/swaps (create a new swap record — coordinator internal use) */
@@ -405,6 +436,17 @@ export async function handleCreateSwap(
             return;
         }
 
+        // Optional: Alice's XMR payout address (where she receives XMR after completion)
+        let aliceXmrPayout: string | null = null;
+        if (typeof candidate['alice_xmr_payout'] === 'string' && candidate['alice_xmr_payout'].length > 0) {
+            aliceXmrPayout = candidate['alice_xmr_payout'].trim();
+            const addrErr = validateMoneroAddress(aliceXmrPayout);
+            if (addrErr !== null) {
+                jsonResponse(res, 400, fail('VALIDATION', `Invalid alice_xmr_payout: ${addrErr}`));
+                return;
+            }
+        }
+
         body = {
             swap_id: swapId,
             hash_lock: hashLock,
@@ -420,6 +462,7 @@ export async function handleCreateSwap(
                 /^[0-9a-f]{64}$/i.test(candidate['opnet_create_tx'])
                     ? candidate['opnet_create_tx']
                     : null,
+            alice_xmr_payout: aliceXmrPayout,
         };
     } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : 'Invalid request';
@@ -528,6 +571,7 @@ export async function handleSubmitKeys(
     let bobPub: string;
     let bobViewKey: string;
     let bobKeyProof: string;
+    let bobSpendKey: string | undefined;
     try {
         const parsed = await readBody(req);
         const candidate = parsed as Record<string, unknown>;
@@ -542,6 +586,10 @@ export async function handleSubmitKeys(
         bobPub = candidate['bobEd25519PubKey'].trim().toLowerCase();
         bobViewKey = candidate['bobViewKey'].trim().toLowerCase();
         bobKeyProof = candidate['bobKeyProof'].trim().toLowerCase();
+        // Optional: Bob's private spend key (needed for coordinator to sweep XMR after completion)
+        if (typeof candidate['bobSpendKey'] === 'string') {
+            bobSpendKey = candidate['bobSpendKey'].trim().toLowerCase();
+        }
     } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : 'Invalid request';
         jsonResponse(res, 400, fail('INVALID_BODY', msg));
@@ -563,6 +611,12 @@ export async function handleSubmitKeys(
         return;
     }
 
+    // Validate bobSpendKey if provided
+    if (bobSpendKey !== undefined && !/^[0-9a-f]{64}$/.test(bobSpendKey)) {
+        jsonResponse(res, 400, fail('VALIDATION', 'bobSpendKey must be exactly 64 hex characters'));
+        return;
+    }
+
     // Verify Bob's proof-of-knowledge: proves he knows the private key behind bobPub
     const proofBytes = hexToBytes(bobKeyProof);
     const pubBytes = hexToBytes(bobPub);
@@ -576,10 +630,130 @@ export async function handleSubmitKeys(
         bob_ed25519_pub: bobPub,
         bob_view_key: bobViewKey,
         bob_dleq_proof: bobKeyProof,
+        ...(bobSpendKey !== undefined ? { bob_spend_key: bobSpendKey } : {}),
     });
-    console.log(`[Routes] Bob's keys verified and stored for split-key swap ${swapId} (pub: ${bobPub.slice(0, 16)}...)`);
+    console.log(`[Routes] Bob's keys verified and stored for split-key swap ${swapId}`);
 
     jsonResponse(res, 200, success({ stored: true }));
+}
+
+/**
+ * Handler: PUT /api/admin/swaps/:id
+ *
+ * Test-only endpoint gated by MONERO_MOCK=true.
+ * Allows tests to simulate on-chain state changes (OPEN → TAKEN, etc.)
+ * without the OPNet watcher. Validates transitions via the state machine.
+ */
+export async function handleAdminUpdateSwap(
+    req: IncomingMessage,
+    res: ServerResponse,
+    storage: StorageService,
+    stateMachine: SwapStateMachine,
+    wsServer: SwapWebSocketServer,
+    swapId: string,
+): Promise<void> {
+    // Gate: only available when MONERO_MOCK=true
+    const isMock = (process.env['MONERO_MOCK'] ?? 'false').toLowerCase() === 'true';
+    if (!isMock) {
+        jsonResponse(res, 403, fail('FORBIDDEN', 'Admin state endpoint is only available in mock mode'));
+        return;
+    }
+
+    const swap = storage.getSwap(swapId);
+    if (!swap) {
+        jsonResponse(res, 404, fail('NOT_FOUND', `Swap ${swapId} not found`));
+        return;
+    }
+
+    let updates: Record<string, unknown>;
+    try {
+        const parsed = await readBody(req);
+        if (typeof parsed !== 'object' || parsed === null) {
+            jsonResponse(res, 400, fail('VALIDATION', 'Request body must be a JSON object'));
+            return;
+        }
+        updates = parsed as Record<string, unknown>;
+    } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : 'Invalid request';
+        jsonResponse(res, 400, fail('INVALID_BODY', msg));
+        return;
+    }
+
+    // Build IUpdateSwapParams from the request body
+    const updateParams: Record<string, string | number | null | undefined> = {};
+    const allowedFields: ReadonlyArray<string> = [
+        'status', 'counterparty', 'opnet_claim_tx', 'opnet_refund_tx',
+        'xmr_lock_tx', 'xmr_lock_confirmations', 'xmr_address',
+        'xmr_subaddr_index', 'preimage', 'claim_token',
+        'trustless_mode', 'alice_ed25519_pub', 'alice_view_key',
+        'bob_ed25519_pub', 'bob_view_key', 'bob_spend_key',
+        'bob_dleq_proof', 'alice_xmr_payout', 'sweep_status',
+    ];
+
+    for (const field of allowedFields) {
+        if (field in updates) {
+            const val = updates[field];
+            if (val === null || typeof val === 'string' || typeof val === 'number') {
+                updateParams[field] = val;
+            }
+        }
+    }
+
+    // If status change requested, validate the transition
+    const newStatus = updateParams['status'];
+    if (typeof newStatus === 'string') {
+        // Verify it's a valid SwapStatus
+        if (!Object.values(SwapStatus).includes(newStatus as SwapStatus)) {
+            jsonResponse(res, 400, fail('VALIDATION', `Invalid status: ${newStatus}`));
+            return;
+        }
+
+        // Apply non-status fields first (guards may need them)
+        const preFields: Record<string, string | number | null | undefined> = { ...updateParams };
+        delete preFields['status'];
+        if (Object.keys(preFields).length > 0) {
+            storage.updateSwap(swapId, preFields as IUpdateSwapParams);
+        }
+
+        // Re-fetch after pre-fields applied, then validate transition
+        const freshSwap = storage.getSwap(swapId);
+        if (!freshSwap) {
+            jsonResponse(res, 404, fail('NOT_FOUND', `Swap ${swapId} not found after pre-update`));
+            return;
+        }
+
+        try {
+            stateMachine.validate(freshSwap, newStatus as SwapStatus);
+        } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : 'Invalid transition';
+            jsonResponse(res, 409, fail('INVALID_TRANSITION', msg));
+            return;
+        }
+
+        // Apply the status change
+        const fromState = freshSwap.status;
+        const updated = storage.updateSwap(
+            swapId,
+            { status: newStatus as SwapStatus } as IUpdateSwapParams,
+            fromState,
+            `Admin state change: ${fromState} → ${newStatus}`,
+        );
+        stateMachine.notifyTransition(updated, fromState, newStatus as SwapStatus);
+        wsServer.broadcastSwapUpdate(updated);
+
+        jsonResponse(res, 200, success({ swap: sanitizeSwapForApi(updated) }));
+        return;
+    }
+
+    // No status change — just apply field updates
+    if (Object.keys(updateParams).length === 0) {
+        jsonResponse(res, 400, fail('VALIDATION', 'No valid update fields provided'));
+        return;
+    }
+
+    const updated = storage.updateSwap(swapId, updateParams as IUpdateSwapParams);
+    wsServer.broadcastSwapUpdate(updated);
+    jsonResponse(res, 200, success({ swap: sanitizeSwapForApi(updated) }));
 }
 
 // ---------------------------------------------------------------------------

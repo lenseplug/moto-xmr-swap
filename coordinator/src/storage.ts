@@ -4,14 +4,15 @@
  */
 
 import initSqlJs, { type Database, type SqlJsStatic } from 'sql.js';
-import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, unlinkSync } from 'node:fs';
+import { join, dirname } from 'node:path';
 import {
     type ICreateSwapParams,
     type IStateHistoryEntry,
     type ISwapRecord,
     type IUpdateSwapParams,
     SwapStatus,
-    TERMINAL_STATES,
+    SETTLED_STATES,
 } from './types.js';
 import { encryptIfPresent, decryptIfPresent } from './encryption.js';
 
@@ -21,6 +22,7 @@ const ENCRYPTED_FIELDS: ReadonlySet<string> = new Set([
     'claim_token',
     'alice_view_key',
     'bob_view_key',
+    'bob_spend_key',
 ]);
 
 const CREATE_SWAPS_TABLE = `
@@ -97,6 +99,7 @@ export class StorageService {
     private readonly dbPath: string;
     private SQL: SqlJsStatic | null = null;
     private saveTimer: NodeJS.Timeout | null = null;
+    private backupTimer: NodeJS.Timeout | null = null;
 
     private constructor(dbPath: string) {
         this.dbPath = dbPath;
@@ -120,6 +123,9 @@ export class StorageService {
         if (this.saveTimer) {
             clearInterval(this.saveTimer);
         }
+        if (this.backupTimer) {
+            clearInterval(this.backupTimer);
+        }
         this.persistToDisk();
         this.db?.close();
         StorageService.instance = null;
@@ -133,8 +139,8 @@ export class StorageService {
     public createSwap(params: ICreateSwapParams): ISwapRecord {
         this.exec(
             `INSERT INTO swaps
-                (swap_id, hash_lock, refund_block, moto_amount, xmr_amount, xmr_fee, xmr_total, xmr_address, depositor, opnet_create_tx)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                (swap_id, hash_lock, refund_block, moto_amount, xmr_amount, xmr_fee, xmr_total, xmr_address, depositor, opnet_create_tx, alice_xmr_payout)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             [
                 params.swap_id,
                 params.hash_lock,
@@ -146,6 +152,7 @@ export class StorageService {
                 params.xmr_address ?? null,
                 params.depositor,
                 params.opnet_create_tx ?? null,
+                params.alice_xmr_payout ?? null,
             ],
         );
         this.scheduleSave();
@@ -233,9 +240,21 @@ export class StorageService {
             setClauses.push('bob_view_key = ?');
             values.push(encryptIfPresent(updates.bob_view_key) ?? null);
         }
+        if (updates.bob_spend_key !== undefined) {
+            setClauses.push('bob_spend_key = ?');
+            values.push(encryptIfPresent(updates.bob_spend_key) ?? null);
+        }
         if (updates.bob_dleq_proof !== undefined) {
             setClauses.push('bob_dleq_proof = ?');
             values.push(updates.bob_dleq_proof);
+        }
+        if (updates.alice_xmr_payout !== undefined) {
+            setClauses.push('alice_xmr_payout = ?');
+            values.push(updates.alice_xmr_payout);
+        }
+        if (updates.sweep_status !== undefined) {
+            setClauses.push('sweep_status = ?');
+            values.push(updates.sweep_status ?? null);
         }
 
         if (setClauses.length > 1) {
@@ -273,11 +292,11 @@ export class StorageService {
      * Returns all swaps not in a terminal state.
      */
     public getActiveSwaps(): ISwapRecord[] {
-        const terminalList = Array.from(TERMINAL_STATES)
+        const settledList = Array.from(SETTLED_STATES)
             .map(() => '?')
             .join(', ');
-        const sql = `SELECT * FROM swaps WHERE status NOT IN (${terminalList}) ORDER BY created_at DESC`;
-        const rows = this.query(sql, Array.from(TERMINAL_STATES));
+        const sql = `SELECT * FROM swaps WHERE status NOT IN (${settledList}) ORDER BY created_at DESC`;
+        const rows = this.query(sql, Array.from(SETTLED_STATES));
         return rows as unknown as ISwapRecord[];
     }
 
@@ -311,6 +330,18 @@ export class StorageService {
         const rows = this.query(
             'SELECT * FROM swaps ORDER BY created_at DESC LIMIT ? OFFSET ?',
             [limit, offset],
+        );
+        return rows as unknown as ISwapRecord[];
+    }
+
+    /**
+     * Returns completed swaps whose sweep failed and need retry.
+     * Matches sweep_status starting with 'failed:' or 'pending'.
+     */
+    public getFailedSweeps(): ISwapRecord[] {
+        const rows = this.query(
+            `SELECT * FROM swaps WHERE status = ? AND (sweep_status LIKE 'failed:%' OR sweep_status = 'pending' OR (sweep_status IS NULL AND trustless_mode = 1)) ORDER BY updated_at ASC LIMIT 20`,
+            [SwapStatus.COMPLETED],
         );
         return rows as unknown as ISwapRecord[];
     }
@@ -351,10 +382,23 @@ export class StorageService {
         this.migrateAddColumn('swaps', 'bob_ed25519_pub', 'TEXT');
         this.migrateAddColumn('swaps', 'bob_view_key', 'TEXT');
         this.migrateAddColumn('swaps', 'bob_dleq_proof', 'TEXT');
+        this.migrateAddColumn('swaps', 'bob_spend_key', 'TEXT');
+        this.migrateAddColumn('swaps', 'alice_xmr_payout', 'TEXT');
+        this.migrateAddColumn('swaps', 'sweep_status', 'TEXT');
 
         this.saveTimer = setInterval(() => {
             this.persistToDisk();
         }, 5000);
+
+        // Periodic database backup
+        const backupIntervalMs = parseInt(process.env['DB_BACKUP_INTERVAL_MS'] ?? '3600000', 10); // default: 1 hour
+        const maxBackups = parseInt(process.env['DB_MAX_BACKUPS'] ?? '24', 10); // keep last 24
+        if (backupIntervalMs > 0) {
+            // Run first backup shortly after startup (10s delay)
+            setTimeout(() => this.createBackup(maxBackups), 10_000);
+            this.backupTimer = setInterval(() => this.createBackup(maxBackups), backupIntervalMs);
+            console.log(`[Storage] Backup enabled: every ${backupIntervalMs / 1000}s, keeping ${maxBackups} copies`);
+        }
     }
 
     private migrateAddColumn(table: string, column: string, type: string): void {
@@ -421,6 +465,40 @@ export class StorageService {
         setImmediate(() => {
             this.persistToDisk();
         });
+    }
+
+    /**
+     * Creates a timestamped backup of the database file.
+     * Keeps the last `maxBackups` files, deleting older ones.
+     */
+    private createBackup(maxBackups: number): void {
+        if (!this.db) return;
+        try {
+            const backupDir = join(dirname(this.dbPath), 'backups');
+            mkdirSync(backupDir, { recursive: true });
+
+            const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+            const backupPath = join(backupDir, `coordinator-${timestamp}.db`);
+
+            const data = this.db.export();
+            writeFileSync(backupPath, data);
+            console.log(`[Storage] Backup created: ${backupPath} (${(data.length / 1024).toFixed(1)} KB)`);
+
+            // Prune old backups
+            const files = readdirSync(backupDir)
+                .filter((f) => f.startsWith('coordinator-') && f.endsWith('.db'))
+                .sort();
+            while (files.length > maxBackups) {
+                const oldest = files.shift();
+                if (oldest) {
+                    unlinkSync(join(backupDir, oldest));
+                    console.log(`[Storage] Deleted old backup: ${oldest}`);
+                }
+            }
+        } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : 'Unknown error';
+            console.error(`[Storage] Backup failed: ${msg}`);
+        }
     }
 
     private persistToDisk(): void {

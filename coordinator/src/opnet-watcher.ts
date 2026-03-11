@@ -129,6 +129,12 @@ export class OpnetWatcher {
             network: networks.opnetTestnet,
             timeout: 20_000,
         });
+
+        // Allow tests to seed a non-zero block height so startXmrLocking doesn't defer.
+        const mockBlock = process.env['MOCK_BLOCK_HEIGHT'];
+        if (mockBlock) {
+            this.currentBlockNumber = BigInt(mockBlock);
+        }
     }
 
     /** Returns the most recently observed block number. */
@@ -239,7 +245,11 @@ export class OpnetWatcher {
     private async refreshActiveSwaps(): Promise<void> {
         if (!CONTRACT_ADDRESS) return;
 
-        const activeSwaps = this.storage.getActiveSwaps();
+        // Include EXPIRED swaps — they can still transition to REFUNDED via on-chain refund.
+        const activeSwaps = [
+            ...this.storage.getActiveSwaps(),
+            ...this.storage.getSwapsByStatus(SwapStatus.EXPIRED),
+        ];
         if (activeSwaps.length === 0) return;
 
         try {
@@ -330,6 +340,7 @@ export class OpnetWatcher {
                 xmr_address: null,
                 depositor: onChain.depositor,
                 opnet_create_tx: null,
+                alice_xmr_payout: null,
             });
             console.log(`[OPNet Watcher] Created swap record for on-chain swap ${swapIdStr} (fee: ${xmrFee}, total: ${xmrTotal})`);
             return;

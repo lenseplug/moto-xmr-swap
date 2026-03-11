@@ -30,6 +30,9 @@ const WS_PING_INTERVAL_MS = 30_000;
 /** Max age for pending preimages before automatic cleanup (ms). */
 const PENDING_PREIMAGE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
+/** Max number of pending preimage entries to prevent unbounded memory growth. */
+const MAX_PENDING_PREIMAGES = 200;
+
 interface IPendingPreimage {
     readonly preimage: string;
     readonly storedAt: number;
@@ -108,7 +111,7 @@ export class SwapWebSocketServer {
      */
     public broadcastSwapUpdate(swap: ISwapRecord): void {
         // Sanitize: strip secrets from public broadcast
-        const sanitized = { ...swap, preimage: null, claim_token: null, alice_view_key: null, bob_view_key: null };
+        const sanitized = { ...swap, preimage: null, claim_token: null, alice_view_key: null, bob_view_key: null, bob_spend_key: null };
         const message: IWsMessage = { type: 'swap_update', data: sanitized };
         this.broadcast(message);
     }
@@ -122,6 +125,14 @@ export class SwapWebSocketServer {
      * @param preimage - The hex-encoded preimage.
      */
     public broadcastPreimageReady(swapId: string, preimage: string): void {
+        // Cap the queue to prevent unbounded memory growth
+        if (this.pendingPreimages.size >= MAX_PENDING_PREIMAGES) {
+            // Remove oldest entry (Map preserves insertion order)
+            const oldestKey = this.pendingPreimages.keys().next().value;
+            if (oldestKey !== undefined) {
+                this.pendingPreimages.delete(oldestKey);
+            }
+        }
         // Always queue the preimage so late subscribers can receive it
         this.pendingPreimages.set(swapId, { preimage, storedAt: Date.now() });
 

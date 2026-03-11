@@ -18,6 +18,7 @@ import {
     handleSetFeeAddress,
     handleSubmitSecret,
     handleSubmitKeys,
+    handleAdminUpdateSwap,
 } from './routes/swaps.js';
 import { type ISwapRecord, SwapStatus } from './types.js';
 import {
@@ -26,12 +27,18 @@ import {
     validateMoneroAddress,
     type IMoneroService,
 } from './monero-module.js';
-import { computeSharedMoneroAddress } from './crypto/index.js';
+import { computeSharedMoneroAddress, addEd25519Scalars } from './crypto/index.js';
 import { initEncryption } from './encryption.js';
 
 const PORT = parseInt(process.env['PORT'] ?? '3001', 10);
 const DB_PATH = process.env['DB_PATH'] ?? 'coordinator.db';
 const EXPIRY_CHECK_INTERVAL_MS = 30_000;
+
+/** Maximum age (ms) for OPEN/TAKEN swaps before time-based emergency expiry. */
+const MAX_SWAP_AGE_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+/** Maximum time (ms) an XMR_LOCKING/XMR_LOCKED swap can be stuck before warning. */
+const XMR_STUCK_WARN_MS = 72 * 60 * 60 * 1000; // 72 hours
 
 /**
  * Allowed CORS origin. Defaults to the local Vite dev server.
@@ -49,6 +56,9 @@ const ADMIN_API_KEY = process.env['ADMIN_API_KEY'] ?? '';
 // In-memory rate limiter (sliding window per IP)
 // ---------------------------------------------------------------------------
 
+/** When true, rate limiting is disabled entirely (test mode only). */
+const RATE_LIMIT_DISABLED = (process.env['RATE_LIMIT_DISABLED'] ?? 'false').toLowerCase() === 'true';
+
 const RATE_LIMIT_WINDOW_MS = 60_000;
 const RATE_LIMIT_MAX_WRITE = 5; // write requests per minute (strict for mainnet)
 const RATE_LIMIT_MAX_READ = 30; // read requests per minute
@@ -60,6 +70,14 @@ interface IRateLimitEntry {
 }
 
 const requestCounts = new Map<string, IRateLimitEntry>();
+
+/** Periodic cleanup of expired rate limit entries to prevent unbounded memory growth. */
+setInterval(() => {
+    const now = Date.now();
+    for (const [key, val] of requestCounts) {
+        if (now > val.resetAt) requestCounts.delete(key);
+    }
+}, RATE_LIMIT_WINDOW_MS * 2).unref();
 
 /** Returns seconds until the rate limit window resets for a given IP, or 0 if not limited. */
 function getRateLimitRetryAfter(ip: string): number {
@@ -216,6 +234,18 @@ function matchRoute(
         return { route: 'submit_keys', params: { id: part2 } };
     }
 
+    // PUT /api/admin/swaps/:id — test-only admin state endpoint
+    if (
+        parts.length === 4 &&
+        part0 === 'api' &&
+        part1 === 'admin' &&
+        part2 === 'swaps' &&
+        method === 'PUT' &&
+        part3 !== undefined
+    ) {
+        return { route: 'admin_update_swap', params: { id: part3 } };
+    }
+
     return null;
 }
 
@@ -303,6 +333,113 @@ const MIN_BLOCKS_REMAINING_FOR_XMR_LOCK = 50;
  *
  * @param currentBlockGetter - Function returning the latest known block number.
  */
+/**
+ * Sweeps XMR from a completed swap's shared lock address.
+ * Reconstructs the full spend key from Alice + Bob private keys,
+ * then calls moneroService.sweepToFeeWallet() to collect fees.
+ *
+ * Runs async in the background — errors are logged but don't block the state machine.
+ */
+async function sweepCompletedSwap(
+    swap: ISwapRecord,
+    storage: StorageService,
+    moneroService: IMoneroService,
+): Promise<void> {
+    const swapId = swap.swap_id;
+
+    if (!swap.xmr_address) {
+        console.warn(`[Sweep] ${swapId}: no XMR lock address — skipping sweep`);
+        return;
+    }
+
+    // We need both parties' private keys to reconstruct the full spend/view keys.
+    // preimage IS Alice's private spend key (in split-key mode).
+    // alice_view_key and bob_view_key are the private view key shares.
+    // bob_spend_key is Bob's private spend key (submitted with his key material).
+    if (!swap.preimage || !swap.alice_view_key || !swap.bob_view_key) {
+        console.warn(`[Sweep] ${swapId}: missing key material (preimage/view keys scrubbed?) — skipping sweep`);
+        storage.updateSwap(swapId, { sweep_status: 'failed:missing_keys' });
+        return;
+    }
+
+    if (!swap.bob_spend_key) {
+        console.warn(
+            `[Sweep] ${swapId}: Bob's private spend key not stored — cannot reconstruct full spend key. ` +
+            `Manual sweep needed via monero-wallet-rpc CLI.`,
+        );
+        storage.updateSwap(swapId, { sweep_status: 'failed:no_bob_spend_key' });
+        return;
+    }
+
+    // sweep_status already set to 'pending' by caller (onStateChange callback)
+    try {
+        // Reconstruct the combined private spend key: s = s_alice + s_bob (mod l)
+        const aliceSpendBytes = hexToBytes(swap.preimage);
+        const bobSpendBytes = hexToBytes(swap.bob_spend_key);
+        const combinedSpendKey = addEd25519Scalars(aliceSpendBytes, bobSpendBytes);
+        const combinedSpendHex = bytesToHex(combinedSpendKey);
+
+        // Reconstruct the combined private view key: v = v_alice + v_bob (mod l)
+        const aliceViewBytes = hexToBytes(swap.alice_view_key);
+        const bobViewBytes = hexToBytes(swap.bob_view_key);
+        const combinedViewKey = addEd25519Scalars(aliceViewBytes, bobViewBytes);
+        const combinedViewHex = bytesToHex(combinedViewKey);
+
+        const feeAmount = BigInt(swap.xmr_fee);
+        const aliceAddress = swap.alice_xmr_payout ?? undefined;
+        const result = await moneroService.sweepToFeeWallet(
+            swapId,
+            combinedSpendHex,
+            combinedViewHex,
+            swap.xmr_address,
+            feeAmount,
+            aliceAddress,
+        );
+
+        if (result.ok) {
+            console.log(
+                `[Sweep] ${swapId}: SUCCESS — txId=${result.txId?.slice(0, 16) ?? 'unknown'}, ` +
+                `fee=${result.feeAmount}, alice=${result.aliceAmount}`,
+            );
+            storage.updateSwap(swapId, {
+                sweep_status: `done:${result.txId ?? 'unknown'}`,
+            });
+            // Now that sweep succeeded, scrub sensitive key material from DB.
+            storage.updateSwap(swapId, {
+                preimage: null,
+                alice_view_key: null,
+                bob_view_key: null,
+                bob_spend_key: null,
+            } as import('./types.js').IUpdateSwapParams);
+            console.log(`[Sweep] ${swapId}: scrubbed key material after successful sweep`);
+        } else {
+            console.error(`[Sweep] ${swapId}: FAILED — ${result.error ?? 'unknown error'}`);
+            storage.updateSwap(swapId, {
+                sweep_status: `failed:${result.error ?? 'unknown'}`,
+            });
+        }
+    } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : 'Unknown error';
+        console.error(`[Sweep] ${swapId}: error — ${msg}`);
+        storage.updateSwap(swapId, { sweep_status: `failed:${msg}` });
+    }
+}
+
+/** Converts a hex string to Uint8Array. */
+function hexToBytes(hex: string): Uint8Array {
+    const clean = hex.startsWith('0x') ? hex.slice(2) : hex;
+    const bytes = new Uint8Array(clean.length / 2);
+    for (let i = 0; i < bytes.length; i++) {
+        bytes[i] = parseInt(clean.slice(i * 2, i * 2 + 2), 16);
+    }
+    return bytes;
+}
+
+/** Converts Uint8Array to hex string. */
+function bytesToHex(bytes: Uint8Array): string {
+    return Array.from(bytes).map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
 function startXmrLocking(
     swapId: string,
     storage: StorageService,
@@ -522,6 +659,19 @@ async function main(): Promise<void> {
     const watcher = new OpnetWatcher(storage, stateMachine);
     const moneroService = createMoneroService();
 
+    // Verify monero-wallet-rpc is reachable before accepting swaps
+    const rpcError = await moneroService.healthCheck();
+    if (rpcError !== null) {
+        const useMock = (process.env['MONERO_MOCK'] ?? 'false').toLowerCase() === 'true';
+        if (useMock) {
+            console.log('[Coordinator] Mock mode — skipping RPC health check');
+        } else {
+            console.error(`[Coordinator] *** FATAL *** ${rpcError}`);
+            console.error('[Coordinator] Cannot start without monero-wallet-rpc. Set MONERO_MOCK=true for testing.');
+            process.exit(1);
+        }
+    }
+
     let wsServer: SwapWebSocketServer | null = null;
 
     stateMachine.onStateChange((swap: ISwapRecord, from: SwapStatus, to: SwapStatus) => {
@@ -529,19 +679,33 @@ async function main(): Promise<void> {
         wsServer?.broadcastSwapUpdate(swap);
 
         // Clean up on terminal states: clear in-memory preimage queue,
-        // stop XMR monitoring, scrub preimage from DB (minimize exposure window),
-        // and release the locking guard.
+        // stop XMR monitoring, and release the locking guard.
         if (to === SwapStatus.COMPLETED || to === SwapStatus.REFUNDED || to === SwapStatus.EXPIRED) {
             wsServer?.clearPendingPreimage(swap.swap_id);
             moneroService.stopMonitoring(swap.swap_id);
             xmrLockingInProgress.delete(swap.swap_id);
-            // Scrub ALL sensitive data from DB — no longer needed after terminal state
-            storage.updateSwap(swap.swap_id, {
-                preimage: null,
-                claim_token: null,
-                alice_view_key: null,
-                bob_view_key: null,
-            } as import('./types.js').IUpdateSwapParams);
+
+            // On COMPLETED trustless swaps: sweep XMR first, then scrub keys after success.
+            // Keys must remain in DB until sweep succeeds (retries read from DB).
+            if (to === SwapStatus.COMPLETED && swap.trustless_mode === 1) {
+                // Set sweep_status BEFORE starting sweep — if process crashes,
+                // the swap will be picked up by the sweep retry logic on restart.
+                storage.updateSwap(swap.swap_id, { sweep_status: 'pending' });
+                void sweepCompletedSwap(swap, storage, moneroService);
+                // Only scrub non-sweep-critical fields immediately.
+                storage.updateSwap(swap.swap_id, {
+                    claim_token: null,
+                } as import('./types.js').IUpdateSwapParams);
+            } else {
+                // Non-trustless or non-COMPLETED: scrub all sensitive data immediately
+                storage.updateSwap(swap.swap_id, {
+                    preimage: null,
+                    claim_token: null,
+                    alice_view_key: null,
+                    bob_view_key: null,
+                    bob_spend_key: null,
+                } as import('./types.js').IUpdateSwapParams);
+            }
         }
 
         // When a swap transitions to TAKEN, try to start XMR locking
@@ -563,7 +727,7 @@ async function main(): Promise<void> {
         const ip = getClientIp(req);
         const isWrite = req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH';
 
-        if (!checkRateLimit(ip, isWrite)) {
+        if (!RATE_LIMIT_DISABLED && !checkRateLimit(ip, isWrite)) {
             tooManyRequests(res, getRateLimitRetryAfter(ip));
             return;
         }
@@ -706,6 +870,29 @@ async function main(): Promise<void> {
                 break;
             }
 
+            case 'admin_update_swap': {
+                const id = match.params['id'];
+                if (!id) {
+                    notFound(res);
+                    break;
+                }
+                if (!isAdminAuthorized(req)) {
+                    unauthorized(res);
+                    break;
+                }
+                if (!wsServer) {
+                    serverError(res, 'WebSocket server not initialized');
+                    break;
+                }
+                handleAdminUpdateSwap(req, res, storage, stateMachine, wsServer, id).catch(
+                    (err: unknown) => {
+                        const msg = err instanceof Error ? err.message : 'Unknown error';
+                        serverError(res, msg);
+                    },
+                );
+                break;
+            }
+
             default:
                 notFound(res);
         }
@@ -731,18 +918,74 @@ async function main(): Promise<void> {
             const expired = watcher.checkExpirations(currentBlock);
             if (expired.length > 0) {
                 console.log(`[Cleanup] Marked ${expired.length} swap(s) as expired`);
-                // Stop monitoring XMR for expired swaps and clean up pending preimages
                 for (const swap of expired) {
                     moneroService.stopMonitoring(swap.swap_id);
                     wsServer.clearPendingPreimage(swap.swap_id);
                 }
             }
         }
+
+        // Time-based fallback: expire OPEN/TAKEN swaps older than MAX_SWAP_AGE_MS.
+        // This catches swaps stuck when OPNet RPC is down (block height stale).
+        const allActive = storage.getActiveSwaps();
+        const now = Date.now();
+        for (const swap of allActive) {
+            if (stateMachine.isTerminal(swap.status)) continue;
+            if (swap.status === SwapStatus.EXPIRED) continue;
+
+            const createdMs = new Date(swap.created_at).getTime();
+            const age = now - createdMs;
+
+            // Only auto-expire OPEN and TAKEN (no XMR at risk)
+            if (
+                (swap.status === SwapStatus.OPEN || swap.status === SwapStatus.TAKEN) &&
+                age > MAX_SWAP_AGE_MS &&
+                stateMachine.canTransition(swap.status, SwapStatus.EXPIRED)
+            ) {
+                const prev = swap.status;
+                const updated = storage.updateSwap(
+                    swap.swap_id,
+                    { status: SwapStatus.EXPIRED },
+                    prev,
+                    `Time-based expiry: swap age ${Math.round(age / 3600000)}h exceeds 24h limit`,
+                );
+                stateMachine.notifyTransition(updated, prev, SwapStatus.EXPIRED);
+                moneroService.stopMonitoring(swap.swap_id);
+                wsServer.clearPendingPreimage(swap.swap_id);
+                console.log(`[Cleanup] Time-based expiry: swap ${swap.swap_id} (age: ${Math.round(age / 3600000)}h, was: ${prev})`);
+            }
+
+            // Warn about stuck XMR_LOCKING/XMR_LOCKED swaps (don't auto-expire — XMR at risk)
+            if (
+                (swap.status === SwapStatus.XMR_LOCKING || swap.status === SwapStatus.XMR_LOCKED) &&
+                age > XMR_STUCK_WARN_MS
+            ) {
+                console.warn(
+                    `[Cleanup] WARNING: Swap ${swap.swap_id} stuck in ${swap.status} for ${Math.round(age / 3600000)}h. ` +
+                    `Manual intervention may be needed. XMR lock address: ${swap.xmr_address ? swap.xmr_address.slice(0, 12) + '...' : 'unknown'}`,
+                );
+            }
+        }
     }, EXPIRY_CHECK_INTERVAL_MS);
+
+    // Periodically retry failed XMR sweeps (every 5 minutes)
+    const SWEEP_RETRY_INTERVAL_MS = 5 * 60 * 1000;
+    const sweepRetryTimer = setInterval(() => {
+        const failed = storage.getFailedSweeps();
+        if (failed.length > 0) {
+            console.log(`[Sweep Retry] Found ${failed.length} failed sweep(s) — retrying`);
+            for (const swap of failed) {
+                if (swap.trustless_mode === 1) {
+                    void sweepCompletedSwap(swap, storage, moneroService);
+                }
+            }
+        }
+    }, SWEEP_RETRY_INTERVAL_MS);
 
     function shutdown(): void {
         console.log('[Coordinator] Shutting down...');
         clearInterval(expiryCheckTimer);
+        clearInterval(sweepRetryTimer);
         moneroService.stopAll();
         watcher.stop();
         wsServer?.close();
@@ -826,6 +1069,17 @@ function recoverInterruptedSwaps(
             }
         }
     }
+
+    // Retry failed sweeps on startup
+    const failedSweeps = storage.getFailedSweeps();
+    if (failedSweeps.length > 0) {
+        console.log(`[Recovery] Found ${failedSweeps.length} failed sweep(s) — retrying`);
+        for (const swap of failedSweeps) {
+            if (swap.trustless_mode === 1) {
+                void sweepCompletedSwap(swap, storage, moneroService);
+            }
+        }
+    }
 }
 
 /** Converts a hex string to Uint8Array. */
@@ -840,8 +1094,9 @@ function hexToUint8(hex: string): Uint8Array {
 }
 
 function hexNibble(c: number): number {
-    if (c >= 48 && c <= 57) return c - 48;
-    if (c >= 97 && c <= 102) return c - 87;
+    if (c >= 48 && c <= 57) return c - 48;       // 0-9
+    if (c >= 97 && c <= 102) return c - 87;       // a-f
+    if (c >= 65 && c <= 70) return c - 55;        // A-F
     return 0;
 }
 

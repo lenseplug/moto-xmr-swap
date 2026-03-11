@@ -6,10 +6,14 @@
     "main": "dist/index.js",
     "scripts": {
         "build": "tsc",
+        "build:test": "tsc -p tsconfig.test.json",
         "typecheck": "tsc --noEmit",
         "lint": "eslint src/",
         "start": "node dist/index.js",
-        "dev": "node --watch dist/index.js"
+        "dev": "node --watch dist/index.js",
+        "test": "npm run build:test && node --test dist/tests/e2e.test.js",
+        "test:fast": "node --test dist/tests/e2e.test.js",
+        "postinstall": "node -e \"const p=JSON.parse(require('fs').readFileSync('node_modules/@noble/hashes/package.json','utf8'));const e={};for(const[k,v]of Object.entries(p.exports)){e[k]=v;if(k.endsWith('.js')&&k!=='.'){const n=k.replace(/\\\\.js$/,'');if(!e[n])e[n]=v}}e['./sha256']='./sha2.js';e['./sha512']='./sha2.js';p.exports=e;require('fs').writeFileSync('node_modules/@noble/hashes/package.json',JSON.stringify(p,null,2))\""
     },
     "dependencies": {
         "@btc-vision/bitcoin": "rc",

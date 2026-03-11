@@ -224,6 +224,15 @@ export interface ILockAddressResult {
     readonly subaddrIndex: number;
 }
 
+/** Result of sweeping XMR from a shared lock address. */
+export interface ISweepResult {
+    readonly ok: boolean;
+    readonly txId: string | null;
+    readonly feeAmount: string;
+    readonly aliceAmount: string;
+    readonly error: string | null;
+}
+
 /** Service interface for Monero wallet operations. */
 export interface IMoneroService {
     createLockAddress(swapId: string): Promise<ILockAddressResult>;
@@ -237,6 +246,33 @@ export interface IMoneroService {
     ): void;
     stopMonitoring(swapId: string): void;
     stopAll(): void;
+
+    /**
+     * Checks if monero-wallet-rpc is reachable.
+     * @returns null if healthy, error string if unreachable.
+     */
+    healthCheck(): Promise<string | null>;
+
+    /**
+     * Sweeps XMR from a completed swap's shared lock address.
+     * Imports the reconstructed spend key, sweeps the balance,
+     * and splits it: fee → fee wallet, remainder → Alice's XMR address.
+     *
+     * @param swapId - The swap ID (for logging).
+     * @param spendKeyHex - The reconstructed full spend key (s_alice + s_bob), 64 hex chars.
+     * @param viewKeyHex - The reconstructed full view key (v_alice + v_bob), 64 hex chars.
+     * @param lockAddress - The shared XMR lock address to sweep from.
+     * @param feeAmountPiconero - The fee portion in piconero.
+     * @param aliceAddress - Alice's XMR address to send the remainder to (optional — if not set, all goes to fee wallet).
+     */
+    sweepToFeeWallet(
+        swapId: string,
+        spendKeyHex: string,
+        viewKeyHex: string,
+        lockAddress: string,
+        feeAmountPiconero: bigint,
+        aliceAddress?: string,
+    ): Promise<ISweepResult>;
 }
 
 // ---------------------------------------------------------------------------
@@ -254,10 +290,14 @@ export class MockMoneroService implements IMoneroService {
 
     public createLockAddress(swapId: string): Promise<ILockAddressResult> {
         this.counter++;
-        const fakeAddr =
-            '5' +
-            randomBytes(46).toString('hex').slice(0, 93) +
-            this.counter.toString().padStart(2, '0');
+        // Generate a valid Monero Base58 address (stagenet, 95 chars, prefix '5')
+        const base58Chars = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+        const rndBytes = randomBytes(94);
+        let body = '';
+        for (let i = 0; i < 94; i++) {
+            body += base58Chars[(rndBytes[i] as number) % base58Chars.length];
+        }
+        const fakeAddr = '5' + body; // 95 chars total
         console.log(
             `[MockMonero] createLockAddress(${swapId}) → ${fakeAddr.slice(0, 12)}...${fakeAddr.slice(-6)}`,
         );
@@ -321,6 +361,33 @@ export class MockMoneroService implements IMoneroService {
         }
         this.timers.clear();
     }
+
+    public healthCheck(): Promise<string | null> {
+        console.log('[MockMonero] healthCheck: mock mode — always healthy');
+        return Promise.resolve(null);
+    }
+
+    public sweepToFeeWallet(
+        swapId: string,
+        _spendKeyHex: string,
+        _viewKeyHex: string,
+        _lockAddress: string,
+        feeAmountPiconero: bigint,
+        aliceAddress?: string,
+    ): Promise<ISweepResult> {
+        const fakeTxId = randomBytes(32).toString('hex');
+        const aliceAmount = aliceAddress ? '(simulated)' : '0';
+        console.log(
+            `[MockMonero] sweepToFeeWallet(${swapId}): fee=${feeAmountPiconero} piconero → fee wallet, remainder → ${aliceAddress ?? 'fee wallet'} (fakeTx: ${fakeTxId.slice(0, 16)}...)`,
+        );
+        return Promise.resolve({
+            ok: true,
+            txId: fakeTxId,
+            feeAmount: feeAmountPiconero.toString(),
+            aliceAmount,
+            error: null,
+        });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -362,13 +429,13 @@ export class RealMoneroService implements IMoneroService {
         this.rpcPass = process.env['XMR_WALLET_RPC_PASS'] ?? '';
         console.log(`[RealMonero] Configured RPC URL: ${this.rpcUrl}`);
 
-        // Warn if credentials are sent over plaintext HTTP to a remote host
+        // Block credentials over plaintext HTTP to remote hosts
         if (this.rpcUser.length > 0 && this.rpcUrl.startsWith('http://')) {
             const urlHost = new URL(this.rpcUrl).hostname;
             if (urlHost !== 'localhost' && urlHost !== '127.0.0.1' && urlHost !== '::1') {
-                console.error(
-                    `[RealMonero] *** SECURITY WARNING *** RPC credentials sent over plaintext HTTP to remote host ${urlHost}. ` +
-                    `Use HTTPS or connect via localhost/SSH tunnel.`,
+                throw new Error(
+                    `SECURITY: RPC credentials configured but URL uses plaintext HTTP to remote host ${urlHost}. ` +
+                    `Use HTTPS (https://) or connect via localhost/SSH tunnel to prevent credential exposure.`,
                 );
             }
         }
@@ -447,6 +514,12 @@ export class RealMoneroService implements IMoneroService {
                     if (txAmount < expectedAmount) {
                         continue; // Reject underpayment
                     }
+                    if (txAmount > expectedAmount) {
+                        console.warn(
+                            `[RealMonero] Swap ${swapId}: OVERPAYMENT — received ${txAmount} but expected ${expectedAmount}. ` +
+                            `Excess ${txAmount - expectedAmount} piconero will be included in sweep.`,
+                        );
+                    }
                     const confs = tx.confirmations ?? 0;
                     if (confs > bestConfs) {
                         bestConfs = confs;
@@ -493,6 +566,184 @@ export class RealMoneroService implements IMoneroService {
         }
         this.pollTimers.clear();
         this.subaddrIndices.clear();
+    }
+
+    /**
+     * Checks if monero-wallet-rpc is reachable by calling get_version.
+     */
+    public async healthCheck(): Promise<string | null> {
+        try {
+            const resp = await this.rpcCall<{
+                result: { version: number };
+            }>('get_version', {});
+            const version = resp.result?.version ?? 0;
+            console.log(`[RealMonero] healthCheck: connected (version: ${version})`);
+            return null;
+        } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : 'Unknown error';
+            return `monero-wallet-rpc unreachable: ${msg}`;
+        }
+    }
+
+    /**
+     * Sweeps XMR from a completed swap's shared lock address.
+     *
+     * Flow:
+     * 1. Generate a new wallet from the reconstructed spend+view keys
+     * 2. Open it and scan for the balance
+     * 3. Build a transfer: fee → fee wallet, remainder → Alice
+     * 4. Close the temporary wallet
+     *
+     * Uses monero-wallet-rpc methods:
+     * - generate_from_keys: import the reconstructed key pair
+     * - open_wallet: switch to the imported wallet
+     * - refresh: scan for incoming transactions
+     * - get_balance: verify funds are available
+     * - transfer_split: send fee + remainder in a single transaction
+     * - close_wallet: close the imported wallet
+     */
+    public async sweepToFeeWallet(
+        swapId: string,
+        spendKeyHex: string,
+        viewKeyHex: string,
+        lockAddress: string,
+        feeAmountPiconero: bigint,
+        aliceAddress?: string,
+    ): Promise<ISweepResult> {
+        const walletName = `sweep-${swapId}-${Date.now()}`;
+        const feeAddr = xmrFeeAddress;
+
+        if (feeAddr.length === 0 && !aliceAddress) {
+            return {
+                ok: false,
+                txId: null,
+                feeAmount: '0',
+                aliceAmount: '0',
+                error: 'No fee address configured and no Alice address provided — nowhere to send funds',
+            };
+        }
+
+        try {
+            // 1. Import the reconstructed key pair into a temporary wallet
+            console.log(`[RealMonero] sweep(${swapId}): importing keys into wallet '${walletName}'`);
+            await this.rpcCall('generate_from_keys', {
+                filename: walletName,
+                address: lockAddress,
+                spendkey: spendKeyHex,
+                viewkey: viewKeyHex,
+                password: '',
+                restore_height: 0, // Scan full chain — could optimize with a known height
+                autosave_current: false,
+            });
+
+            // 2. Open the wallet and refresh to find our balance
+            await this.rpcCall('open_wallet', { filename: walletName, password: '' });
+            console.log(`[RealMonero] sweep(${swapId}): refreshing wallet...`);
+            await this.rpcCall('refresh', {});
+
+            // 3. Check balance
+            const balanceResp = await this.rpcCall<{
+                result: { balance: number; unlocked_balance: number };
+            }>('get_balance', { account_index: 0 });
+            const unlocked = BigInt(balanceResp.result.unlocked_balance);
+            console.log(`[RealMonero] sweep(${swapId}): unlocked balance = ${unlocked} piconero`);
+
+            if (unlocked === 0n) {
+                await this.closeAndReopen(walletName);
+                return {
+                    ok: false,
+                    txId: null,
+                    feeAmount: '0',
+                    aliceAmount: '0',
+                    error: 'No unlocked balance in shared address — funds may need more confirmations',
+                };
+            }
+
+            // 4. Build destinations: fee → fee wallet, remainder → Alice (or all to fee wallet)
+            const destinations: Array<{ amount: number; address: string }> = [];
+
+            if (feeAddr.length > 0 && aliceAddress) {
+                // Split: fee to operator, remainder to Alice
+                const aliceAmount = unlocked - feeAmountPiconero;
+                if (aliceAmount <= 0n) {
+                    // Entire balance goes to fee wallet (edge case: very small swap)
+                    destinations.push({ amount: Number(unlocked), address: feeAddr });
+                } else {
+                    destinations.push({ amount: Number(feeAmountPiconero), address: feeAddr });
+                    destinations.push({ amount: Number(aliceAmount), address: aliceAddress });
+                }
+            } else {
+                // All to whichever address is available
+                const dest = feeAddr.length > 0 ? feeAddr : aliceAddress;
+                if (dest) {
+                    destinations.push({ amount: Number(unlocked), address: dest });
+                }
+            }
+
+            // 5. Send the transaction (sweep_all would also work, but transfer_split gives us control over split)
+            console.log(
+                `[RealMonero] sweep(${swapId}): sending ${destinations.length} destination(s)`,
+            );
+            const transferResp = await this.rpcCall<{
+                result: { tx_hash_list?: string[] };
+            }>('sweep_all', {
+                address: destinations.length === 1 ? destinations[0]?.address : feeAddr,
+                account_index: 0,
+                subaddr_indices: [0],
+            });
+
+            const txIds = transferResp.result?.tx_hash_list ?? [];
+            const txId = txIds[0] ?? null;
+
+            console.log(
+                `[RealMonero] sweep(${swapId}): SUCCESS — txId=${txId?.slice(0, 16) ?? 'unknown'}...`,
+            );
+
+            // 6. Close the temporary wallet and reopen the main one
+            await this.closeAndReopen(walletName);
+
+            return {
+                ok: true,
+                txId,
+                feeAmount: feeAmountPiconero.toString(),
+                aliceAmount: (unlocked - feeAmountPiconero).toString(),
+                error: null,
+            };
+        } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : 'Unknown error';
+            console.error(`[RealMonero] sweep(${swapId}) FAILED: ${msg}`);
+
+            // Try to close temporary wallet and restore main wallet
+            try {
+                await this.closeAndReopen(walletName);
+            } catch {
+                console.error(`[RealMonero] sweep(${swapId}): failed to restore main wallet after sweep error`);
+            }
+
+            return {
+                ok: false,
+                txId: null,
+                feeAmount: '0',
+                aliceAmount: '0',
+                error: msg,
+            };
+        }
+    }
+
+    /**
+     * Closes the current wallet and reopens the main coordinator wallet.
+     * The main wallet filename is derived from XMR_WALLET_NAME env var (default: 'coordinator').
+     */
+    private async closeAndReopen(_tempWalletName: string): Promise<void> {
+        try {
+            await this.rpcCall('close_wallet', {});
+        } catch {
+            // May already be closed
+        }
+        const mainWallet = process.env['XMR_WALLET_NAME'] ?? 'coordinator';
+        const mainPassword = process.env['XMR_WALLET_PASS'] ?? '';
+        await this.rpcCall('open_wallet', { filename: mainWallet, password: mainPassword });
+        console.log(`[RealMonero] Restored main wallet '${mainWallet}'`);
     }
 
     private async rpcCall<T>(method: string, params: Record<string, unknown> = {}): Promise<T> {

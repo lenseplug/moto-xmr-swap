@@ -110,6 +110,7 @@ export function TakeSwap({ swapId, onBack, onTaken }: TakeSwapProps): React.Reac
                     bobEd25519PubKey: uint8ArrayToHex(bobSpendKey.publicKey),
                     bobViewKey: uint8ArrayToHex(bobViewKeyPair.privateKey),
                     bobKeyProof: uint8ArrayToHex(keyProof),
+                    bobSpendKey: uint8ArrayToHex(bobSpendKey.privateKey),
                 });
             } catch {
                 console.warn('Failed to submit Bob keys — coordinator may operate without split-key mode');
