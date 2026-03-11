@@ -194,7 +194,7 @@ export async function getAllCoordinatorStatuses(): Promise<CoordinatorStatus[]> 
  * @param aliceViewKey - Optional Alice view key for split-key mode (64 hex chars)
  * @returns true if the secret was accepted
  */
-export async function submitSwapSecret(swapId: string, secret: string, aliceViewKey?: string): Promise<boolean> {
+export async function submitSwapSecret(swapId: string, secret: string, aliceViewKey?: string): Promise<{ ok: boolean; error?: string }> {
     try {
         const body: Record<string, string> = { secret };
         if (aliceViewKey) {
@@ -206,9 +206,13 @@ export async function submitSwapSecret(swapId: string, secret: string, aliceView
             body: JSON.stringify(body),
             signal: AbortSignal.timeout(10000),
         });
-        return res.ok;
-    } catch {
-        return false;
+        if (!res.ok) {
+            const text = await res.text().catch(() => '');
+            return { ok: false, error: `${res.status}: ${text}` };
+        }
+        return { ok: true };
+    } catch (err) {
+        return { ok: false, error: err instanceof Error ? err.message : 'unknown' };
     }
 }
 

@@ -1,11 +1,11 @@
 /**
  * CreateSwap form component — allows users to create a new MOTO/XMR atomic swap.
  */
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useRef } from 'react';
 import { useWalletConnect } from '@btc-vision/walletconnect';
 import { networks } from '@btc-vision/bitcoin';
 import { getSwapVaultContract, getMotoContract, parseMotoAmount, parseXmrAmount, splitXmrAddress, getProvider } from '../services/opnet';
-import { generateTrustlessSecret, saveLocalSwapSecret, secretHexToBigint, hashSecret } from '../utils/hashlock';
+import { generateTrustlessSecret, saveLocalSwapSecret, hashSecret } from '../utils/hashlock';
 import { submitSwapSecret } from '../services/coordinator';
 import { PrivacyBanner } from './PrivacyBanner';
 import { ExplorerLinks } from './ExplorerLinks';
@@ -13,7 +13,9 @@ import { ExplorerLinks } from './ExplorerLinks';
 const SWAP_VAULT_ADDRESS = import.meta.env.VITE_SWAP_VAULT_ADDRESS;
 const MOTO_TOKEN_ADDRESS = import.meta.env.VITE_MOTO_TOKEN_ADDRESS;
 const BLOCKS_PER_HOUR = 6;
-const DEFAULT_TIMEOUT_BLOCKS = 100;
+// Coordinator requires at least 50 blocks remaining when locking XMR.
+// TODO(mainnet): Review and adjust for mainnet block times
+const DEFAULT_TIMEOUT_BLOCKS = 80;
 
 interface CreateSwapProps {
     readonly onSwapCreated: (swapId: bigint) => void;
@@ -54,6 +56,16 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
     const [txResult, setTxResult] = useState<TxResult | null>(null);
     const [formError, setFormError] = useState<string | null>(null);
 
+    // Cancellation support — aborting before the wallet prompt is shown
+    const cancelledRef = useRef(false);
+
+    const handleCancel = useCallback((): void => {
+        cancelledRef.current = true;
+        setStep('idle');
+        setStatusMessage('');
+        setFormError('Swap creation cancelled.');
+    }, []);
+
     const handleFieldChange = useCallback(
         (field: keyof FormState) =>
             (e: React.ChangeEvent<HTMLInputElement>): void => {
@@ -73,8 +85,8 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
         if (form.xmrAddress.trim().length < 10) return 'Please enter a valid XMR address';
 
         const blocks = parseInt(form.timeoutBlocks, 10);
-        if (isNaN(blocks) || blocks < 10 || blocks > 10000)
-            return 'Timeout must be between 10 and 10000 blocks';
+        if (isNaN(blocks) || blocks < 60 || blocks > 10000)
+            return 'Timeout must be between 60 and 10,000 blocks (coordinator needs at least 50 blocks to lock XMR safely)';
 
         return null;
     }, [form]);
@@ -100,6 +112,7 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
         const timeoutBlocks = BigInt(parseInt(form.timeoutBlocks, 10));
 
         setFormError(null);
+        cancelledRef.current = false;
 
         try {
             // Step 1: Check existing allowance
@@ -118,13 +131,14 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
 
             const currentAllowance = allowanceResult.properties.remaining;
 
-            // Step 2: Approve if needed
+            // Step 2: Approve if needed — use a large blanket approval so we only do this once
             if (currentAllowance < motoAmount) {
-                const needed = motoAmount - currentAllowance;
+                // Approve a huge amount so future swaps never need another approval
+                const bigApproval = 2n ** 128n - 1n; // u128 max — way more than enough
                 setStep('approving');
-                setStatusMessage(`Increasing allowance by ${form.motoAmount} MOTO...`);
+                setStatusMessage('Approving MOTO for SwapVault (one-time)...');
 
-                const approveSim = await motoContract.increaseAllowance(vaultAddress, needed);
+                const approveSim = await motoContract.increaseAllowance(vaultAddress, bigApproval);
                 if ('error' in approveSim) {
                     throw new Error(`Allowance simulation failed: ${String(approveSim.error)}`);
                 }
@@ -143,8 +157,31 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
                     throw new Error(`Allowance transaction failed: ${String(approveObj['error'])}`);
                 }
 
-                // Brief wait for allowance TX to propagate
-                await new Promise<void>((r) => setTimeout(r, 3000));
+                // Wait for the approval to be confirmed on-chain by polling allowance
+                setStatusMessage('Approving MOTO — waiting for block confirmation...');
+                const maxWaitMs = 10 * 60 * 1000; // 10 minutes max
+                const pollMs = 5_000; // check every 5s
+                const startTime = Date.now();
+                let confirmed = false;
+
+                while (Date.now() - startTime < maxWaitMs) {
+                    await new Promise<void>((r) => setTimeout(r, pollMs));
+                    const elapsed = Math.round((Date.now() - startTime) / 1000);
+                    setStatusMessage(`Approving MOTO — waiting for block confirmation (${elapsed}s)...`);
+                    try {
+                        const recheckResult = await motoContract.allowance(senderAddress, vaultAddress);
+                        if (!('error' in recheckResult) && recheckResult.properties.remaining >= motoAmount) {
+                            confirmed = true;
+                            break;
+                        }
+                    } catch {
+                        // RPC hiccup — keep polling
+                    }
+                }
+
+                if (!confirmed) {
+                    throw new Error('Approval timed out — the allowance TX may still be pending. Try again in a few minutes.');
+                }
             }
 
             // Step 3: Generate ed25519 split keys + hash-lock
@@ -174,21 +211,56 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
             // between the block number fetch and the transaction being mined.
             const refundBlock = currentBlock + timeoutBlocks + 20n;
 
-            // Step 6: Simulate createSwap (swapContract already initialised above)
+            // Step 6: Simulate createSwap with retry (allowance may need a block to confirm)
+            // OPNet simulations can throw OR return error objects, so we handle both.
             setStatusMessage('Simulating swap creation...');
 
-            const createSim = await swapContract.createSwap(
-                hashLock,
-                refundBlock,
-                motoAmount,
-                xmrAmount,
-                xmrAddressHi,
-                xmrAddressLo,
-            );
+            let createSim: Awaited<ReturnType<typeof swapContract.createSwap>> | null = null;
+            const maxRetries = 36; // up to ~3 minutes of retries
+            for (let attempt = 1; attempt <= maxRetries; attempt++) {
+                try {
+                    const simResult = await swapContract.createSwap(
+                        hashLock,
+                        refundBlock,
+                        motoAmount,
+                        xmrAmount,
+                        xmrAddressHi,
+                        xmrAddressLo,
+                    );
 
-            if ('error' in createSim) {
-                throw new Error(`Swap simulation failed: ${String(createSim.error)}`);
+                    if ('error' in simResult) {
+                        const errMsg = String(simResult.error);
+                        if (errMsg.includes('llowance') && attempt < maxRetries) {
+                            // Allowance not confirmed yet — keep waiting
+                            throw new Error(errMsg);
+                        }
+                        throw new Error(`Swap simulation failed: ${errMsg}`);
+                    }
+
+                    createSim = simResult;
+                    break;
+                } catch (simErr: unknown) {
+                    const errMsg = simErr instanceof Error ? simErr.message : String(simErr);
+
+                    // Retry on allowance errors (case-insensitive partial match)
+                    if (errMsg.toLowerCase().includes('allowance') && attempt < maxRetries) {
+                        setStep('approving');
+                        setStatusMessage(`Approving MOTO — waiting for block confirmation (${attempt}/${maxRetries})...`);
+                        await new Promise<void>((r) => setTimeout(r, 5_000));
+                        continue;
+                    }
+
+                    // Non-allowance error or last retry — give up
+                    throw new Error(`Swap simulation failed: ${errMsg}`);
+                }
             }
+
+            if (createSim === null) {
+                throw new Error('Swap simulation failed: allowance not confirmed after retries. Try again in a few minutes.');
+            }
+
+            // Check for cancellation before requesting wallet signature
+            if (cancelledRef.current) return;
 
             // Step 7: Send transaction
             setStatusMessage('Waiting for wallet signature...');
@@ -214,29 +286,56 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
                       ? receiptObj['txid']
                       : 'pending';
 
-            // Extract swapId from events
-            const events = createSim.events ?? [];
+            // Extract swapId — prefer return value, fallback to events
             let swapId = 0n;
-            if (events.length > 0) {
-                const firstEvent = events[0];
-                if (firstEvent !== undefined && typeof firstEvent === 'object' && firstEvent !== null) {
-                    const evtRecord = firstEvent as unknown as Record<string, unknown>;
-                    const vals = evtRecord['values'] as Record<string, unknown> | undefined;
-                    if (vals !== undefined && typeof vals['swapId'] === 'bigint') {
-                        swapId = vals['swapId'];
+
+            // Try the simulation return value first (most reliable)
+            if (createSim.properties && typeof createSim.properties === 'object') {
+                const props = createSim.properties as Record<string, unknown>;
+                if (typeof props['swapId'] === 'bigint') {
+                    swapId = props['swapId'];
+                }
+            }
+
+            // Fallback: try events
+            if (swapId === 0n) {
+                const events = createSim.events ?? [];
+                if (events.length > 0) {
+                    const firstEvent = events[0];
+                    if (firstEvent !== undefined && typeof firstEvent === 'object' && firstEvent !== null) {
+                        const evtRecord = firstEvent as unknown as Record<string, unknown>;
+                        const vals = evtRecord['values'] as Record<string, unknown> | undefined;
+                        if (vals !== undefined && typeof vals['swapId'] === 'bigint') {
+                            swapId = vals['swapId'];
+                        }
                     }
                 }
             }
 
-            // Store secret + view key locally
-            saveLocalSwapSecret(swapId.toString(), secret, hashLockHex, aliceViewKey);
-            void secretHexToBigint(secret);
+            console.log('[CreateSwap] Extracted swapId:', swapId.toString());
 
-            // Submit secret + view key to coordinator (non-fatal if it fails — SwapStatus retries)
-            try {
-                await submitSwapSecret(swapId.toString(), secret, aliceViewKey);
-            } catch {
-                console.warn('Failed to submit secret to coordinator — will retry on status page');
+            // Store secret + view key locally (persists in localStorage across refreshes)
+            saveLocalSwapSecret(swapId.toString(), secret, hashLockHex, aliceViewKey);
+
+            // Submit secret + view key to coordinator with retries.
+            // The coordinator may not know about this swap yet (it creates the record
+            // when the OPNet watcher detects the on-chain tx in the next block), so
+            // we retry for up to ~3 minutes. SwapStatus also retries as a fallback.
+            setStatusMessage('Registering swap secret with coordinator...');
+            let secretSubmitted = false;
+            for (let attempt = 0; attempt < 36; attempt++) {
+                if (cancelledRef.current) break;
+                const result = await submitSwapSecret(swapId.toString(), secret, aliceViewKey);
+                if (result.ok) {
+                    secretSubmitted = true;
+                    break;
+                }
+                if (attempt < 35) {
+                    await new Promise<void>((r) => setTimeout(r, 5_000));
+                }
+            }
+            if (!secretSubmitted) {
+                console.warn('[CreateSwap] Secret not confirmed by coordinator — SwapStatus will retry');
             }
 
             setTxResult({ txId, swapId });
@@ -406,7 +505,7 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
                         </div>
                     )}
 
-                    {/* Status */}
+                    {/* Status + Cancel */}
                     {isProcessing && (
                         <div
                             style={{
@@ -427,9 +526,17 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
                                     height: '6px',
                                     borderRadius: '50%',
                                     background: 'var(--color-orange)',
+                                    flexShrink: 0,
                                 }}
                             />
-                            {statusMessage}
+                            <span style={{ flex: 1 }}>{statusMessage}</span>
+                            <button
+                                className="btn btn-ghost btn-sm"
+                                style={{ color: 'var(--color-text-error)', flexShrink: 0 }}
+                                onClick={handleCancel}
+                            >
+                                Cancel
+                            </button>
                         </div>
                     )}
 
@@ -479,8 +586,7 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
                                     marginTop: '6px',
                                 }}
                             >
-                                Swap keys saved locally. Do not clear browser data until the swap is
-                                complete.
+                                Swap keys saved to browser storage. Safe to refresh — do not clear browser data until the swap completes.
                             </p>
                             <ExplorerLinks txId={txResult.txId} address={walletAddress ?? undefined} />
                         </div>
@@ -495,10 +601,10 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
                         >
                             {isProcessing
                                 ? step === 'approving'
-                                    ? 'Approving...'
+                                    ? 'Approving MOTO...'
                                     : step === 'creating'
-                                      ? 'Creating...'
-                                      : 'Checking...'
+                                      ? 'Creating Swap...'
+                                      : 'Checking Allowance...'
                                 : 'Create Swap'}
                         </button>
                     )}

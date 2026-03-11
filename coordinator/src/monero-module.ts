@@ -224,6 +224,13 @@ export interface ILockAddressResult {
     readonly subaddrIndex: number;
 }
 
+/** Result of transferring XMR to a lock address. */
+export interface ITransferResult {
+    readonly ok: boolean;
+    readonly txId: string | null;
+    readonly error: string | null;
+}
+
 /** Result of sweeping XMR from a shared lock address. */
 export interface ISweepResult {
     readonly ok: boolean;
@@ -243,6 +250,7 @@ export interface IMoneroService {
         onConfirmed: OnConfirmedCallback,
         onProgress?: OnProgressCallback,
         subaddrIndex?: number,
+        lockTxId?: string,
     ): void;
     stopMonitoring(swapId: string): void;
     stopAll(): void;
@@ -252,6 +260,20 @@ export interface IMoneroService {
      * @returns null if healthy, error string if unreachable.
      */
     healthCheck(): Promise<string | null>;
+
+    /**
+     * Transfers XMR from the coordinator's wallet to a lock address.
+     * This is how the coordinator provides XMR liquidity for MOTO→XMR swaps.
+     *
+     * @param swapId - The swap ID (for logging).
+     * @param address - The lock address to send XMR to.
+     * @param amountPiconero - The amount to send in piconero.
+     */
+    transferToLockAddress(
+        swapId: string,
+        address: string,
+        amountPiconero: bigint,
+    ): Promise<ITransferResult>;
 
     /**
      * Sweeps XMR from a completed swap's shared lock address.
@@ -311,6 +333,7 @@ export class MockMoneroService implements IMoneroService {
         onConfirmed: OnConfirmedCallback,
         onProgress?: OnProgressCallback,
         _subaddrIndex?: number,
+        _lockTxId?: string,
     ): void {
         console.log(
             `[MockMonero] startMonitoring(${swapId}) — will auto-confirm in ${XMR_MOCK_CONFIRM_DELAY_MS}ms`,
@@ -365,6 +388,18 @@ export class MockMoneroService implements IMoneroService {
     public healthCheck(): Promise<string | null> {
         console.log('[MockMonero] healthCheck: mock mode — always healthy');
         return Promise.resolve(null);
+    }
+
+    public transferToLockAddress(
+        swapId: string,
+        _address: string,
+        amountPiconero: bigint,
+    ): Promise<ITransferResult> {
+        const fakeTxId = randomBytes(32).toString('hex');
+        console.log(
+            `[MockMonero] transferToLockAddress(${swapId}): ${amountPiconero} piconero (fakeTx: ${fakeTxId.slice(0, 16)}...)`,
+        );
+        return Promise.resolve({ ok: true, txId: fakeTxId, error: null });
     }
 
     public sweepToFeeWallet(
@@ -462,9 +497,12 @@ export class RealMoneroService implements IMoneroService {
         onConfirmed: OnConfirmedCallback,
         onProgress?: OnProgressCallback,
         recoverySubaddrIndex?: number,
+        lockTxId?: string,
     ): void {
+        const mode = lockTxId ? 'outgoing-tx' : 'incoming-addr';
         console.log(
-            `[RealMonero] startMonitoring(${swapId}) — polling every ${XMR_POLL_INTERVAL_MS}ms, expecting ${expectedAmount} piconero`,
+            `[RealMonero] startMonitoring(${swapId}) — mode: ${mode}, polling every ${XMR_POLL_INTERVAL_MS}ms, expecting ${expectedAmount} piconero` +
+            (lockTxId ? `, tracking tx: ${lockTxId.slice(0, 16)}...` : ''),
         );
 
         // Resolve subaddress index: prefer in-memory (from createLockAddress), fall back to persisted value
@@ -473,7 +511,33 @@ export class RealMoneroService implements IMoneroService {
         }
         const subaddrIndex = this.subaddrIndices.get(swapId);
 
-        const poll = async (): Promise<void> => {
+        const pollByTxId = async (txId: string): Promise<void> => {
+            try {
+                // Track outgoing transfer by its tx hash
+                const resp = await this.rpcCall<{
+                    result: { transfer?: { confirmations?: number; txid?: string } };
+                }>('get_transfer_by_txid', { txid: txId });
+
+                const confs = resp.result?.transfer?.confirmations ?? 0;
+
+                if (confs > 0) {
+                    onProgress?.(confs);
+                    console.log(
+                        `[RealMonero] Swap ${swapId}: ${confs} confirmations (tx: ${txId.slice(0, 16)}...)`,
+                    );
+                }
+
+                if (confs >= XMR_REQUIRED_CONFIRMATIONS) {
+                    onConfirmed(confs, txId);
+                    this.stopMonitoring(swapId);
+                }
+            } catch (err: unknown) {
+                const msg = err instanceof Error ? err.message : 'Unknown error';
+                console.error(`[RealMonero] Poll error for swap ${swapId} (tx tracking): ${msg}`);
+            }
+        };
+
+        const pollByAddress = async (): Promise<void> => {
             try {
                 // Filter by subaddress index if known — only shows transfers
                 // to this specific lock address, not the entire wallet.
@@ -544,6 +608,10 @@ export class RealMoneroService implements IMoneroService {
             }
         };
 
+        const poll = lockTxId
+            ? (): Promise<void> => pollByTxId(lockTxId)
+            : pollByAddress;
+
         void poll();
         const timer = setInterval(() => void poll(), XMR_POLL_INTERVAL_MS);
         this.pollTimers.set(swapId, timer);
@@ -582,6 +650,56 @@ export class RealMoneroService implements IMoneroService {
         } catch (err: unknown) {
             const msg = err instanceof Error ? err.message : 'Unknown error';
             return `monero-wallet-rpc unreachable: ${msg}`;
+        }
+    }
+
+    /**
+     * Transfers XMR from the coordinator's wallet to a lock address.
+     * Uses monero-wallet-rpc `transfer` method.
+     */
+    public async transferToLockAddress(
+        swapId: string,
+        address: string,
+        amountPiconero: bigint,
+    ): Promise<ITransferResult> {
+        try {
+            // Check balance first
+            const balanceResp = await this.rpcCall<{
+                result: { unlocked_balance: number };
+            }>('get_balance', { account_index: 0 });
+            const unlocked = BigInt(balanceResp.result.unlocked_balance);
+
+            if (unlocked < amountPiconero) {
+                const error = `Insufficient XMR balance: have ${unlocked} piconero, need ${amountPiconero}`;
+                console.error(`[RealMonero] transferToLockAddress(${swapId}): ${error}`);
+                return { ok: false, txId: null, error };
+            }
+
+            console.log(
+                `[RealMonero] transferToLockAddress(${swapId}): sending ${amountPiconero} piconero to ${address.slice(0, 12)}...`,
+            );
+
+            const transferResp = await this.rpcCall<{
+                result: { tx_hash: string; fee: number };
+            }>('transfer', {
+                destinations: [{ amount: Number(amountPiconero), address }],
+                account_index: 0,
+                priority: 1, // Normal priority
+                do_not_relay: false,
+                get_tx_key: true,
+            });
+
+            const txId = transferResp.result?.tx_hash ?? null;
+            const txFee = transferResp.result?.fee ?? 0;
+            console.log(
+                `[RealMonero] transferToLockAddress(${swapId}): SUCCESS — txId=${txId?.slice(0, 16)}... fee=${txFee} piconero`,
+            );
+
+            return { ok: true, txId, error: null };
+        } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : 'Unknown error';
+            console.error(`[RealMonero] transferToLockAddress(${swapId}) FAILED: ${msg}`);
+            return { ok: false, txId: null, error: msg };
         }
     }
 

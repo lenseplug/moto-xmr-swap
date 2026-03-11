@@ -2,6 +2,7 @@
  * OrderBook component — displays active MOTO/XMR swaps.
  */
 import React, { useState, useCallback } from 'react';
+import { useWalletConnect } from '@btc-vision/walletconnect';
 import { useSwaps, useBlockNumber } from '../hooks/useSwaps';
 import { formatTokenAmount, formatXmrAmount } from '../services/opnet';
 import { SWAP_STATUS_LABELS } from '../types/swap';
@@ -96,6 +97,7 @@ function sortSwaps(
 export function OrderBook({ onTakeSwap }: OrderBookProps): React.ReactElement {
     const { swaps, isLoading, error, refresh, lastUpdated } = useSwaps();
     const currentBlock = useBlockNumber();
+    const { address: senderAddress } = useWalletConnect();
 
     const [sortField, setSortField] = useState<SortField>('blocksRemaining');
     const [sortDir, setSortDir] = useState<SortDirection>('asc');
@@ -112,7 +114,12 @@ export function OrderBook({ onTakeSwap }: OrderBookProps): React.ReactElement {
         [sortField],
     );
 
-    const enriched = swaps.map((s) => enrichSwap(s, currentBlock));
+    // Hide swaps created by the connected wallet (compare on-chain depositor)
+    // This works correctly even when multiple wallets share the same browser.
+    const myAddress = senderAddress?.toString().toLowerCase() ?? '';
+    const visibleSwaps = swaps.filter((s) => s.depositor.toLowerCase() !== myAddress);
+
+    const enriched = visibleSwaps.map((s) => enrichSwap(s, currentBlock));
     const sorted = sortSwaps(enriched, sortField, sortDir);
 
     const SortArrow = ({ field }: { field: SortField }): React.ReactElement => {
@@ -237,8 +244,9 @@ export function OrderBook({ onTakeSwap }: OrderBookProps): React.ReactElement {
                                 <th
                                     style={thStyle}
                                     onClick={() => handleSortClick('blocksRemaining')}
+                                    title="Blocks until refund timeout — the swap itself completes in 2-3 blocks"
                                 >
-                                    Blocks Left
+                                    Expires
                                     <SortArrow field="blocksRemaining" />
                                 </th>
                                 <th style={{ ...thStyle, cursor: 'default' }}>Status</th>

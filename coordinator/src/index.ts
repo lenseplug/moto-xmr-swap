@@ -136,10 +136,17 @@ function getClientIp(req: IncomingMessage): string {
 // CORS helpers
 // ---------------------------------------------------------------------------
 
+/** Parsed list of allowed CORS origins (supports comma-separated). */
+const ALLOWED_ORIGINS = ALLOWED_ORIGIN.split(',').map((o) => o.trim());
+
 /** Adds CORS and security headers to all responses. */
-function addCorsHeaders(res: ServerResponse): void {
-    // CORS
-    res.setHeader('Access-Control-Allow-Origin', ALLOWED_ORIGIN);
+function addCorsHeaders(res: ServerResponse, req?: IncomingMessage): void {
+    // CORS — reflect the matching request origin (only one value allowed in the header)
+    const requestOrigin = req?.headers['origin'] ?? '';
+    if (ALLOWED_ORIGINS.includes(requestOrigin)) {
+        res.setHeader('Access-Control-Allow-Origin', requestOrigin);
+    }
+    res.setHeader('Vary', 'Origin');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
     res.setHeader('Access-Control-Max-Age', '86400');
@@ -573,12 +580,41 @@ function startXmrLocking(
                 `[XMR Locking] Swap ${swapId} → XMR_LOCKING (address: ${xmrLockAddress.slice(0, 12)}...)`,
             );
 
-            // Start monitoring the XMR address
+            // Transfer XMR from coordinator's wallet to the lock address
             const expectedAmount = BigInt(swap.xmr_total);
             if (expectedAmount <= 0n) {
                 console.error(`[XMR Locking] Swap ${swapId} has zero/negative xmr_total — aborting`);
                 return;
             }
+
+            // Transfer XMR — retry with backoff if balance is temporarily locked
+            let transferTxId: string | null = null;
+            const maxTransferAttempts = 11;
+            for (let txAttempt = 1; txAttempt <= maxTransferAttempts; txAttempt++) {
+                const result = await moneroService.transferToLockAddress(swapId, xmrLockAddress, expectedAmount);
+                if (result.ok) {
+                    transferTxId = result.txId;
+                    if (transferTxId) {
+                        storage.updateSwap(swapId, { xmr_lock_tx: transferTxId });
+                        console.log(`[XMR Locking] Swap ${swapId} — XMR sent! tx: ${transferTxId.slice(0, 16)}...`);
+                    }
+                    break;
+                }
+                console.error(`[XMR Locking] Swap ${swapId} — transfer attempt ${txAttempt}/${maxTransferAttempts} failed: ${result.error}`);
+                if (txAttempt === maxTransferAttempts) {
+                    console.error(`[XMR Locking] Swap ${swapId} — all transfer attempts exhausted`);
+                    xmrLockingInProgress.delete(swapId);
+                    return;
+                }
+                const delayMs = Math.min(30000 * txAttempt, 120000);
+                console.log(`[XMR Locking] Swap ${swapId} — retrying in ${delayMs / 1000}s...`);
+                await new Promise<void>(resolve => setTimeout(resolve, delayMs));
+            }
+
+            // Start monitoring the XMR lock for confirmations.
+            // For split-key mode (shared address not in our wallet), track by outgoing tx hash.
+            // For standard mode (subaddress in our wallet), track by incoming transfers.
+            const lockTxId = transferTxId ?? undefined;
             moneroService.startMonitoring(
                 swapId,
                 xmrLockAddress,
@@ -601,6 +637,8 @@ function startXmrLocking(
                         wsServer.broadcastSwapUpdate(current);
                     }
                 },
+                subaddrIndex,
+                lockTxId,
             );
         } catch (err: unknown) {
             const msg = err instanceof Error ? err.message : 'Unknown error';
@@ -716,7 +754,7 @@ async function main(): Promise<void> {
     });
 
     const server = createServer((req: IncomingMessage, res: ServerResponse) => {
-        addCorsHeaders(res);
+        addCorsHeaders(res, req);
 
         if (req.method === 'OPTIONS') {
             res.writeHead(204);
@@ -795,7 +833,7 @@ async function main(): Promise<void> {
                     notFound(res);
                     break;
                 }
-                handleTakeSwap(req, res, storage, id).catch((err: unknown) => {
+                handleTakeSwap(req, res, storage, id, stateMachine, wsServer!).catch((err: unknown) => {
                     const msg = err instanceof Error ? err.message : 'Unknown error';
                     serverError(res, msg);
                 });
@@ -1029,7 +1067,43 @@ function recoverInterruptedSwaps(
                 console.error(`[Recovery] Swap ${swap.swap_id} has non-numeric xmr_total (${swap.xmr_total}) — skipping`);
                 continue;
             }
-            console.log(`[Recovery] Resuming XMR monitoring for swap ${swap.swap_id} (subaddr_index: ${swap.xmr_subaddr_index ?? 'unknown'})`);
+
+            // If xmr_lock_tx is 'pending', the transfer was never sent — attempt it now
+            if (!swap.xmr_lock_tx || swap.xmr_lock_tx === 'pending') {
+                console.log(`[Recovery] Swap ${swap.swap_id} needs XMR transfer (lockTx=pending) — attempting...`);
+                void (async () => {
+                    const result = await moneroService.transferToLockAddress(swap.swap_id, swap.xmr_address!, expectedAmount);
+                    if (result.ok && result.txId) {
+                        storage.updateSwap(swap.swap_id, { xmr_lock_tx: result.txId });
+                        console.log(`[Recovery] Swap ${swap.swap_id} — XMR sent! tx: ${result.txId.slice(0, 16)}...`);
+                        // Now start monitoring by tx hash
+                        moneroService.startMonitoring(
+                            swap.swap_id, swap.xmr_address!, expectedAmount,
+                            (confs: number, txId: string) => {
+                                storage.updateSwap(swap.swap_id, { xmr_lock_tx: txId });
+                                notifyXmrConfirmed(swap.swap_id, confs, storage, stateMachine, wsServer);
+                            },
+                            (confs: number) => {
+                                storage.updateSwap(swap.swap_id, { xmr_lock_confirmations: confs });
+                                const cur = storage.getSwap(swap.swap_id);
+                                if (cur) wsServer.broadcastSwapUpdate(cur);
+                            },
+                            undefined, result.txId,
+                        );
+                    } else {
+                        console.error(`[Recovery] Swap ${swap.swap_id} — XMR transfer failed: ${result.error}. Will retry on next restart.`);
+                    }
+                })();
+                continue;
+            }
+
+            // If xmr_lock_tx is a real tx hash, track by tx hash for confirmations
+            const recoveryLockTxId = swap.xmr_lock_tx;
+            console.log(
+                `[Recovery] Resuming XMR monitoring for swap ${swap.swap_id}` +
+                ` (subaddr_index: ${swap.xmr_subaddr_index ?? 'unknown'}` +
+                `, lockTx: ${recoveryLockTxId.slice(0, 16)}...)`,
+            );
             moneroService.startMonitoring(
                 swap.swap_id,
                 swap.xmr_address,
@@ -1046,6 +1120,7 @@ function recoverInterruptedSwaps(
                     }
                 },
                 swap.xmr_subaddr_index ?? undefined,
+                recoveryLockTxId,
             );
         }
 

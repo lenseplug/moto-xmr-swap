@@ -86,7 +86,7 @@ export default function App(): React.ReactElement {
                         marginTop: '8px',
                     }}
                 >
-                    Coordinator-mediated atomic swap — Bitcoin L1 to Monero
+                    Hash-locked cross-chain swap — MOTO {'>'} XMR
                 </p>
             </div>
 

@@ -7,12 +7,14 @@ import { generateEd25519KeyPair } from './ed25519';
 import type { LocalSwapSecret } from '../types/swap';
 
 /**
- * Secrets and claim tokens use sessionStorage (cleared on tab close)
- * to minimize exposure window. The coordinator holds the preimage as
- * a fallback — users don't need to persist secrets across sessions.
+ * Secrets and claim tokens use localStorage (persists across refreshes,
+ * tab closes, and browser restarts). This prevents secret loss from
+ * accidental page refresh — which would make a swap uncompletable.
+ * Secrets are cleaned up when swaps reach terminal states (COMPLETED/REFUNDED).
  */
 const LOCAL_SECRETS_KEY = 'moto_xmr_swap_secrets';
 const CLAIM_TOKENS_KEY = 'moto_xmr_claim_tokens';
+const BOB_KEYS_KEY = 'moto_xmr_bob_keys';
 
 /**
  * Generates a cryptographically random 32-byte secret and computes its SHA-256 hash.
@@ -122,7 +124,7 @@ export function secretHexToBigint(secretHex: string): bigint {
 }
 
 /**
- * Persists a swap secret to sessionStorage so the user can claim later.
+ * Persists a swap secret to localStorage so the user can claim later.
  *
  * @param swapId - The swap ID (decimal string)
  * @param secret - The secret preimage hex
@@ -143,7 +145,7 @@ export function saveLocalSwapSecret(
         ...(aliceViewKey !== undefined ? { aliceViewKey } : {}),
     };
     secrets.push(entry);
-    sessionStorage.setItem(LOCAL_SECRETS_KEY, JSON.stringify(secrets));
+    localStorage.setItem(LOCAL_SECRETS_KEY, JSON.stringify(secrets));
 }
 
 /**
@@ -151,7 +153,7 @@ export function saveLocalSwapSecret(
  */
 export function loadLocalSwapSecrets(): LocalSwapSecret[] {
     try {
-        const raw = sessionStorage.getItem(LOCAL_SECRETS_KEY);
+        const raw = localStorage.getItem(LOCAL_SECRETS_KEY);
         if (!raw) return [];
         return JSON.parse(raw) as LocalSwapSecret[];
     } catch {
@@ -170,7 +172,7 @@ export function getLocalSwapSecret(swapId: string): LocalSwapSecret | null {
 }
 
 /**
- * Removes the secret for a specific swap ID from sessionStorage.
+ * Removes the secret for a specific swap ID from localStorage.
  * Call this when a swap reaches a terminal state (COMPLETED, REFUNDED, EXPIRED).
  *
  * @param swapId - The swap ID (decimal string)
@@ -178,14 +180,14 @@ export function getLocalSwapSecret(swapId: string): LocalSwapSecret | null {
 export function clearLocalSwapSecret(swapId: string): void {
     try {
         const secrets = loadLocalSwapSecrets().filter((s) => s.swapId !== swapId);
-        sessionStorage.setItem(LOCAL_SECRETS_KEY, JSON.stringify(secrets));
+        localStorage.setItem(LOCAL_SECRETS_KEY, JSON.stringify(secrets));
     } catch {
-        // sessionStorage unavailable — ignore
+        // localStorage unavailable — ignore
     }
 }
 
 /**
- * Saves a claim_token for a swap in sessionStorage.
+ * Saves a claim_token for a swap in localStorage.
  * The claim_token is used to authenticate WebSocket subscriptions.
  *
  * @param swapId - The swap ID (decimal string)
@@ -198,12 +200,12 @@ export function saveClaimToken(swapId: string, claimToken: string): void {
         return;
     }
     try {
-        const raw = sessionStorage.getItem(CLAIM_TOKENS_KEY);
+        const raw = localStorage.getItem(CLAIM_TOKENS_KEY);
         const tokens: Record<string, string> = raw ? (JSON.parse(raw) as Record<string, string>) : {};
         tokens[swapId] = claimToken;
-        sessionStorage.setItem(CLAIM_TOKENS_KEY, JSON.stringify(tokens));
+        localStorage.setItem(CLAIM_TOKENS_KEY, JSON.stringify(tokens));
     } catch {
-        // sessionStorage unavailable — ignore
+        // localStorage unavailable — ignore
     }
 }
 
@@ -214,7 +216,7 @@ export function saveClaimToken(swapId: string, claimToken: string): void {
  */
 export function getClaimToken(swapId: string): string | null {
     try {
-        const raw = sessionStorage.getItem(CLAIM_TOKENS_KEY);
+        const raw = localStorage.getItem(CLAIM_TOKENS_KEY);
         if (!raw) return null;
         const tokens = JSON.parse(raw) as Record<string, string>;
         return tokens[swapId] ?? null;
@@ -224,18 +226,97 @@ export function getClaimToken(swapId: string): string | null {
 }
 
 /**
- * Removes the claim_token for a specific swap ID from sessionStorage.
+ * Removes the claim_token for a specific swap ID from localStorage.
  *
  * @param swapId - The swap ID (decimal string)
  */
 export function clearClaimToken(swapId: string): void {
     try {
-        const raw = sessionStorage.getItem(CLAIM_TOKENS_KEY);
+        const raw = localStorage.getItem(CLAIM_TOKENS_KEY);
         if (!raw) return;
         const tokens = JSON.parse(raw) as Record<string, string>;
         delete tokens[swapId];
-        sessionStorage.setItem(CLAIM_TOKENS_KEY, JSON.stringify(tokens));
+        localStorage.setItem(CLAIM_TOKENS_KEY, JSON.stringify(tokens));
     } catch {
-        // sessionStorage unavailable — ignore
+        // localStorage unavailable — ignore
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bob key material persistence (taker side)
+// ---------------------------------------------------------------------------
+
+/**
+ * Stored Bob key material for retrying key submission if it fails.
+ */
+export interface StoredBobKeys {
+    readonly swapId: string;
+    readonly bobEd25519PubKey: string;
+    readonly bobViewKey: string;
+    readonly bobSpendKey: string;
+    readonly bobKeyProof: string;
+    readonly createdAt: number;
+    /** Whether keys have been successfully submitted to the coordinator. */
+    submitted: boolean;
+}
+
+/**
+ * Saves Bob's generated key material to localStorage before submission.
+ * This ensures keys aren't lost if the submission fails.
+ */
+export function saveBobKeys(keys: Omit<StoredBobKeys, 'createdAt' | 'submitted'>): void {
+    try {
+        const raw = localStorage.getItem(BOB_KEYS_KEY);
+        const all: Record<string, StoredBobKeys> = raw ? (JSON.parse(raw) as Record<string, StoredBobKeys>) : {};
+        all[keys.swapId] = { ...keys, createdAt: Date.now(), submitted: false };
+        localStorage.setItem(BOB_KEYS_KEY, JSON.stringify(all));
+    } catch {
+        // localStorage unavailable — ignore
+    }
+}
+
+/**
+ * Marks Bob's keys as successfully submitted for a swap.
+ */
+export function markBobKeysSubmitted(swapId: string): void {
+    try {
+        const raw = localStorage.getItem(BOB_KEYS_KEY);
+        if (!raw) return;
+        const all = JSON.parse(raw) as Record<string, StoredBobKeys>;
+        if (all[swapId]) {
+            all[swapId] = { ...all[swapId], submitted: true };
+            localStorage.setItem(BOB_KEYS_KEY, JSON.stringify(all));
+        }
+    } catch {
+        // localStorage unavailable — ignore
+    }
+}
+
+/**
+ * Retrieves Bob's stored key material for a swap (if any).
+ */
+export function getBobKeys(swapId: string): StoredBobKeys | null {
+    try {
+        const raw = localStorage.getItem(BOB_KEYS_KEY);
+        if (!raw) return null;
+        const all = JSON.parse(raw) as Record<string, StoredBobKeys>;
+        return all[swapId] ?? null;
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * Removes Bob's key material for a swap (terminal state cleanup).
+ */
+export function clearBobKeys(swapId: string): void {
+    try {
+        const raw = localStorage.getItem(BOB_KEYS_KEY);
+        if (!raw) return;
+        const all = JSON.parse(raw) as Record<string, StoredBobKeys>;
+        delete all[swapId];
+        localStorage.setItem(BOB_KEYS_KEY, JSON.stringify(all));
+    } catch {
+        // localStorage unavailable — ignore
     }
 }

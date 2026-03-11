@@ -4,7 +4,7 @@
  */
 import React from 'react';
 import { useWalletConnect } from '@btc-vision/walletconnect';
-import { loadLocalSwapSecrets } from '../utils/hashlock';
+import { loadLocalSwapSecrets, getBobKeys } from '../utils/hashlock';
 import { formatTokenAmount, formatXmrAmount } from '../services/opnet';
 import { useSwaps } from '../hooks/useSwaps';
 import { SWAP_STATUS_LABELS } from '../types/swap';
@@ -18,7 +18,7 @@ interface MySwapsProps {
  * Shows active swaps the user created (from localStorage) and swaps they've taken.
  */
 export function MySwaps({ onViewStatus }: MySwapsProps): React.ReactElement {
-    const { publicKey, walletAddress } = useWalletConnect();
+    const { publicKey } = useWalletConnect();
     const isConnected = publicKey !== null;
     const { swaps, isLoading } = useSwaps();
 
@@ -28,14 +28,12 @@ export function MySwaps({ onViewStatus }: MySwapsProps): React.ReactElement {
     // Swaps the user created (have a local secret for)
     const myCreatedSwaps = swaps.filter((s) => localSwapIds.has(s.swapId.toString()));
 
-    // Swaps where the user is the counterparty
-    const myTakenSwaps = walletAddress !== null
-        ? swaps.filter(
-              (s) =>
-                  !localSwapIds.has(s.swapId.toString()) &&
-                  s.counterparty.toLowerCase().includes(walletAddress.toLowerCase().slice(0, 8)),
-          )
-        : [];
+    // Swaps where the user is the taker (Bob) — identified by stored Bob keys in sessionStorage
+    const myTakenSwaps = swaps.filter((s) => {
+        if (localSwapIds.has(s.swapId.toString())) return false; // skip own swaps
+        const bobKeys = getBobKeys(s.swapId.toString());
+        return bobKeys !== null;
+    });
 
     const tdStyle: React.CSSProperties = {
         padding: '14px 16px',

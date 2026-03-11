@@ -75,7 +75,9 @@ export class SwapWebSocketServer {
             verifyClient: ({ origin }: { origin?: string }) => {
                 // Allow non-browser clients (scripts, curl) that send no Origin header.
                 if (!origin) return true;
-                return origin === ALLOWED_ORIGIN;
+                // Support comma-separated origins for dev (e.g. "http://localhost:5173,http://localhost:5174")
+                const allowed = ALLOWED_ORIGIN.split(',').map((o) => o.trim());
+                return allowed.includes(origin);
             },
         });
         this.wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {

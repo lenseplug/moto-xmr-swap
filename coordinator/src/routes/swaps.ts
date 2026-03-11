@@ -177,6 +177,8 @@ export async function handleTakeSwap(
     res: ServerResponse,
     storage: StorageService,
     swapId: string,
+    stateMachine: SwapStateMachine,
+    wsServer: SwapWebSocketServer,
 ): Promise<void> {
     // Per-swap lock prevents TOCTOU race: two concurrent take requests
     // can no longer both pass the claim_token check simultaneously.
@@ -241,10 +243,31 @@ export async function handleTakeSwap(
 
         // Generate a one-time claim_token for authenticated WebSocket subscription
         const claimToken = randomBytes(32).toString('hex');
-        storage.updateSwap(swapId, { claim_token: claimToken });
+        const currentSwap = freshSwap ?? swap;
+        const wasOpen = currentSwap.status === SwapStatus.OPEN;
+
+        // If swap is OPEN, transition to TAKEN immediately so Bob can submit keys
+        // without waiting for the OPNet watcher to detect the on-chain take.
+        if (wasOpen) {
+            storage.updateSwap(swapId, {
+                claim_token: claimToken,
+                status: SwapStatus.TAKEN,
+                counterparty: body.opnetTxId.trim(),
+            });
+        } else {
+            storage.updateSwap(swapId, { claim_token: claimToken });
+        }
+
+        const updatedSwap = storage.getSwap(swapId);
+
+        // Notify state machine + broadcast if we transitioned
+        if (wasOpen && updatedSwap) {
+            stateMachine.notifyTransition(updatedSwap, SwapStatus.OPEN, SwapStatus.TAKEN);
+            wsServer.broadcastSwapUpdate(updatedSwap);
+        }
 
         jsonResponse(res, 200, success({
-            swap: sanitizeSwapForApi(freshSwap ?? swap),
+            swap: sanitizeSwapForApi(updatedSwap ?? currentSwap),
             opnetTxId: body.opnetTxId.trim(),
             claim_token: claimToken,
         }));

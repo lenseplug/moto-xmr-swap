@@ -28,7 +28,7 @@ export XMR_POLL_INTERVAL_MS="15000"
 # ── Server ───────────────────────────────────────────────────────────────────
 export PORT="3099"
 export ADMIN_API_KEY="test-admin-key-that-is-at-least-32-chars-long"
-export CORS_ORIGIN="*"
+export CORS_ORIGIN="http://localhost:5173,http://localhost:5174"
 export DB_PATH="./data/coordinator-real.db"
 export DB_BACKUP_INTERVAL_MS="60000"
 
@@ -69,4 +69,8 @@ echo "  Monero:   stagenet (real wallet-rpc)"
 echo "  DB:       $DB_PATH"
 echo ""
 
-node dist/src/index.js
+if [ -f dist/src/index.js ]; then
+    node dist/src/index.js
+else
+    node dist/index.js
+fi

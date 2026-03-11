@@ -7,7 +7,7 @@ import { networks } from '@btc-vision/bitcoin';
 import { getSwapVaultContract, formatTokenAmount, formatXmrAmount } from '../services/opnet';
 import { joinXmrAddress } from '../services/opnet';
 import { notifySwapTaken, submitBobKeys } from '../services/coordinator';
-import { saveClaimToken } from '../utils/hashlock';
+import { saveClaimToken, saveBobKeys, markBobKeysSubmitted } from '../utils/hashlock';
 import { generateEd25519KeyPair, signBobKeyProof } from '../utils/ed25519';
 import { uint8ArrayToHex } from '../utils/hashlock';
 import { useSwap, useBlockNumber } from '../hooks/useSwaps';
@@ -33,6 +33,7 @@ export function TakeSwap({ swapId, onBack, onTaken }: TakeSwapProps): React.Reac
     const currentBlock = useBlockNumber();
 
     const [step, setStep] = useState<'idle' | 'taking' | 'done' | 'error'>('idle');
+    const [statusMessage, setStatusMessage] = useState<string>('');
     const [txId, setTxId] = useState<string | null>(null);
     const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
@@ -59,6 +60,7 @@ export function TakeSwap({ swapId, onBack, onTaken }: TakeSwapProps): React.Reac
 
         setStep('taking');
         setErrorMsg(null);
+        setStatusMessage('Simulating take transaction...');
 
         try {
             const contract = getSwapVaultContract(SWAP_VAULT_ADDRESS, senderAddress);
@@ -67,6 +69,8 @@ export function TakeSwap({ swapId, onBack, onTaken }: TakeSwapProps): React.Reac
             if ('error' in sim) {
                 throw new Error(`Simulation failed: ${String(sim.error)}`);
             }
+
+            setStatusMessage('Waiting for wallet signature...');
 
             const receipt = await sim.sendTransaction({
                 signer: null,
@@ -90,6 +94,7 @@ export function TakeSwap({ swapId, onBack, onTaken }: TakeSwapProps): React.Reac
                       : 'pending';
 
             setTxId(resultTxId);
+            setStatusMessage('Notifying coordinator...');
 
             // Notify coordinator to begin XMR locking and capture claim_token
             const takeResult = await notifySwapTaken(swapId.toString(), resultTxId);
@@ -97,23 +102,48 @@ export function TakeSwap({ swapId, onBack, onTaken }: TakeSwapProps): React.Reac
                 saveClaimToken(swapId.toString(), takeResult.claimToken);
             }
 
+            setStatusMessage('Generating split-key material...');
+
             // Generate Bob's ed25519 keys and submit with proof-of-knowledge
             try {
                 const bobSpendKey = generateEd25519KeyPair();
                 const bobViewKeyPair = generateEd25519KeyPair();
+
+                const bobPubHex = uint8ArrayToHex(bobSpendKey.publicKey);
+                const bobViewHex = uint8ArrayToHex(bobViewKeyPair.privateKey);
+                const bobSpendHex = uint8ArrayToHex(bobSpendKey.privateKey);
+
                 const keyProof = await signBobKeyProof(
                     bobSpendKey.privateKey,
                     bobSpendKey.publicKey,
                     swapId.toString(),
                 );
-                await submitBobKeys(swapId.toString(), {
-                    bobEd25519PubKey: uint8ArrayToHex(bobSpendKey.publicKey),
-                    bobViewKey: uint8ArrayToHex(bobViewKeyPair.privateKey),
-                    bobKeyProof: uint8ArrayToHex(keyProof),
-                    bobSpendKey: uint8ArrayToHex(bobSpendKey.privateKey),
+                const proofHex = uint8ArrayToHex(keyProof);
+
+                setStatusMessage('Submitting keys to coordinator...');
+
+                // Persist keys BEFORE submission so we can retry from SwapStatus
+                saveBobKeys({
+                    swapId: swapId.toString(),
+                    bobEd25519PubKey: bobPubHex,
+                    bobViewKey: bobViewHex,
+                    bobSpendKey: bobSpendHex,
+                    bobKeyProof: proofHex,
                 });
-            } catch {
-                console.warn('Failed to submit Bob keys — coordinator may operate without split-key mode');
+
+                const keysOk = await submitBobKeys(swapId.toString(), {
+                    bobEd25519PubKey: bobPubHex,
+                    bobViewKey: bobViewHex,
+                    bobKeyProof: proofHex,
+                    bobSpendKey: bobSpendHex,
+                });
+                if (keysOk) {
+                    markBobKeysSubmitted(swapId.toString());
+                } else {
+                    console.warn('Bob key submission returned non-OK — will retry from status page');
+                }
+            } catch (keyErr) {
+                console.warn('Failed to submit Bob keys — will retry from status page:', keyErr);
             }
 
             setStep('done');
@@ -247,7 +277,7 @@ export function TakeSwap({ swapId, onBack, onTaken }: TakeSwapProps): React.Reac
                                 </span>,
                             )}
                             {detailRow(
-                                'Blocks Remaining',
+                                'Expires In (blocks)',
                                 <span
                                     style={{
                                         color: isExpired
@@ -306,9 +336,10 @@ export function TakeSwap({ swapId, onBack, onTaken }: TakeSwapProps): React.Reac
                                         height: '6px',
                                         borderRadius: '50%',
                                         background: 'var(--color-orange)',
+                                        animation: 'pulse 2s ease-in-out infinite',
                                     }}
                                 />
-                                Waiting for wallet signature...
+                                {statusMessage || 'Processing...'}
                             </div>
                         )}
 
@@ -361,7 +392,7 @@ export function TakeSwap({ swapId, onBack, onTaken }: TakeSwapProps): React.Reac
                                 disabled={!isConnected || step === 'taking'}
                                 onClick={() => void handleTake()}
                             >
-                                {step === 'taking' ? 'Taking Swap...' : 'Take Swap'}
+                                {step === 'taking' ? (statusMessage || 'Taking Swap...') : 'Take Swap'}
                             </button>
                         )}
 
