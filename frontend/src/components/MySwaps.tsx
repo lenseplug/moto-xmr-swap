@@ -2,12 +2,14 @@
  * MySwaps — shows swaps the current user is involved in.
  * Reads all local secrets and shows their status.
  */
-import React from 'react';
+import React, { useState, useEffect } from 'react';
 import { useWalletConnect } from '@btc-vision/walletconnect';
 import { loadLocalSwapSecrets, getBobKeys } from '../utils/hashlock';
 import { formatTokenAmount, formatXmrAmount } from '../services/opnet';
 import { useSwaps } from '../hooks/useSwaps';
+import { getAllCoordinatorStatuses } from '../services/coordinator';
 import { SWAP_STATUS_LABELS } from '../types/swap';
+import type { CoordinatorStatus } from '../types/swap';
 import { SkeletonRow } from './SkeletonRow';
 
 interface MySwapsProps {
@@ -18,12 +20,31 @@ interface MySwapsProps {
  * Shows active swaps the user created (from localStorage) and swaps they've taken.
  */
 export function MySwaps({ onViewStatus }: MySwapsProps): React.ReactElement {
-    const { publicKey } = useWalletConnect();
+    const { publicKey, address: senderAddress } = useWalletConnect();
     const isConnected = publicKey !== null;
     const { swaps, isLoading } = useSwaps();
 
     const localSecrets = loadLocalSwapSecrets();
     const localSwapIds = new Set(localSecrets.map((s) => s.swapId));
+
+    // Fetch coordinator swaps with pending XMR claims (only for Alice = depositor)
+    const myAddress = senderAddress?.toString().toLowerCase() ?? '';
+    const [pendingClaimStatuses, setPendingClaimStatuses] = useState<CoordinatorStatus[]>([]);
+
+    useEffect(() => {
+        if (!myAddress) return;
+        let mounted = true;
+        void getAllCoordinatorStatuses().then((statuses) => {
+            if (!mounted) return;
+            const pending = statuses.filter(
+                (s) =>
+                    (s.sweepStatus === 'pending' || s.sweepStatus?.startsWith('failed:')) &&
+                    s.depositor?.toLowerCase() === myAddress,
+            );
+            setPendingClaimStatuses(pending);
+        });
+        return () => { mounted = false; };
+    }, [swaps.length, myAddress]); // re-check when swap list or wallet changes
 
     // Swaps the user created (have a local secret for)
     const myCreatedSwaps = swaps.filter((s) => localSwapIds.has(s.swapId.toString()));
@@ -177,21 +198,59 @@ export function MySwaps({ onViewStatus }: MySwapsProps): React.ReactElement {
             {renderTable('Created by You', myCreatedSwaps, 'No swaps created from this browser session.')}
             {renderTable('Taken by You', myTakenSwaps, 'No swaps taken on this account.')}
 
-            {localSecrets.length > 0 && (
-                <div
-                    style={{
-                        padding: '12px 14px',
-                        background: 'rgba(232, 115, 42, 0.04)',
-                        border: '1px solid var(--color-border-subtle)',
-                        borderRadius: 'var(--radius-md)',
-                        fontSize: '0.78rem',
-                        color: 'var(--color-text-muted)',
-                    }}
-                >
-                    {localSecrets.length} swap secret{localSecrets.length !== 1 ? 's' : ''} stored locally.
-                    Keep this browser data until all your swaps are complete.
+            {/* Completed swaps awaiting XMR claim */}
+            {pendingClaimStatuses.length > 0 && (
+                <div>
+                    <h3
+                        style={{
+                            fontSize: '1rem',
+                            fontWeight: 600,
+                            marginBottom: '12px',
+                            color: 'var(--color-text-warning)',
+                            letterSpacing: '0.03em',
+                        }}
+                    >
+                        XMR Sweeps In Progress
+                    </h3>
+                    <div className="glass-card" style={{ overflow: 'hidden', marginBottom: '24px' }}>
+                        {pendingClaimStatuses.map((status) => (
+                            <div
+                                key={status.swapId}
+                                style={{
+                                    display: 'flex',
+                                    alignItems: 'center',
+                                    justifyContent: 'space-between',
+                                    padding: '14px 16px',
+                                    borderBottom: '1px solid var(--color-border-subtle)',
+                                }}
+                            >
+                                <div>
+                                    <span style={{ fontFamily: 'var(--font-mono)', fontSize: '0.85rem' }}>
+                                        Swap #{status.swapId}
+                                    </span>
+                                    <span
+                                        style={{
+                                            marginLeft: '12px',
+                                            fontSize: '0.75rem',
+                                            color: 'var(--color-text-warning)',
+                                            fontWeight: 600,
+                                        }}
+                                    >
+                                        {status.sweepStatus === 'pending' ? 'Sweeping...' : 'Sweep failed — auto-retrying'}
+                                    </span>
+                                </div>
+                                <button
+                                    className="btn btn-ghost btn-sm"
+                                    onClick={() => onViewStatus(BigInt(status.swapId))}
+                                >
+                                    View
+                                </button>
+                            </div>
+                        ))}
+                    </div>
                 </div>
             )}
+
         </div>
     );
 }

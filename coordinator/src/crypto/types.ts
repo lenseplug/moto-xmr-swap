@@ -35,6 +35,8 @@ export interface ISharedMoneroAddress {
     readonly publicSpendKey: Uint8Array;
     /** Combined public view key: V_a + V_b on ed25519 (32 bytes). */
     readonly publicViewKey: Uint8Array;
+    /** Combined private view key scalar: v_a + v_b (32 bytes). */
+    readonly privateViewKey: Uint8Array;
 }
 
 /** Monero network type for address encoding. */

@@ -78,7 +78,7 @@ export function TakeSwap({ swapId, onBack, onTaken }: TakeSwapProps): React.Reac
                 linkMLDSAPublicKeyToAddress: true,
                 refundTo: walletAddress,
                 maximumAllowedSatToSpend: 150_000n,
-                network: networks.testnet,
+                network: networks.opnetTestnet,
             });
 
             const receiptObj = receipt as unknown as Record<string, unknown>;
@@ -101,6 +101,11 @@ export function TakeSwap({ swapId, onBack, onTaken }: TakeSwapProps): React.Reac
             if (takeResult.claimToken) {
                 saveClaimToken(swapId.toString(), takeResult.claimToken);
             }
+
+            // Navigate to SwapStatus immediately — key submission continues async below
+            // but Bob is already on the status page (handles refresh/interruption gracefully)
+            setStep('done');
+            onTaken(swapId);
 
             setStatusMessage('Generating split-key material...');
 
@@ -145,9 +150,6 @@ export function TakeSwap({ swapId, onBack, onTaken }: TakeSwapProps): React.Reac
             } catch (keyErr) {
                 console.warn('Failed to submit Bob keys — will retry from status page:', keyErr);
             }
-
-            setStep('done');
-            onTaken(swapId);
         } catch (err) {
             setStep('error');
             setErrorMsg(err instanceof Error ? err.message : 'Unknown error');

@@ -337,10 +337,11 @@ export class StorageService {
     /**
      * Returns completed swaps whose sweep failed and need retry.
      * Matches sweep_status starting with 'failed:' or 'pending'.
+     * Sweeps are now automatic — no manual claim needed.
      */
     public getFailedSweeps(): ISwapRecord[] {
         const rows = this.query(
-            `SELECT * FROM swaps WHERE status = ? AND (sweep_status LIKE 'failed:%' OR sweep_status = 'pending' OR (sweep_status IS NULL AND trustless_mode = 1)) ORDER BY updated_at ASC LIMIT 20`,
+            `SELECT * FROM swaps WHERE status = ? AND (sweep_status LIKE 'failed:%' OR sweep_status = 'pending') ORDER BY updated_at ASC LIMIT 20`,
             [SwapStatus.COMPLETED],
         );
         return rows as unknown as ISwapRecord[];

@@ -118,7 +118,7 @@ export function computeSharedMoneroAddress(
     // Encode as a standard Monero address
     const address = encodeMoneroAddress(publicSpendKey, publicViewKey, network);
 
-    return { address, publicSpendKey, publicViewKey };
+    return { address, publicSpendKey, publicViewKey, privateViewKey: combinedViewScalar };
 }
 
 // ---------------------------------------------------------------------------

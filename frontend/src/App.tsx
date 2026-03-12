@@ -1,15 +1,16 @@
 /**
  * Main application component for MOTO-XMR Atomic Swap.
  */
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { Header } from './components/Header';
 import { OrderBook } from './components/OrderBook';
 import { CreateSwap } from './components/CreateSwap';
 import { TakeSwap } from './components/TakeSwap';
 import { SwapStatus } from './components/SwapStatus';
 import { MySwaps } from './components/MySwaps';
+import { Docs } from './components/Docs';
 
-type TabId = 'orderbook' | 'create' | 'myswaps';
+type TabId = 'orderbook' | 'create' | 'myswaps' | 'docs';
 
 type ViewState =
     | { kind: 'tab'; tab: TabId }
@@ -21,6 +22,32 @@ type ViewState =
  */
 export default function App(): React.ReactElement {
     const [view, setView] = useState<ViewState>({ kind: 'tab', tab: 'orderbook' });
+
+    // Recover in-flight swap takes on page refresh
+    useEffect(() => {
+        try {
+            // Check for Bob's claim tokens (taker side)
+            const claimRaw = localStorage.getItem('moto_xmr_claim_tokens');
+            if (claimRaw) {
+                const tokens = JSON.parse(claimRaw) as Record<string, string>;
+                const firstSwapId = Object.keys(tokens)[0];
+                if (firstSwapId) {
+                    setView({ kind: 'status', swapId: BigInt(firstSwapId) });
+                    return;
+                }
+            }
+            // Check for Alice's secrets (creator side)
+            const secretRaw = localStorage.getItem('moto_xmr_swap_secrets');
+            if (secretRaw) {
+                const secrets = JSON.parse(secretRaw) as Array<{ swapId: string }>;
+                if (secrets.length > 0) {
+                    setView({ kind: 'status', swapId: BigInt(secrets[0].swapId) });
+                }
+            }
+        } catch {
+            // localStorage parse error — ignore
+        }
+    }, []);
 
     const activeTab: TabId =
         view.kind === 'tab' ? view.tab : view.kind === 'take' ? 'orderbook' : 'myswaps';
@@ -57,6 +84,47 @@ export default function App(): React.ReactElement {
 
     return (
         <>
+            {/* Watermark logos */}
+            <div
+                style={{
+                    position: 'fixed',
+                    inset: 0,
+                    pointerEvents: 'none',
+                    zIndex: 0,
+                    overflow: 'hidden',
+                }}
+                aria-hidden="true"
+            >
+                <img
+                    src="/moto-logo.png"
+                    alt=""
+                    style={{
+                        position: 'absolute',
+                        top: '15%',
+                        left: '-5%',
+                        width: '45vw',
+                        maxWidth: '500px',
+                        opacity: 0.03,
+                        filter: 'blur(1px)',
+                        transform: 'rotate(-15deg)',
+                    }}
+                />
+                <img
+                    src="/xmr-logo.png"
+                    alt=""
+                    style={{
+                        position: 'absolute',
+                        bottom: '10%',
+                        right: '-5%',
+                        width: '40vw',
+                        maxWidth: '450px',
+                        opacity: 0.03,
+                        filter: 'blur(1px)',
+                        transform: 'rotate(12deg)',
+                    }}
+                />
+            </div>
+
             <Header activeTab={activeTab} onTabChange={handleTabChange} />
 
             {/* Title Banner */}
@@ -64,21 +132,47 @@ export default function App(): React.ReactElement {
                 style={{
                     textAlign: 'center',
                     padding: '40px 24px 20px',
+                    position: 'relative',
+                    zIndex: 1,
                 }}
             >
-                <h1
+                <div
                     style={{
-                        fontSize: 'clamp(1.8rem, 4vw, 2.8rem)',
-                        fontWeight: 700,
-                        letterSpacing: '0.04em',
-                        lineHeight: 1.2,
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        gap: '16px',
+                        marginBottom: '8px',
                     }}
                 >
-                    <span style={{ color: 'var(--color-purple-light)' }}>MOTO</span>
-                    <span style={{ color: 'var(--color-text-muted)', margin: '0 12px' }}>&gt;</span>
-                    <span style={{ color: 'var(--color-orange)' }}>XMR</span>
-                    <span style={{ color: 'var(--color-text-primary)', marginLeft: '12px' }}>SWAP</span>
-                </h1>
+                    <img
+                        src="/moto-logo.png"
+                        alt="MOTO"
+                        width={52}
+                        height={52}
+                        style={{ borderRadius: '50%', boxShadow: '0 0 20px rgba(196, 86, 255, 0.3)' }}
+                    />
+                    <h1
+                        style={{
+                            fontSize: 'clamp(1.8rem, 4vw, 2.8rem)',
+                            fontWeight: 700,
+                            letterSpacing: '0.04em',
+                            lineHeight: 1.2,
+                        }}
+                    >
+                        <span style={{ color: '#c456ff' }}>MOTO</span>
+                        <span style={{ color: 'var(--color-text-muted)', margin: '0 12px' }}>&gt;</span>
+                        <span style={{ color: '#f26822' }}>XMR</span>
+                        <span style={{ color: 'var(--color-text-primary)', marginLeft: '12px' }}>SWAP</span>
+                    </h1>
+                    <img
+                        src="/xmr-logo.png"
+                        alt="XMR"
+                        width={52}
+                        height={52}
+                        style={{ borderRadius: '50%', boxShadow: '0 0 20px rgba(242, 104, 34, 0.3)' }}
+                    />
+                </div>
                 <p
                     style={{
                         color: 'var(--color-text-secondary)',
@@ -86,7 +180,7 @@ export default function App(): React.ReactElement {
                         marginTop: '8px',
                     }}
                 >
-                    Hash-locked cross-chain swap — MOTO {'>'} XMR
+                    Buy MOTO Anonymously
                 </p>
             </div>
 
@@ -97,6 +191,8 @@ export default function App(): React.ReactElement {
                     width: '100%',
                     margin: '0 auto',
                     padding: '12px 24px 64px',
+                    position: 'relative',
+                    zIndex: 1,
                 }}
             >
                 {view.kind === 'tab' && view.tab === 'orderbook' && (
@@ -110,6 +206,8 @@ export default function App(): React.ReactElement {
                 {view.kind === 'tab' && view.tab === 'myswaps' && (
                     <MySwaps onViewStatus={handleViewStatus} />
                 )}
+
+                {view.kind === 'tab' && view.tab === 'docs' && <Docs />}
 
                 {view.kind === 'take' && (
                     <TakeSwap

@@ -5,7 +5,7 @@ import React, { useState, useCallback, useRef } from 'react';
 import { useWalletConnect } from '@btc-vision/walletconnect';
 import { networks } from '@btc-vision/bitcoin';
 import { getSwapVaultContract, getMotoContract, parseMotoAmount, parseXmrAmount, splitXmrAddress, getProvider } from '../services/opnet';
-import { generateTrustlessSecret, saveLocalSwapSecret, hashSecret } from '../utils/hashlock';
+import { generateTrustlessSecret, saveLocalSwapSecret, clearLocalSwapSecret, hashSecret } from '../utils/hashlock';
 import { submitSwapSecret } from '../services/coordinator';
 import { PrivacyBanner } from './PrivacyBanner';
 import { ExplorerLinks } from './ExplorerLinks';
@@ -81,6 +81,7 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
 
         const xmr = parseXmrAmount(form.xmrAmount);
         if (xmr <= 0n) return 'XMR amount must be greater than zero';
+        if (xmr < 25_000_000_000n) return 'Minimum XMR amount is 0.025 XMR. Amounts below this may result in lost funds due to network fees exceeding the swap fee.';
 
         if (form.xmrAddress.trim().length < 10) return 'Please enter a valid XMR address';
 
@@ -149,7 +150,7 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
                     linkMLDSAPublicKeyToAddress: true,
                     refundTo: walletAddress,
                     maximumAllowedSatToSpend: 100_000n,
-                    network: networks.testnet,
+                    network: networks.opnetTestnet,
                 });
 
                 const approveObj = approveReceipt as unknown as Record<string, unknown>;
@@ -259,34 +260,7 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
                 throw new Error('Swap simulation failed: allowance not confirmed after retries. Try again in a few minutes.');
             }
 
-            // Check for cancellation before requesting wallet signature
-            if (cancelledRef.current) return;
-
-            // Step 7: Send transaction
-            setStatusMessage('Waiting for wallet signature...');
-
-            const createReceipt = await createSim.sendTransaction({
-                signer: null,
-                mldsaSigner: null,
-                refundTo: walletAddress,
-                maximumAllowedSatToSpend: 200_000n,
-                network: networks.testnet,
-            });
-
-            const receiptObj = createReceipt as unknown as Record<string, unknown>;
-
-            if ('error' in receiptObj) {
-                throw new Error(`Swap transaction failed: ${String(receiptObj['error'])}`);
-            }
-
-            const txId =
-                typeof receiptObj['result'] === 'string'
-                    ? receiptObj['result']
-                    : typeof receiptObj['txid'] === 'string'
-                      ? receiptObj['txid']
-                      : 'pending';
-
-            // Extract swapId — prefer return value, fallback to events
+            // Extract swapId from simulation BEFORE sending transaction
             let swapId = 0n;
 
             // Try the simulation return value first (most reliable)
@@ -314,10 +288,41 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
 
             console.log('[CreateSwap] Extracted swapId:', swapId.toString());
 
-            // Store secret + view key locally (persists in localStorage across refreshes)
-            saveLocalSwapSecret(swapId.toString(), secret, hashLockHex, aliceViewKey);
+            // CRITICAL: Save secret to localStorage BEFORE sending transaction.
+            // If sendTransaction hangs or the page is closed, the secret survives.
+            const aliceXmrPayout = form.xmrAddress.trim();
+            saveLocalSwapSecret(swapId.toString(), secret, hashLockHex, aliceViewKey, aliceXmrPayout);
 
-            // Submit secret + view key to coordinator with retries.
+            // Check for cancellation before requesting wallet signature
+            if (cancelledRef.current) return;
+
+            // Step 7: Send transaction
+            setStatusMessage('Waiting for wallet signature...');
+
+            const createReceipt = await createSim.sendTransaction({
+                signer: null,
+                mldsaSigner: null,
+                refundTo: walletAddress,
+                maximumAllowedSatToSpend: 200_000n,
+                network: networks.opnetTestnet,
+            });
+
+            const receiptObj = createReceipt as unknown as Record<string, unknown>;
+
+            if ('error' in receiptObj) {
+                // Clean up saved secret if tx failed
+                clearLocalSwapSecret(swapId.toString());
+                throw new Error(`Swap transaction failed: ${String(receiptObj['error'])}`);
+            }
+
+            const txId =
+                typeof receiptObj['result'] === 'string'
+                    ? receiptObj['result']
+                    : typeof receiptObj['txid'] === 'string'
+                      ? receiptObj['txid']
+                      : 'pending';
+
+            // Submit secret + view key + XMR payout to coordinator with retries.
             // The coordinator may not know about this swap yet (it creates the record
             // when the OPNet watcher detects the on-chain tx in the next block), so
             // we retry for up to ~3 minutes. SwapStatus also retries as a fallback.
@@ -325,7 +330,7 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
             let secretSubmitted = false;
             for (let attempt = 0; attempt < 36; attempt++) {
                 if (cancelledRef.current) break;
-                const result = await submitSwapSecret(swapId.toString(), secret, aliceViewKey);
+                const result = await submitSwapSecret(swapId.toString(), secret, aliceViewKey, aliceXmrPayout);
                 if (result.ok) {
                     secretSubmitted = true;
                     break;
@@ -441,9 +446,21 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
                             disabled={isProcessing || step === 'done'}
                         />
                         <p style={{ fontSize: '0.75rem', color: 'var(--color-text-muted)', marginTop: '4px' }}>
-                            XMR amount you want to receive (12 decimal places).
-                            The taker pays an additional 0.87% fee on top of this amount.
+                            Minimum 0.025 XMR. The taker pays an additional 0.87% fee on top of this amount.
                         </p>
+                        {form.xmrAmount.trim() !== '' && parseXmrAmount(form.xmrAmount) > 0n && parseXmrAmount(form.xmrAmount) < 25_000_000_000n && (
+                            <p style={{
+                                fontSize: '0.75rem',
+                                color: 'var(--color-text-warning)',
+                                marginTop: '6px',
+                                padding: '8px 10px',
+                                background: 'rgba(255, 215, 64, 0.08)',
+                                border: '1px solid rgba(255, 215, 64, 0.25)',
+                                borderRadius: 'var(--radius-sm)',
+                            }}>
+                                Amounts below 0.025 XMR may result in lost funds — network fees can exceed the swap fee at this size.
+                            </p>
+                        )}
                     </div>
 
                     {/* XMR Address */}

@@ -25,14 +25,43 @@ interface SwapStatusProps {
 
 type StepKey = 'created' | 'taken' | 'xmr_locking' | 'xmr_locked' | 'claimed' | 'complete';
 
-const STEPS: Array<{ key: StepKey; label: string; description: string; activeDescription: string }> = [
-    { key: 'created', label: 'Created', description: 'MOTO locked in vault', activeDescription: 'Your MOTO is locked on-chain. Waiting for a counterparty to accept this swap. OPNet blocks take 3-5 minutes — your swap will appear in the order book after the next block.' },
-    { key: 'taken', label: 'Taken', description: 'Counterparty accepted', activeDescription: 'A counterparty has accepted your swap. The coordinator is now setting up the Monero escrow address. This happens automatically — no action needed from you.' },
-    { key: 'xmr_locking', label: 'XMR Locking', description: 'Counterparty sending XMR', activeDescription: 'Waiting for XMR to be sent to the escrow address. Needs 10 confirmations (~20 minutes on stagenet).' },
-    { key: 'xmr_locked', label: 'XMR Locked', description: 'XMR in escrow', activeDescription: 'XMR is safely locked in escrow with 10+ confirmations. The counterparty can now claim MOTO by revealing the hash lock secret.' },
-    { key: 'claimed', label: 'Claimed', description: 'MOTO claimed', activeDescription: 'MOTO has been claimed on-chain. The coordinator is now sweeping the XMR to your Monero address. This is automatic.' },
-    { key: 'complete', label: 'Complete', description: 'Swap finalized', activeDescription: 'Swap complete! All funds have been transferred successfully.' },
+const STEPS: Array<{ key: StepKey; label: string; description: string }> = [
+    { key: 'created', label: 'Created', description: 'MOTO locked in vault' },
+    { key: 'taken', label: 'Taken', description: 'Counterparty accepted' },
+    { key: 'xmr_locking', label: 'XMR Locking', description: 'Awaiting XMR deposit' },
+    { key: 'xmr_locked', label: 'XMR Locked', description: 'XMR in escrow' },
+    { key: 'claimed', label: 'Claimed', description: 'MOTO claimed' },
+    { key: 'complete', label: 'Complete', description: 'Swap finalized' },
 ];
+
+function getActiveDescription(step: StepKey, isAlice: boolean, xmrConfirmations?: number, isDepositor?: boolean): string {
+    const hasConfs = xmrConfirmations !== undefined && xmrConfirmations > 0;
+    const descriptions: Record<StepKey, string> = {
+        created: isAlice
+            ? 'Your MOTO is locked on-chain. Waiting for a buyer to accept this swap.'
+            : 'Your take transaction is confirming on-chain (3–5 min).',
+        taken: isAlice
+            ? 'A buyer has accepted your swap. The coordinator is setting up the XMR escrow.'
+            : 'Swap accepted. The coordinator is generating the XMR escrow address.',
+        xmr_locking: hasConfs
+            ? (isAlice
+                ? 'XMR deposit received. Waiting for 10 confirmations (~20 min). No action needed.'
+                : 'XMR deposit received. Waiting for 10 confirmations (~20 min). You\'ll be able to claim MOTO once confirmed.')
+            : (isAlice
+                ? 'The coordinator is depositing XMR to the escrow address. This is automatic.'
+                : 'Send the exact XMR amount shown below to the escrow address. 10 confirmations needed (~20 min).'),
+        xmr_locked: isAlice
+            ? 'XMR is safely locked in escrow. Waiting for the buyer to claim MOTO.'
+            : 'XMR is locked. You can now claim your MOTO.',
+        claimed: isAlice
+            ? 'The buyer claimed your MOTO. XMR is being automatically sent to your wallet...'
+            : 'You successfully claimed MOTO!',
+        complete: (isAlice || isDepositor)
+            ? 'Swap complete. Your XMR is being sent to your Monero wallet.'
+            : 'Swap complete. MOTO has been transferred to your wallet.',
+    };
+    return descriptions[step];
+}
 
 function stepIndex(step: StepKey): number {
     return STEPS.findIndex((s) => s.key === step);
@@ -57,6 +86,7 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
     // Stable reference for useEffect deps — only changes if the actual secret string changes
     const localSecretHex = localSecret?.secret ?? null;
     const localViewKey = localSecret?.aliceViewKey ?? undefined;
+    const localXmrPayout = localSecret?.aliceXmrPayout ?? undefined;
 
     // Debug: track secret submission status visibly
     const [secretDebug, setSecretDebug] = useState<string>('checking...');
@@ -90,7 +120,7 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
 
         const trySubmit = async (): Promise<boolean> => {
             attemptCount++;
-            const result = await submitSwapSecret(swapId.toString(), localSecretHex, localViewKey);
+            const result = await submitSwapSecret(swapId.toString(), localSecretHex, localViewKey, localXmrPayout);
             if (!cancelled) {
                 setSecretDebug(result.ok
                     ? 'Secret submitted OK!'
@@ -124,7 +154,7 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
             cancelled = true;
             clearInterval(interval);
         };
-    }, [localSecretHex, localViewKey, swapId]); // stable primitive deps
+    }, [localSecretHex, localViewKey, localXmrPayout, swapId]); // stable primitive deps
 
     // Persistently retry Bob key submission until it succeeds.
     const bobKeysSubmittedRef = useRef(false);
@@ -179,15 +209,22 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
         };
     }, [swapId]); // eslint-disable-line react-hooks/exhaustive-deps
 
-    // Clean up secrets when swap reaches terminal state (CLAIMED or REFUNDED)
+    // Clean up secrets when swap reaches terminal state.
+    // For Alice: only clear AFTER XMR claim is done (sweep completed).
+    // For Bob/others: clear when on-chain status is terminal.
     useEffect(() => {
         if (swap === null) return;
         if (swap.status === 2n || swap.status === 3n) {
-            clearLocalSwapSecret(swapId.toString());
+            // Always clean up Bob's data
             clearClaimToken(swapId.toString());
             clearBobKeys(swapId.toString());
+            // Only clear Alice's secret after XMR sweep is done
+            const sweepDone = coordinatorStatus?.sweepStatus?.startsWith('done:');
+            if (sweepDone || swap.status === 3n) {
+                clearLocalSwapSecret(swapId.toString());
+            }
         }
-    }, [swap, swapId]);
+    }, [swap, swapId, coordinatorStatus?.sweepStatus]);
 
     // Poll coordinator
     useEffect(() => {
@@ -205,6 +242,10 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
             clearInterval(interval);
         };
     }, [swapId]);
+
+    // Determine user role: Alice created the swap (has secret), Bob took it (has claim token).
+    const isAlice = localSecret !== null;
+    const isBob = claimToken !== null && !isAlice;
 
     // Determine current progress step from on-chain + coordinator state.
     // Coordinator status is authoritative for TAKEN onwards since on-chain
@@ -227,6 +268,9 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
             }
         }
         if (swap.status === 1n) return 'taken';
+        // Bob took the swap but on-chain/coordinator hasn't confirmed yet —
+        // show 'taken' instead of misleading 'created' ("waiting for counterparty")
+        if (isBob) return 'taken';
         return 'created';
     })();
 
@@ -271,7 +315,7 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
                 linkMLDSAPublicKeyToAddress: true,
                 refundTo: walletAddress,
                 maximumAllowedSatToSpend: 150_000n,
-                network: networks.testnet,
+                network: networks.opnetTestnet,
             });
 
             const receiptObj = receipt as unknown as Record<string, unknown>;
@@ -317,7 +361,7 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
                 mldsaSigner: null,
                 refundTo: walletAddress,
                 maximumAllowedSatToSpend: 150_000n,
-                network: networks.testnet,
+                network: networks.opnetTestnet,
             });
 
             const receiptObj = receipt as unknown as Record<string, unknown>;
@@ -337,6 +381,18 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
             setActionError(err instanceof Error ? err.message : 'Unknown error');
         }
     }, [isConnected, walletAddress, publicKey, senderAddress, swapId]);
+
+    // Depositor check for role-aware messaging
+    const isDepositor = swap !== null && senderAddress !== null &&
+        swap.depositor.toLowerCase() === senderAddress.toString().toLowerCase();
+
+    const xmrClaimDone =
+        coordinatorStatus !== null &&
+        coordinatorStatus.sweepStatus?.startsWith('done:');
+
+    const xmrClaimPending =
+        coordinatorStatus !== null &&
+        coordinatorStatus.sweepStatus === 'pending';
 
     return (
         <div style={{ maxWidth: '560px' }}>
@@ -364,23 +420,7 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
                 </p>
             </div>
 
-            {/* Debug banner — shows secret submission status */}
-            <div
-                style={{
-                    padding: '8px 12px',
-                    background: 'rgba(0, 150, 255, 0.1)',
-                    border: '1px solid rgba(0, 150, 255, 0.3)',
-                    borderRadius: 'var(--radius-sm)',
-                    marginBottom: '12px',
-                    fontSize: '0.72rem',
-                    fontFamily: 'var(--font-mono)',
-                    color: 'rgba(150, 200, 255, 0.9)',
-                }}
-            >
-                [DEBUG] {secretDebug}
-            </div>
-
-            {loadError !== null && (
+{loadError !== null && (
                 <div
                     style={{
                         padding: '12px 14px',
@@ -422,26 +462,71 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
                     />
                     <div>
                         <p style={{ fontSize: '0.9rem', fontWeight: 700, color: 'var(--color-text-accent)', marginBottom: '2px' }}>
-                            {currentStep === 'created' && 'Waiting for counterparty'}
-                            {currentStep === 'taken' && (localSecret ? 'Counterparty accepted' : 'Swap accepted — setting up escrow')}
-                            {currentStep === 'xmr_locking' && 'Locking XMR in escrow'}
-                            {currentStep === 'xmr_locked' && (localSecret ? 'XMR locked — waiting for claim' : 'XMR locked — ready to claim')}
-                            {currentStep === 'claimed' && 'Finalizing swap'}
+                            {currentStep === 'created' && (isAlice ? 'Waiting for someone to take your swap' : 'Confirming take transaction')}
+                            {currentStep === 'taken' && (isAlice ? 'Counterparty accepted — setting up escrow' : isBob && coordinatorStatus?.step === 'created' ? 'Take transaction confirming on-chain' : 'Swap accepted — setting up escrow')}
+                            {currentStep === 'xmr_locking' && (coordinatorStatus?.xmrLockConfirmations !== undefined && coordinatorStatus.xmrLockConfirmations > 0
+                                ? `XMR deposit — ${coordinatorStatus.xmrLockConfirmations}/10 confirmations`
+                                : (isAlice ? 'Awaiting XMR deposit' : 'Send XMR to the escrow address below'))}
+                            {currentStep === 'xmr_locked' && ((isAlice || isDepositor) ? 'XMR locked — waiting for buyer' : 'XMR locked — claim your MOTO')}
+                            {currentStep === 'claimed' && ((isAlice || isDepositor)
+                                ? (xmrClaimDone ? 'XMR sent to your wallet' : xmrClaimPending ? 'Sending XMR...' : 'Claim your XMR')
+                                : 'Swap complete')}
                         </p>
                         <p style={{ fontSize: '0.78rem', color: 'var(--color-text-secondary)' }}>
-                            {currentStep === 'created' && (localSecret
-                                ? 'Your MOTO is locked on-chain. It will appear in the order book after the next OPNet block (3-5 min). No action needed — just wait for someone to take it.'
-                                : 'Waiting for your take transaction to confirm on-chain. OPNet blocks take 3-5 min.')}
-                            {currentStep === 'taken' && (localSecret
-                                ? 'A counterparty accepted! The coordinator is setting up the Monero escrow address automatically. This takes a moment.'
-                                : 'You accepted this swap. The coordinator is generating the Monero escrow address. This is automatic — no action needed.')}
-                            {currentStep === 'xmr_locking' && (localSecret
-                                ? 'The coordinator is locking XMR in escrow. Needs 10 confirmations (~20 min on stagenet). This is automatic — no action needed.'
-                                : 'The coordinator is locking XMR in escrow. Needs 10 confirmations (~20 min on stagenet). Once confirmed, you can claim MOTO.')}
-                            {currentStep === 'xmr_locked' && (localSecret
-                                ? 'XMR is safely locked with 10+ confirmations. Waiting for the counterparty to claim MOTO — no action needed from you.'
-                                : 'XMR is safely locked with 10+ confirmations. You can claim MOTO once the preimage is delivered.')}
-                            {currentStep === 'claimed' && 'MOTO claimed! The coordinator is sweeping XMR to the payout address automatically.'}
+                            {currentStep === 'created' && (isAlice
+                                ? 'Your MOTO is locked on-chain. Waiting for someone to take your swap. OPNet blocks take 3–5 minutes.'
+                                : 'Your take transaction is confirming on-chain. OPNet blocks take 3–5 minutes — this page updates automatically.')}
+                            {currentStep === 'taken' && (isAlice
+                                ? 'Someone accepted your swap! The coordinator is setting up the XMR escrow address. This is automatic.'
+                                : isBob && coordinatorStatus?.step === 'created'
+                                    ? 'Your take transaction is confirming on-chain. OPNet blocks take 3–5 minutes. Once confirmed, XMR escrow setup begins automatically.'
+                                    : 'You accepted this swap. The coordinator is generating the XMR escrow address — no action needed.')}
+                            {currentStep === 'xmr_locking' && (
+                                <>
+                                    {coordinatorStatus?.xmrLockConfirmations !== undefined && coordinatorStatus.xmrLockConfirmations > 0
+                                        ? (isAlice
+                                            ? 'XMR deposit received. Waiting for 10 confirmations on the Monero network. No action needed.'
+                                            : 'XMR deposit received. Waiting for 10 confirmations (~20 min). You can claim MOTO once confirmed.')
+                                        : (isAlice
+                                            ? 'The coordinator is depositing XMR to the escrow address. No action needed from you.'
+                                            : coordinatorStatus?.xmrTxId && coordinatorStatus.xmrTxId !== 'pending'
+                                                ? 'XMR has been sent. Waiting for first confirmation — this can take several minutes. Do not send again.'
+                                                : 'Send the exact XMR amount to the escrow address shown below. Only send once — do not retry if it appears slow.')}
+                                    {coordinatorStatus?.xmrLockConfirmations !== undefined && (
+                                        <span
+                                            style={{
+                                                display: 'block',
+                                                marginTop: '8px',
+                                                height: '6px',
+                                                borderRadius: '3px',
+                                                background: 'rgba(255,255,255,0.08)',
+                                                overflow: 'hidden',
+                                            }}
+                                        >
+                                            <span
+                                                style={{
+                                                    display: 'block',
+                                                    height: '100%',
+                                                    width: `${Math.min(100, (coordinatorStatus.xmrLockConfirmations / 10) * 100)}%`,
+                                                    background: 'linear-gradient(90deg, var(--color-orange), var(--color-orange-light))',
+                                                    borderRadius: '3px',
+                                                    transition: 'width 0.5s ease',
+                                                }}
+                                            />
+                                        </span>
+                                    )}
+                                </>
+                            )}
+                            {currentStep === 'xmr_locked' && ((isAlice || isDepositor)
+                                ? 'XMR is safely locked with 10+ confirmations. Waiting for the buyer to claim MOTO — no action needed.'
+                                : 'XMR is safely locked with 10+ confirmations. Click "Claim MOTO" to receive your tokens.')}
+                            {currentStep === 'claimed' && ((isAlice || isDepositor)
+                                ? (xmrClaimDone
+                                    ? 'XMR has been sent to your Monero wallet. It should arrive within a few minutes.'
+                                    : xmrClaimPending
+                                        ? 'XMR is being sent to your Monero wallet. This may take a minute...'
+                                        : 'The buyer claimed your MOTO. XMR is being automatically sent to your wallet...')
+                                : 'MOTO has been transferred to your wallet. The swap is complete.')}
                         </p>
                     </div>
                 </div>
@@ -571,7 +656,7 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
                                                   : 'var(--color-text-secondary)',
                                         }}
                                     >
-                                        {isActive ? step.activeDescription : step.description}
+                                        {isActive ? getActiveDescription(step.key, isAlice, coordinatorStatus?.xmrLockConfirmations, isDepositor) : step.description}
                                     </p>
                                 </div>
                             </div>
@@ -681,7 +766,7 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
                     <p style={{ color: 'var(--color-text-secondary)' }}>
                         {coordinatorStatus.message}
                     </p>
-                    {coordinatorStatus.xmrTxId !== undefined && (
+                    {coordinatorStatus.xmrTxId !== undefined && coordinatorStatus.xmrTxId !== 'pending' && (
                         <p style={{ fontFamily: 'var(--font-mono)', fontSize: '0.75rem', color: 'var(--color-text-muted)', marginTop: '6px' }}>
                             XMR TX: {coordinatorStatus.xmrTxId.slice(0, 20)}...
                         </p>
@@ -734,7 +819,9 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
                     </div>
                     {swap !== null && (
                         <p style={{ fontSize: '0.78rem', color: 'var(--color-text-secondary)', marginTop: '8px' }}>
-                            Coordinator is locking <strong>{formatXmrAmount(calculateXmrTotal(swap.xmrAmount))}</strong> XMR at this address
+                            {isAlice
+                                ? <>Buyer must deposit <strong>{formatXmrAmount(calculateXmrTotal(swap.xmrAmount))}</strong> XMR to this address</>
+                                : <>Send exactly <strong>{formatXmrAmount(calculateXmrTotal(swap.xmrAmount))}</strong> XMR to this address</>}
                         </p>
                     )}
                     {coordinatorStatus.xmrLockConfirmations !== undefined && (
@@ -754,7 +841,7 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
                 </div>
             )}
 
-            {/* Refund Warning */}
+            {/* Refund Warning (approaching expiry) */}
             {showRefundWarn && (
                 <div
                     style={{
@@ -768,7 +855,30 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
                     }}
                 >
                     <strong>Warning:</strong> Only {blocksLeft?.toString()} blocks remaining before
-                    timeout. Consider requesting a refund if the swap is not progressing.
+                    timeout.{' '}
+                    {(isAlice || isDepositor)
+                        ? 'If the swap does not complete, you can request a refund after the timeout expires.'
+                        : 'If the swap does not complete before timeout, the depositor can reclaim their MOTO.'}
+                </div>
+            )}
+
+            {/* Expired — refund available */}
+            {canRefund && (
+                <div
+                    style={{
+                        padding: '14px 16px',
+                        background: 'rgba(255, 82, 82, 0.08)',
+                        border: '1px solid rgba(255, 82, 82, 0.25)',
+                        borderRadius: 'var(--radius-md)',
+                        marginBottom: '16px',
+                        fontSize: '0.875rem',
+                        color: 'var(--color-text-error)',
+                    }}
+                >
+                    <strong>Swap Expired.</strong>{' '}
+                    {(isAlice || isDepositor)
+                        ? 'The timelock has passed. You can now reclaim your MOTO using the refund button below.'
+                        : 'The timelock has passed. The depositor can now reclaim their MOTO.'}
                 </div>
             )}
 
@@ -811,7 +921,34 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
                 <button className="btn btn-primary btn-lg" style={{ width: '100%', marginBottom: '12px' }} disabled>
                     Claiming...
                 </button>
-            ) : claimStep === 'done' ? null : swap !== null && swap.status < 2n && currentStep !== 'complete' && (
+            ) : claimStep === 'done' ? (
+                <div
+                    style={{
+                        padding: '14px 18px',
+                        background: 'rgba(74, 222, 128, 0.06)',
+                        border: '1px solid rgba(74, 222, 128, 0.2)',
+                        borderRadius: 'var(--radius-md)',
+                        marginBottom: '12px',
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '10px',
+                    }}
+                >
+                    <div
+                        style={{
+                            width: '8px',
+                            height: '8px',
+                            borderRadius: '50%',
+                            background: '#4ade80',
+                            flexShrink: 0,
+                            animation: 'pulse 2s ease-in-out infinite',
+                        }}
+                    />
+                    <p style={{ fontSize: '0.875rem', color: 'var(--color-text-secondary)' }}>
+                        Claim transaction broadcast. Waiting for on-chain confirmation (1–2 blocks, ~3–10 min). The page will update automatically.
+                    </p>
+                </div>
+            ) : swap !== null && swap.status < 2n && currentStep !== 'complete' && (
                 (() => {
                     // Bob can claim once XMR is locked
                     const canClaim =
@@ -833,19 +970,27 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
                         );
                     }
 
-                    // Otherwise show a waiting message appropriate to the current step
+                    // Otherwise show a waiting message appropriate to the current step and role
                     const waitingMessages: Record<string, string> = {
-                        created: 'Waiting for a counterparty to accept this swap. Your MOTO is safely locked on-chain.',
-                        taken: localSecret
-                            ? 'Counterparty accepted! Coordinator is locking XMR in escrow — no action needed from you.'
-                            : 'You accepted this swap. Coordinator is setting up the XMR escrow address — this is automatic.',
-                        xmr_locking: localSecret
-                            ? 'Coordinator is locking XMR in escrow automatically. No action needed from you.'
-                            : 'Coordinator is locking XMR in escrow. Waiting for 10 confirmations (~20 min). No action needed.',
-                        xmr_locked: localSecret
-                            ? 'XMR is locked. Waiting for counterparty to claim MOTO — no action needed from you.'
-                            : 'XMR is locked! You can claim MOTO once the preimage is delivered.',
-                        claimed: 'MOTO claimed! Coordinator is sweeping XMR to the payout address automatically.',
+                        created: isAlice
+                            ? 'Waiting for someone to take your swap. Your MOTO is safely locked on-chain.'
+                            : 'Connecting with seller. Your take transaction is confirming on-chain — OPNet blocks take 3–5 minutes.',
+                        taken: isAlice
+                            ? 'A counterparty accepted your swap! The coordinator is setting up the XMR escrow. This is automatic — no action needed.'
+                            : 'You accepted this swap. Waiting for on-chain confirmation and XMR escrow setup. OPNet blocks take 3–5 minutes.',
+                        xmr_locking: (coordinatorStatus?.xmrLockConfirmations !== undefined && coordinatorStatus.xmrLockConfirmations > 0)
+                            ? (isAlice
+                                ? 'XMR deposit received. Waiting for 10 confirmations. No action needed.'
+                                : 'XMR deposit received! Waiting for 10 confirmations (~20 min).')
+                            : (isAlice
+                                ? 'Waiting for the buyer to deposit XMR to the escrow address. No action needed from you.'
+                                : 'Send the exact XMR amount to the escrow address above. 10 Monero confirmations needed (~20 min).'),
+                        xmr_locked: (isAlice || isDepositor)
+                            ? 'XMR is locked in escrow. Waiting for the counterparty to claim MOTO — no action needed from you.'
+                            : 'XMR is locked! You can claim your MOTO once the secret is delivered.',
+                        claimed: (isAlice || isDepositor)
+                            ? 'MOTO has been claimed. XMR is being automatically sent to your wallet...'
+                            : 'You claimed MOTO! The swap is being finalized.',
                     };
 
                     const msg = waitingMessages[currentStep];
@@ -882,6 +1027,40 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
                 })()
             )}
 
+            {/* Auto XMR Sweep Status */}
+            {(isAlice || isDepositor) && (xmrClaimDone || xmrClaimPending || coordinatorStatus?.sweepStatus?.startsWith('failed:')) && (
+                <div
+                    style={{
+                        padding: '14px 18px',
+                        background: 'rgba(74, 222, 128, 0.06)',
+                        border: '1px solid rgba(74, 222, 128, 0.2)',
+                        borderRadius: 'var(--radius-md)',
+                        marginBottom: '12px',
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '10px',
+                    }}
+                >
+                    <div
+                        style={{
+                            width: '8px',
+                            height: '8px',
+                            borderRadius: '50%',
+                            background: xmrClaimDone ? '#4ade80' : coordinatorStatus?.sweepStatus?.startsWith('failed:') ? 'var(--color-text-error)' : 'var(--color-orange)',
+                            flexShrink: 0,
+                            animation: xmrClaimDone ? 'none' : 'pulse 2s ease-in-out infinite',
+                        }}
+                    />
+                    <p style={{ fontSize: '0.875rem', color: 'var(--color-text-secondary)' }}>
+                        {xmrClaimDone
+                            ? 'XMR has been sent to your Monero wallet. It may take a few minutes to appear.'
+                            : coordinatorStatus?.sweepStatus?.startsWith('failed:')
+                                ? 'XMR sweep failed. The coordinator will automatically retry every 5 minutes.'
+                                : 'XMR is being automatically sent to your Monero wallet...'}
+                    </p>
+                </div>
+            )}
+
             {/* Refund action */}
             {canRefund && refundStep === 'idle' && (
                 <button
@@ -911,12 +1090,30 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
                     }}
                 >
                     <p style={{ fontWeight: 700, color: 'var(--color-text-accent)', fontSize: '1rem' }}>
-                        {swap.status === 2n ? 'Swap Complete' : 'Swap Refunded'}
+                        {swap.status === 3n
+                            ? 'Swap Refunded'
+                            : (isAlice || isDepositor)
+                                ? (xmrClaimDone
+                                    ? 'Swap Complete'
+                                    : xmrClaimPending
+                                        ? 'Sending XMR...'
+                                        : coordinatorStatus?.sweepStatus?.startsWith('failed:')
+                                            ? 'XMR Sweep Retrying...'
+                                            : 'Swap Complete')
+                                : 'Swap Complete'}
                     </p>
                     <p style={{ fontSize: '0.82rem', color: 'var(--color-text-secondary)', marginTop: '4px' }}>
-                        {swap.status === 2n
-                            ? 'MOTO has been claimed. The atomic swap is complete.'
-                            : 'MOTO has been returned to the depositor.'}
+                        {swap.status === 3n
+                            ? 'MOTO has been returned to the seller.'
+                            : (isAlice || isDepositor)
+                                ? (xmrClaimDone
+                                    ? 'Your XMR has been sent. It may take a few minutes to appear in your wallet.'
+                                    : xmrClaimPending
+                                        ? 'XMR is being automatically sent to your Monero wallet...'
+                                        : coordinatorStatus?.sweepStatus?.startsWith('failed:')
+                                            ? 'XMR sweep failed — the coordinator will automatically retry.'
+                                            : 'The buyer claimed your MOTO. XMR is being sent to your wallet.')
+                                : 'MOTO has been transferred to your wallet.'}
                     </p>
                 </div>
             )}

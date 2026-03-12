@@ -315,6 +315,7 @@ export async function handleSubmitSecret(
 
         let secret: string;
         let aliceViewKey: string | undefined;
+        let aliceXmrPayout: string | undefined;
         try {
             const parsed = await readBody(req);
             if (
@@ -330,6 +331,9 @@ export async function handleSubmitSecret(
             const candidate = parsed as Record<string, unknown>;
             if (typeof candidate['aliceViewKey'] === 'string') {
                 aliceViewKey = candidate['aliceViewKey'].trim().toLowerCase();
+            }
+            if (typeof candidate['aliceXmrPayout'] === 'string' && candidate['aliceXmrPayout'].length > 0) {
+                aliceXmrPayout = candidate['aliceXmrPayout'].trim();
             }
         } catch (err: unknown) {
             const msg = err instanceof Error ? err.message : 'Invalid request';
@@ -377,6 +381,11 @@ export async function handleSubmitSecret(
             updateParams['alice_ed25519_pub'] = alicePubHex;
             updateParams['alice_view_key'] = aliceViewKey;
             console.log(`[Routes] Split-key mode enabled for swap ${swapId}`);
+        }
+
+        if (aliceXmrPayout) {
+            updateParams['alice_xmr_payout'] = aliceXmrPayout;
+            console.log(`[Routes] Alice XMR payout address set for swap ${swapId}: ${aliceXmrPayout.slice(0, 12)}...`);
         }
 
         storage.updateSwap(swapId, updateParams as import('../types.js').IUpdateSwapParams);
@@ -450,7 +459,7 @@ export async function handleCreateSwap(
             return;
         }
         if (xmrParsed < MIN_XMR_AMOUNT_PICONERO) {
-            jsonResponse(res, 400, fail('VALIDATION', `xmr_amount below minimum (${MIN_XMR_AMOUNT_PICONERO} piconero = 0.001 XMR)`));
+            jsonResponse(res, 400, fail('VALIDATION', `xmr_amount below minimum (${MIN_XMR_AMOUNT_PICONERO} piconero = 0.025 XMR)`));
             return;
         }
         // Validate refund_block is positive

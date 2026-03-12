@@ -8,8 +8,10 @@ export const FEE_BPS = 87;
 /** Basis-point denominator. */
 const BPS_DENOMINATOR = 10_000n;
 
-/** Minimum XMR amount in piconero (0.001 XMR = 1,000,000,000 piconero). */
-export const MIN_XMR_AMOUNT_PICONERO = 1_000_000_000n;
+/** Minimum XMR amount in piconero (0.025 XMR = 25,000,000,000 piconero).
+ *  At 0.87% fee, this yields ~217.5M piconero dev fee.
+ *  After 80M network fee deduction, ~137.5M goes to fee wallet. */
+export const MIN_XMR_AMOUNT_PICONERO = 25_000_000_000n;
 
 /** Regex matching a valid non-negative integer string (no leading zeros except "0" itself). */
 const VALID_AMOUNT_RE = /^(0|[1-9]\d*)$/;

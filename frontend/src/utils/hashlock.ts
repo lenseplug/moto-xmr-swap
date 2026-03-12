@@ -135,6 +135,7 @@ export function saveLocalSwapSecret(
     secret: string,
     hashLock: string,
     aliceViewKey?: string,
+    aliceXmrPayout?: string,
 ): void {
     const secrets = loadLocalSwapSecrets();
     const entry: LocalSwapSecret = {
@@ -143,6 +144,7 @@ export function saveLocalSwapSecret(
         hashLock,
         createdAt: Date.now(),
         ...(aliceViewKey !== undefined ? { aliceViewKey } : {}),
+        ...(aliceXmrPayout !== undefined ? { aliceXmrPayout } : {}),
     };
     secrets.push(entry);
     localStorage.setItem(LOCAL_SECRETS_KEY, JSON.stringify(secrets));

@@ -56,6 +56,8 @@ interface ICoordinatorSwapResponse {
             readonly trustless_mode: number;
             readonly alice_ed25519_pub: string | null;
             readonly bob_ed25519_pub: string | null;
+            readonly sweep_status: string | null;
+            readonly depositor: string;
             readonly updated_at: string;
         };
     } | null;
@@ -91,6 +93,8 @@ export async function getCoordinatorSwapStatus(swapId: string): Promise<Coordina
             trustlessMode: swap.trustless_mode === 1,
             aliceEd25519Pub: swap.alice_ed25519_pub ?? undefined,
             bobEd25519Pub: swap.bob_ed25519_pub ?? undefined,
+            sweepStatus: swap.sweep_status ?? undefined,
+            depositor: swap.depositor,
             updatedAt: new Date(swap.updated_at).getTime(),
         };
     } catch {
@@ -146,6 +150,8 @@ interface ICoordinatorListResponse {
             readonly trustless_mode: number;
             readonly alice_ed25519_pub: string | null;
             readonly bob_ed25519_pub: string | null;
+            readonly sweep_status: string | null;
+            readonly depositor: string;
             readonly updated_at: string;
         }>;
     } | null;
@@ -177,6 +183,8 @@ export async function getAllCoordinatorStatuses(): Promise<CoordinatorStatus[]> 
                 trustlessMode: swap.trustless_mode === 1,
                 aliceEd25519Pub: swap.alice_ed25519_pub ?? undefined,
                 bobEd25519Pub: swap.bob_ed25519_pub ?? undefined,
+                sweepStatus: swap.sweep_status ?? undefined,
+                depositor: swap.depositor,
                 updatedAt: new Date(swap.updated_at).getTime(),
             };
         });
@@ -194,11 +202,14 @@ export async function getAllCoordinatorStatuses(): Promise<CoordinatorStatus[]> 
  * @param aliceViewKey - Optional Alice view key for split-key mode (64 hex chars)
  * @returns true if the secret was accepted
  */
-export async function submitSwapSecret(swapId: string, secret: string, aliceViewKey?: string): Promise<{ ok: boolean; error?: string }> {
+export async function submitSwapSecret(swapId: string, secret: string, aliceViewKey?: string, aliceXmrPayout?: string): Promise<{ ok: boolean; error?: string }> {
     try {
         const body: Record<string, string> = { secret };
         if (aliceViewKey) {
             body['aliceViewKey'] = aliceViewKey;
+        }
+        if (aliceXmrPayout) {
+            body['aliceXmrPayout'] = aliceXmrPayout;
         }
         const res = await fetch(`${COORDINATOR_BASE}/api/swaps/${swapId}/secret`, {
             method: 'POST',
@@ -234,5 +245,28 @@ export async function submitBobKeys(swapId: string, keys: BobKeyMaterial): Promi
         return res.ok;
     } catch {
         return false;
+    }
+}
+
+/**
+ * Alice triggers XMR claim (sweep from lock address to her payout address).
+ *
+ * @param swapId - The swap ID as a decimal string
+ * @returns Result with ok status and optional error message
+ */
+export async function claimXmr(swapId: string): Promise<{ ok: boolean; error?: string }> {
+    try {
+        const res = await fetch(`${COORDINATOR_BASE}/api/swaps/${swapId}/claim-xmr`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            signal: AbortSignal.timeout(15000),
+        });
+        if (!res.ok) {
+            const body = (await res.json().catch(() => ({}))) as { error?: { message?: string } };
+            return { ok: false, error: body.error?.message ?? `HTTP ${res.status}` };
+        }
+        return { ok: true };
+    } catch (err) {
+        return { ok: false, error: err instanceof Error ? err.message : 'unknown' };
     }
 }

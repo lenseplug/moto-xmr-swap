@@ -84,6 +84,8 @@ export interface CoordinatorStatus {
     readonly trustlessMode?: boolean;
     readonly aliceEd25519Pub?: string;
     readonly bobEd25519Pub?: string;
+    readonly sweepStatus?: string;
+    readonly depositor?: string;
     readonly updatedAt: number;
 }
 
@@ -118,6 +120,8 @@ export interface LocalSwapSecret {
     readonly createdAt: number;
     /** Alice's ed25519 private view key for split-key mode. */
     readonly aliceViewKey?: string;
+    /** Alice's XMR payout address (where she receives XMR after completion). */
+    readonly aliceXmrPayout?: string;
 }
 
 /**

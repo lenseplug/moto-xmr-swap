@@ -354,6 +354,15 @@ export class OpnetWatcher {
             onChainMappedStatus !== SwapStatus.MOTO_CLAIMING &&
             onChainMappedStatus !== SwapStatus.REFUNDED
         ) {
+            // Still update counterparty if it changed (take confirmed on-chain while
+            // coordinator was already in XMR_LOCKING/XMR_LOCKED).
+            if (
+                onChain.counterparty.length > 0 &&
+                onChain.counterparty !== existing.counterparty
+            ) {
+                this.storage.updateSwap(swapIdStr, { counterparty: onChain.counterparty });
+                console.log(`[OPNet Watcher] Swap ${swapIdStr}: counterparty updated (on-chain confirmed)`);
+            }
             return;
         }
 

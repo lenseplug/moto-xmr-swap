@@ -117,10 +117,23 @@ export function OrderBook({ onTakeSwap }: OrderBookProps): React.ReactElement {
     // Hide swaps created by the connected wallet (compare on-chain depositor)
     // This works correctly even when multiple wallets share the same browser.
     const myAddress = senderAddress?.toString().toLowerCase() ?? '';
-    const visibleSwaps = swaps.filter((s) => s.depositor.toLowerCase() !== myAddress);
+    const visibleSwaps = swaps.filter((s) => {
+        // Hide own swaps
+        if (s.depositor.toLowerCase() === myAddress) return false;
+        // Hide terminal states (claimed / refunded)
+        if (s.status === 2n || s.status === 3n) return false;
+        // Hide expired OPEN swaps
+        if (s.status === 0n && currentBlock !== null && s.refundBlock <= currentBlock) return false;
+        return true;
+    });
 
-    const enriched = visibleSwaps.map((s) => enrichSwap(s, currentBlock));
-    const sorted = sortSwaps(enriched, sortField, sortDir);
+    // Default sort: newest first (highest swapId at top)
+    const enriched = visibleSwaps
+        .map((s) => enrichSwap(s, currentBlock))
+        .sort((a, b) => Number(b.swapId - a.swapId));
+    const sorted = sortField === 'blocksRemaining' && sortDir === 'asc'
+        ? enriched
+        : sortSwaps(enriched, sortField, sortDir);
 
     const SortArrow = ({ field }: { field: SortField }): React.ReactElement => {
         if (sortField !== field)

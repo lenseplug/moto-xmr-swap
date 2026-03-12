@@ -4,7 +4,7 @@
 import React from 'react';
 import { useWalletConnect, SupportedWallets } from '@btc-vision/walletconnect';
 
-type TabId = 'orderbook' | 'create' | 'myswaps';
+type TabId = 'orderbook' | 'create' | 'myswaps' | 'docs';
 
 interface HeaderProps {
     readonly activeTab: TabId;
@@ -32,6 +32,7 @@ export function Header({ activeTab, onTabChange }: HeaderProps): React.ReactElem
         { id: 'orderbook', label: 'Order Book' },
         { id: 'create', label: 'Create Swap' },
         { id: 'myswaps', label: 'My Swaps' },
+        { id: 'docs', label: 'About' },
     ];
 
     return (
@@ -62,28 +63,23 @@ export function Header({ activeTab, onTabChange }: HeaderProps): React.ReactElem
                         gap: '24px',
                     }}
                 >
-                    {/* OP_NET Logo */}
+                    {/* MOTO-XMR Logos */}
                     <div style={{ display: 'flex', alignItems: 'center', gap: '16px', flexShrink: 0 }}>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-                            {/* OP_NET Logo */}
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
                             <img
-                                src="/opnet-logo.jpg"
-                                alt="OP_NET"
-                                width={36}
-                                height={36}
-                                style={{ borderRadius: '6px' }}
+                                src="/moto-logo.png"
+                                alt="MOTO"
+                                width={34}
+                                height={34}
+                                style={{ borderRadius: '50%' }}
                             />
-                            <span
-                                style={{
-                                    fontFamily: 'var(--font-display)',
-                                    fontWeight: 700,
-                                    fontSize: '1.15rem',
-                                    color: 'var(--color-text-primary)',
-                                    letterSpacing: '0.04em',
-                                }}
-                            >
-                                <span style={{ color: 'var(--color-orange)' }}>OP</span>NET
-                            </span>
+                            <img
+                                src="/xmr-logo.png"
+                                alt="XMR"
+                                width={34}
+                                height={34}
+                                style={{ borderRadius: '50%' }}
+                            />
                         </div>
 
                         <div
@@ -116,7 +112,7 @@ export function Header({ activeTab, onTabChange }: HeaderProps): React.ReactElem
                                     fontFamily: 'var(--font-mono)',
                                 }}
                             >
-                                Testnet
+                                Mainnet
                             </span>
                         </div>
                     </div>
