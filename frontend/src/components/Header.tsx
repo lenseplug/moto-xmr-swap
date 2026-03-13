@@ -1,10 +1,10 @@
 /**
- * App header — OP_NET branded with wallet connection and tab navigation.
+ * OPNero header -- branded navigation with wallet connection.
  */
 import React from 'react';
 import { useWalletConnect, SupportedWallets } from '@btc-vision/walletconnect';
 
-type TabId = 'orderbook' | 'create' | 'myswaps';
+type TabId = 'orderbook' | 'create' | 'myswaps' | 'docs';
 
 interface HeaderProps {
     readonly activeTab: TabId;
@@ -12,7 +12,7 @@ interface HeaderProps {
 }
 
 /**
- * OP_NET-branded header with navigation tabs and wallet connector.
+ * OPNero-branded header with navigation tabs and wallet connector.
  */
 export function Header({ activeTab, onTabChange }: HeaderProps): React.ReactElement {
     const { publicKey, walletAddress, connectToWallet, disconnect } = useWalletConnect();
@@ -32,6 +32,7 @@ export function Header({ activeTab, onTabChange }: HeaderProps): React.ReactElem
         { id: 'orderbook', label: 'Order Book' },
         { id: 'create', label: 'Create Swap' },
         { id: 'myswaps', label: 'My Swaps' },
+        { id: 'docs', label: 'About' },
     ];
 
     return (
@@ -43,7 +44,7 @@ export function Header({ activeTab, onTabChange }: HeaderProps): React.ReactElem
                 background: 'rgba(10, 10, 15, 0.95)',
                 backdropFilter: 'blur(12px)',
                 WebkitBackdropFilter: 'blur(12px)',
-                borderBottom: '1px solid rgba(232, 115, 42, 0.12)',
+                borderBottom: '1px solid rgba(255, 107, 0, 0.08)',
             }}
         >
             <div
@@ -62,38 +63,57 @@ export function Header({ activeTab, onTabChange }: HeaderProps): React.ReactElem
                         gap: '24px',
                     }}
                 >
-                    {/* OP_NET Logo */}
+                    {/* OPNero Logo + Branding */}
                     <div style={{ display: 'flex', alignItems: 'center', gap: '16px', flexShrink: 0 }}>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-                            {/* OP_NET Logo */}
-                            <img
-                                src="/opnet-logo.jpg"
-                                alt="OP_NET"
-                                width={36}
-                                height={36}
-                                style={{ borderRadius: '6px' }}
-                            />
+                        <div style={{ display: 'flex', flexDirection: 'column' }}>
+                            <div style={{ display: 'flex', alignItems: 'baseline', gap: '2px' }}>
+                                <span
+                                    style={{
+                                        fontSize: '1.4rem',
+                                        fontWeight: 700,
+                                        color: '#ff6b00',
+                                        letterSpacing: '0.02em',
+                                        fontFamily: 'var(--font-display)',
+                                    }}
+                                >
+                                    OP
+                                </span>
+                                <span
+                                    style={{
+                                        fontSize: '1.4rem',
+                                        fontWeight: 700,
+                                        color: '#ffffff',
+                                        letterSpacing: '0.02em',
+                                        fontFamily: 'var(--font-display)',
+                                    }}
+                                >
+                                    Nero
+                                </span>
+                            </div>
                             <span
                                 style={{
-                                    fontFamily: 'var(--font-display)',
-                                    fontWeight: 700,
-                                    fontSize: '1.15rem',
-                                    color: 'var(--color-text-primary)',
-                                    letterSpacing: '0.04em',
+                                    fontSize: '0.6rem',
+                                    fontWeight: 500,
+                                    color: '#555566',
+                                    letterSpacing: '0.12em',
+                                    textTransform: 'uppercase',
+                                    marginTop: '-2px',
+                                    fontFamily: 'var(--font-mono)',
                                 }}
                             >
-                                <span style={{ color: 'var(--color-orange)' }}>OP</span>NET
+                                OP-20 / XMR DEX
                             </span>
                         </div>
 
+                        {/* Network Badge */}
                         <div
                             style={{
                                 display: 'flex',
                                 alignItems: 'center',
                                 gap: '6px',
                                 padding: '3px 10px',
-                                background: 'rgba(232, 115, 42, 0.08)',
-                                border: '1px solid rgba(232, 115, 42, 0.2)',
+                                background: 'rgba(255, 107, 0, 0.06)',
+                                border: '1px solid rgba(255, 107, 0, 0.15)',
                                 borderRadius: '999px',
                             }}
                         >
@@ -144,11 +164,11 @@ export function Header({ activeTab, onTabChange }: HeaderProps): React.ReactElem
                                     border: 'none',
                                     background:
                                         activeTab === tab.id
-                                            ? 'rgba(232, 115, 42, 0.12)'
+                                            ? 'rgba(255, 107, 0, 0.10)'
                                             : 'transparent',
                                     color:
                                         activeTab === tab.id
-                                            ? 'var(--color-orange-light)'
+                                            ? '#ff6b00'
                                             : 'var(--color-text-secondary)',
                                     fontFamily: 'var(--font-display)',
                                     fontSize: '0.9rem',
@@ -157,7 +177,7 @@ export function Header({ activeTab, onTabChange }: HeaderProps): React.ReactElem
                                     transition: 'all var(--transition-fast)',
                                     borderBottom:
                                         activeTab === tab.id
-                                            ? '2px solid var(--color-orange)'
+                                            ? '2px solid #ff6b00'
                                             : '2px solid transparent',
                                     minHeight: '36px',
                                     whiteSpace: 'nowrap',
@@ -180,15 +200,33 @@ export function Header({ activeTab, onTabChange }: HeaderProps): React.ReactElem
                         ))}
                     </nav>
 
-                    {/* Wallet */}
-                    <div style={{ flexShrink: 0 }}>
+                    {/* Right: opnero.xyz badge + Wallet */}
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '12px', flexShrink: 0 }}>
+                        {/* opnero.xyz badge */}
+                        <span
+                            style={{
+                                fontSize: '0.7rem',
+                                fontWeight: 500,
+                                color: '#555566',
+                                fontFamily: 'var(--font-mono)',
+                                letterSpacing: '0.04em',
+                                padding: '2px 8px',
+                                border: '1px solid #2a2a3a',
+                                borderRadius: '6px',
+                                display: 'none', // hidden on small screens via inline
+                            }}
+                            className="opnero-badge"
+                        >
+                            opnero.xyz
+                        </span>
+
                         {isConnected && walletAddress ? (
                             <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
                                 <div
                                     style={{
                                         padding: '6px 14px',
-                                        background: 'rgba(232, 115, 42, 0.06)',
-                                        border: '1px solid var(--color-border-default)',
+                                        background: 'rgba(255, 107, 0, 0.05)',
+                                        border: '1px solid #2a2a3a',
                                         borderRadius: 'var(--radius-md)',
                                         fontFamily: 'var(--font-mono)',
                                         fontSize: '0.82rem',

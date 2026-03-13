@@ -1,5 +1,7 @@
 /**
  * SwapVault ABI and typed interface for use with getContract().
+ * Updated for multi-token support: createSwap takes tokenAddress as first param,
+ * getSwap returns tokenAddress as first output field.
  */
 import { ABIDataTypes, BitcoinAbiTypes, OP_NET_ABI, IOP_NETContract, CallResult, OPNetEvent } from 'opnet';
 import type { Address } from '@btc-vision/transaction';
@@ -10,6 +12,7 @@ export const SwapVaultEvents = [
         values: [
             { name: 'swapId', type: ABIDataTypes.UINT256 },
             { name: 'depositor', type: ABIDataTypes.ADDRESS },
+            { name: 'tokenAddress', type: ABIDataTypes.ADDRESS },
             { name: 'hashLock', type: ABIDataTypes.UINT256 },
             { name: 'refundBlock', type: ABIDataTypes.UINT256 },
             { name: 'amount', type: ABIDataTypes.UINT256 },
@@ -49,8 +52,21 @@ export const SwapVaultEvents = [
 
 export const SwapVaultAbi = [
     {
+        name: 'listToken',
+        inputs: [{ name: 'tokenAddress', type: ABIDataTypes.ADDRESS }],
+        outputs: [{ name: 'success', type: ABIDataTypes.BOOL }],
+        type: BitcoinAbiTypes.Function,
+    },
+    {
+        name: 'delistToken',
+        inputs: [{ name: 'tokenAddress', type: ABIDataTypes.ADDRESS }],
+        outputs: [{ name: 'success', type: ABIDataTypes.BOOL }],
+        type: BitcoinAbiTypes.Function,
+    },
+    {
         name: 'createSwap',
         inputs: [
+            { name: 'tokenAddress', type: ABIDataTypes.ADDRESS },
             { name: 'hashLock', type: ABIDataTypes.UINT256 },
             { name: 'refundBlock', type: ABIDataTypes.UINT256 },
             { name: 'amount', type: ABIDataTypes.UINT256 },
@@ -86,6 +102,7 @@ export const SwapVaultAbi = [
         name: 'getSwap',
         inputs: [{ name: 'swapId', type: ABIDataTypes.UINT256 }],
         outputs: [
+            { name: 'tokenAddress', type: ABIDataTypes.ADDRESS },
             { name: 'hashLock', type: ABIDataTypes.UINT256 },
             { name: 'refundBlock', type: ABIDataTypes.UINT256 },
             { name: 'amount', type: ABIDataTypes.UINT256 },
@@ -116,6 +133,18 @@ export const SwapVaultAbi = [
         outputs: [{ name: 'totalEscrow', type: ABIDataTypes.UINT256 }],
         type: BitcoinAbiTypes.Function,
     },
+    {
+        name: 'isListed',
+        inputs: [{ name: 'tokenAddress', type: ABIDataTypes.ADDRESS }],
+        outputs: [{ name: 'listed', type: ABIDataTypes.BOOL }],
+        type: BitcoinAbiTypes.Function,
+    },
+    {
+        name: 'getTokenCount',
+        inputs: [],
+        outputs: [{ name: 'count', type: ABIDataTypes.UINT256 }],
+        type: BitcoinAbiTypes.Function,
+    },
     ...SwapVaultEvents,
     ...OP_NET_ABI,
 ];
@@ -123,6 +152,7 @@ export const SwapVaultAbi = [
 export type SwapCreatedEvent = {
     readonly swapId: bigint;
     readonly depositor: Address;
+    readonly tokenAddress: Address;
     readonly hashLock: bigint;
     readonly refundBlock: bigint;
     readonly amount: bigint;
@@ -170,6 +200,7 @@ export type RefundResult = CallResult<
 
 export type GetSwapResult = CallResult<
     {
+        tokenAddress: Address;
         hashLock: bigint;
         refundBlock: bigint;
         amount: bigint;
@@ -202,6 +233,7 @@ export interface ISwapVault extends IOP_NETContract {
     /** Resolves the contract's on-chain Address object (async getter on BaseContract). */
     readonly contractAddress: Promise<Address>;
     createSwap(
+        tokenAddress: string | Address,
         hashLock: bigint,
         refundBlock: bigint,
         amount: bigint,

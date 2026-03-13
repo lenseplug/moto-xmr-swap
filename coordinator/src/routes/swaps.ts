@@ -16,6 +16,9 @@ import {
     calculateXmrTotal,
     safeParseAmount,
     MIN_XMR_AMOUNT_PICONERO,
+    DEFAULT_TOKEN_ADDRESS,
+    DEFAULT_TOKEN_SYMBOL,
+    DEFAULT_TOKEN_DECIMALS,
 } from '../types.js';
 import { StorageService } from '../storage.js';
 import { SwapStateMachine } from '../state-machine.js';
@@ -144,7 +147,15 @@ export function handleListSwaps(
 ): void {
     const url = new URL(req.url ?? '/', `http://localhost`);
     const { page, limit } = parsePagination(url);
-    const swaps = storage.listSwaps(page, limit);
+
+    // Token filtering: ?token=SYMBOL or ?token_address=ADDRESS
+    const tokenSymbol = url.searchParams.get('token') ?? undefined;
+    const tokenAddress = url.searchParams.get('token_address') ?? undefined;
+
+    const swaps = (tokenSymbol || tokenAddress)
+        ? storage.listSwapsFiltered(page, limit, tokenAddress, tokenSymbol)
+        : storage.listSwaps(page, limit);
+
     const sanitized = swaps.map(sanitizeSwapForApi);
     jsonResponse(res, 200, success({ swaps: sanitized, page, limit }));
 }
@@ -155,6 +166,7 @@ export function handleGetSwap(
     res: ServerResponse,
     storage: StorageService,
     swapId: string,
+    getQueuePosition?: (swapId: string) => { position: number; total: number } | null,
 ): void {
     const swap = storage.getSwap(swapId);
     if (!swap) {
@@ -162,7 +174,12 @@ export function handleGetSwap(
         return;
     }
     const history = storage.getStateHistory(swapId);
-    jsonResponse(res, 200, success({ swap: sanitizeSwapForApi(swap), history }));
+    const queuePos = getQueuePosition?.(swapId) ?? null;
+    jsonResponse(res, 200, success({
+        swap: sanitizeSwapForApi(swap),
+        history,
+        ...(queuePos ? { sweepQueuePosition: queuePos.position, sweepQueueTotal: queuePos.total } : {}),
+    }));
 }
 
 /**
@@ -315,6 +332,7 @@ export async function handleSubmitSecret(
 
         let secret: string;
         let aliceViewKey: string | undefined;
+        let aliceXmrPayout: string | undefined;
         try {
             const parsed = await readBody(req);
             if (
@@ -330,6 +348,9 @@ export async function handleSubmitSecret(
             const candidate = parsed as Record<string, unknown>;
             if (typeof candidate['aliceViewKey'] === 'string') {
                 aliceViewKey = candidate['aliceViewKey'].trim().toLowerCase();
+            }
+            if (typeof candidate['aliceXmrPayout'] === 'string' && candidate['aliceXmrPayout'].length > 0) {
+                aliceXmrPayout = candidate['aliceXmrPayout'].trim();
             }
         } catch (err: unknown) {
             const msg = err instanceof Error ? err.message : 'Invalid request';
@@ -377,6 +398,11 @@ export async function handleSubmitSecret(
             updateParams['alice_ed25519_pub'] = alicePubHex;
             updateParams['alice_view_key'] = aliceViewKey;
             console.log(`[Routes] Split-key mode enabled for swap ${swapId}`);
+        }
+
+        if (aliceXmrPayout) {
+            updateParams['alice_xmr_payout'] = aliceXmrPayout;
+            console.log(`[Routes] Alice XMR payout address set for swap ${swapId}: ${aliceXmrPayout.slice(0, 12)}...`);
         }
 
         storage.updateSwap(swapId, updateParams as import('../types.js').IUpdateSwapParams);
@@ -450,7 +476,7 @@ export async function handleCreateSwap(
             return;
         }
         if (xmrParsed < MIN_XMR_AMOUNT_PICONERO) {
-            jsonResponse(res, 400, fail('VALIDATION', `xmr_amount below minimum (${MIN_XMR_AMOUNT_PICONERO} piconero = 0.001 XMR)`));
+            jsonResponse(res, 400, fail('VALIDATION', `xmr_amount below minimum (${MIN_XMR_AMOUNT_PICONERO} piconero = 0.025 XMR)`));
             return;
         }
         // Validate refund_block is positive
@@ -470,6 +496,38 @@ export async function handleCreateSwap(
             }
         }
 
+        // Token lookup: accept optional tokenAddress, default to MOTO
+        let tokenAddress = DEFAULT_TOKEN_ADDRESS;
+        let tokenSymbol = DEFAULT_TOKEN_SYMBOL;
+        let tokenDecimals = DEFAULT_TOKEN_DECIMALS;
+        let tokenAmount = motoAmount; // Default: same as moto_amount
+
+        if (typeof candidate['tokenAddress'] === 'string' && candidate['tokenAddress'].trim().length > 0) {
+            const requestedAddress = candidate['tokenAddress'].trim();
+            const tokenRecord = storage.getToken(requestedAddress);
+            if (!tokenRecord) {
+                jsonResponse(res, 400, fail('VALIDATION', `Unsupported token: ${requestedAddress}. Add it via POST /api/tokens first.`));
+                return;
+            }
+            if (!tokenRecord.is_active) {
+                jsonResponse(res, 400, fail('VALIDATION', `Token ${requestedAddress} is not active`));
+                return;
+            }
+            tokenAddress = tokenRecord.address;
+            tokenSymbol = tokenRecord.symbol;
+            tokenDecimals = tokenRecord.decimals;
+        }
+
+        // Allow explicit token_amount override (e.g. for tokens with different decimals)
+        if (typeof candidate['token_amount'] === 'string') {
+            const parsedTokenAmount = safeParseAmount(candidate['token_amount']);
+            if (parsedTokenAmount === null || parsedTokenAmount <= 0n) {
+                jsonResponse(res, 400, fail('VALIDATION', 'token_amount must be a positive integer string'));
+                return;
+            }
+            tokenAmount = candidate['token_amount'];
+        }
+
         body = {
             swap_id: swapId,
             hash_lock: hashLock,
@@ -486,6 +544,10 @@ export async function handleCreateSwap(
                     ? candidate['opnet_create_tx']
                     : null,
             alice_xmr_payout: aliceXmrPayout,
+            token_address: tokenAddress,
+            token_symbol: tokenSymbol,
+            token_decimals: tokenDecimals,
+            token_amount: tokenAmount,
         };
     } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : 'Invalid request';

@@ -2,14 +2,25 @@
  * Shared types for the MOTO-XMR Coordinator.
  */
 
+/** Default MOTO token contract address. Used for backward compatibility. */
+export const DEFAULT_TOKEN_ADDRESS = 'opt1sqzkx6wm5acawl9m6nay2mjsm6wagv7gazcgtczds';
+
+/** Default token symbol. */
+export const DEFAULT_TOKEN_SYMBOL = 'MOTO';
+
+/** Default token decimals. */
+export const DEFAULT_TOKEN_DECIMALS = 18;
+
 /** Swap fee in basis points (0.87% = 87 bps). Paid by the taker on the XMR side. */
 export const FEE_BPS = 87;
 
 /** Basis-point denominator. */
 const BPS_DENOMINATOR = 10_000n;
 
-/** Minimum XMR amount in piconero (0.001 XMR = 1,000,000,000 piconero). */
-export const MIN_XMR_AMOUNT_PICONERO = 1_000_000_000n;
+/** Minimum XMR amount in piconero (0.025 XMR = 25,000,000,000 piconero).
+ *  At 0.87% fee, this yields ~217.5M piconero dev fee.
+ *  After 80M network fee deduction, ~137.5M goes to fee wallet. */
+export const MIN_XMR_AMOUNT_PICONERO = 25_000_000_000n;
 
 /** Regex matching a valid non-negative integer string (no leading zeros except "0" itself). */
 const VALID_AMOUNT_RE = /^(0|[1-9]\d*)$/;
@@ -125,6 +136,14 @@ export interface ISwapRecord {
     readonly alice_xmr_payout: string | null;
     /** Sweep status: null = not attempted, 'pending' = queued, 'done' = swept, 'failed:reason' = error. */
     readonly sweep_status: string | null;
+    /** Token contract address (e.g. MOTO). Defaults to MOTO for backward compat. */
+    readonly token_address: string;
+    /** Token symbol (e.g. 'MOTO'). */
+    readonly token_symbol: string;
+    /** Token decimals (e.g. 18). */
+    readonly token_decimals: number;
+    /** Token-side amount in atomic units. Mirrors moto_amount for MOTO swaps. */
+    readonly token_amount: string;
     readonly created_at: string;
     readonly updated_at: string;
 }
@@ -142,6 +161,14 @@ export interface ICreateSwapParams {
     readonly depositor: string;
     readonly opnet_create_tx: string | null;
     readonly alice_xmr_payout: string | null;
+    /** Token contract address. Defaults to MOTO if not provided. */
+    readonly token_address: string;
+    /** Token symbol. Defaults to 'MOTO' if not provided. */
+    readonly token_symbol: string;
+    /** Token decimals. Defaults to 18 if not provided. */
+    readonly token_decimals: number;
+    /** Token-side amount in atomic units. Mirrors moto_amount for MOTO swaps. */
+    readonly token_amount: string;
 }
 
 /** Fields that can be updated on an existing swap. */
@@ -192,6 +219,8 @@ export interface IMonitorLockResult {
 /** On-chain swap data returned by the OPNet watcher. */
 export interface IOnChainSwap {
     readonly swapId: bigint;
+    /** Token contract address (new: first field in getSwap return). */
+    readonly tokenAddress: string;
     readonly hashLock: bigint;
     readonly refundBlock: bigint;
     readonly amount: bigint;
@@ -201,6 +230,18 @@ export interface IOnChainSwap {
     readonly status: bigint;
     readonly xmrAddressHi: bigint;
     readonly xmrAddressLo: bigint;
+}
+
+/** A supported token record as stored in the tokens table. */
+export interface ITokenRecord {
+    readonly id: number;
+    readonly address: string;
+    readonly symbol: string;
+    readonly name: string;
+    readonly decimals: number;
+    readonly logo_url: string | null;
+    readonly is_active: boolean;
+    readonly created_at: string;
 }
 
 /** Preimage-ready WebSocket message payload. */
@@ -216,10 +257,15 @@ export interface IWsClientMessage {
     readonly claimToken?: string;
 }
 
+/** Queue position info broadcast via WebSocket. */
+export interface IWsQueueUpdate {
+    readonly queue: ReadonlyArray<{ readonly swapId: string; readonly position: number; readonly total: number }>;
+}
+
 /** WebSocket message shape. */
 export interface IWsMessage {
-    readonly type: 'swap_update' | 'active_swaps' | 'error' | 'preimage_ready';
-    readonly data: ISwapRecord | ISwapRecord[] | string | IWsPreimageReady;
+    readonly type: 'swap_update' | 'active_swaps' | 'error' | 'preimage_ready' | 'queue_update';
+    readonly data: ISwapRecord | ISwapRecord[] | string | IWsPreimageReady | IWsQueueUpdate;
 }
 
 /** Structured API response wrapper. */

@@ -40,12 +40,17 @@ export function useSwaps(): UseSwapsResult {
 
         try {
             const contract = getSwapVaultContract(SWAP_VAULT_ADDRESS);
-            const countResult = await contract.getSwapCount();
+            const provider = getProvider();
+            const [countResult, currentHeight] = await Promise.all([
+                contract.getSwapCount(),
+                provider.getBlockNumber(),
+            ]);
 
             if ('error' in countResult) {
                 throw new Error(String(countResult.error));
             }
 
+            const blockHeight = typeof currentHeight === 'bigint' ? currentHeight : BigInt(currentHeight ?? 0);
             const count = countResult.properties.count ?? 0n;
             const swapDataArr: SwapData[] = [];
 
@@ -59,15 +64,22 @@ export function useSwaps(): UseSwapsResult {
                     // Only include non-terminal swaps (OPEN=0, TAKEN=1)
                     if (p.status > 1n) continue;
 
+                    // Skip expired swaps (refund block already passed)
+                    if (blockHeight > 0n && p.refundBlock <= blockHeight) continue;
+
                     const depositorStr = typeof p.depositor === 'object' && p.depositor !== null
                         ? (p.depositor as { toString(): string }).toString()
                         : String(p.depositor);
                     const counterpartyStr = typeof p.counterparty === 'object' && p.counterparty !== null
                         ? (p.counterparty as { toString(): string }).toString()
                         : String(p.counterparty);
+                    const tokenAddrStr = typeof p.tokenAddress === 'object' && p.tokenAddress !== null
+                        ? (p.tokenAddress as { toString(): string }).toString()
+                        : String(p.tokenAddress ?? '');
 
                     swapDataArr.push({
                         swapId: i,
+                        tokenAddress: tokenAddrStr,
                         hashLock: p.hashLock,
                         refundBlock: p.refundBlock,
                         amount: p.amount,
@@ -162,8 +174,13 @@ export function useSwap(swapId: bigint | null): {
                 ? (p.counterparty as { toString(): string }).toString()
                 : String(p.counterparty);
 
+            const tokenAddrStr = typeof p.tokenAddress === 'object' && p.tokenAddress !== null
+                ? (p.tokenAddress as { toString(): string }).toString()
+                : String(p.tokenAddress ?? '');
+
             const swapData: SwapData = {
                 swapId,
+                tokenAddress: tokenAddrStr,
                 hashLock: p.hashLock,
                 refundBlock: p.refundBlock,
                 amount: p.amount,

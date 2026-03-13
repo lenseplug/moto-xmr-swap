@@ -1,5 +1,5 @@
 /**
- * OPNet provider singleton and contract cache for the MOTO-XMR Swap dApp.
+ * OPNet provider singleton and contract cache for the OPNero DEX.
  */
 import { getContract, JSONRpcProvider, IOP20Contract, OP_20_ABI } from 'opnet';
 import type { BitcoinInterfaceAbi } from 'opnet';
@@ -28,7 +28,7 @@ export function getProvider(): JSONRpcProvider {
 }
 
 const swapVaultCache = new Map<string, ISwapVault>();
-const motoTokenCache = new Map<string, IOP20Contract>();
+const tokenContractCache = new Map<string, IOP20Contract>();
 
 /**
  * Returns a cached SwapVault contract instance.
@@ -65,17 +65,17 @@ export function getSwapVaultContract(contractAddress: string, sender?: Address):
 }
 
 /**
- * Returns a cached MOTO token (OP-20) contract instance.
+ * Returns a cached OP-20 token contract instance for ANY token address.
  * Updates the sender on every call without recreating the instance.
  *
- * @param tokenAddress - The MOTO token contract address
+ * @param tokenAddress - The OP-20 token contract address
  * @param sender - The OPNet Address of the connected wallet (optional for reads)
  */
-export function getMotoContract(tokenAddress: string, sender?: Address): IOP20Contract {
+export function getTokenContract(tokenAddress: string, sender?: Address): IOP20Contract {
     const provider = getProvider();
     const cacheKey = tokenAddress;
 
-    if (!motoTokenCache.has(cacheKey)) {
+    if (!tokenContractCache.has(cacheKey)) {
         const contract = getContract<IOP20Contract>(
             tokenAddress,
             OP_20_ABI,
@@ -83,10 +83,10 @@ export function getMotoContract(tokenAddress: string, sender?: Address): IOP20Co
             networks.opnetTestnet,
             sender,
         );
-        motoTokenCache.set(cacheKey, contract);
+        tokenContractCache.set(cacheKey, contract);
     }
 
-    const cached = motoTokenCache.get(cacheKey);
+    const cached = tokenContractCache.get(cacheKey);
     if (!cached) {
         throw new Error('Contract cache miss after set — this should not happen');
     }
@@ -96,6 +96,17 @@ export function getMotoContract(tokenAddress: string, sender?: Address): IOP20Co
     }
 
     return cached;
+}
+
+/**
+ * Convenience wrapper: returns MOTO token contract.
+ * Delegates to getTokenContract with the provided address.
+ *
+ * @param tokenAddress - The MOTO token contract address
+ * @param sender - The OPNet Address of the connected wallet (optional for reads)
+ */
+export function getMotoContract(tokenAddress: string, sender?: Address): IOP20Contract {
+    return getTokenContract(tokenAddress, sender);
 }
 
 /**
@@ -143,6 +154,23 @@ export function parseMotoAmount(display: string): bigint {
     const paddedFrac = fracStr.padEnd(18, '0').slice(0, 18);
     const frac = BigInt(paddedFrac);
     return whole * 10n ** 18n + frac;
+}
+
+/**
+ * Parses a human-readable token amount string to raw bigint with arbitrary decimals.
+ *
+ * @param display - Display string like "100.5"
+ * @param decimals - Number of decimal places for the token
+ */
+export function parseTokenAmount(display: string, decimals: number): bigint {
+    const trimmed = display.trim();
+    if (!trimmed || trimmed === '') return 0n;
+    if (!/^\d*\.?\d*$/.test(trimmed) || trimmed === '.') throw new Error('Invalid amount');
+    const [wholeStr, fracStr = ''] = trimmed.split('.');
+    const whole = BigInt(wholeStr || '0');
+    const paddedFrac = fracStr.padEnd(decimals, '0').slice(0, decimals);
+    const frac = BigInt(paddedFrac);
+    return whole * 10n ** BigInt(decimals) + frac;
 }
 
 /**

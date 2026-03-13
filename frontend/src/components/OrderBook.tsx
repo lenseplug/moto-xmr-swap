@@ -1,5 +1,5 @@
 /**
- * OrderBook component — displays active MOTO/XMR swaps.
+ * OrderBook component -- displays active OP-20/XMR swaps.
  */
 import React, { useState, useCallback } from 'react';
 import { useWalletConnect } from '@btc-vision/walletconnect';
@@ -74,7 +74,7 @@ function sortSwaps(
     return [...swaps].sort((a, b) => {
         let cmp = 0;
         switch (field) {
-            case 'motoAmount':
+            case 'tokenAmount':
                 cmp = a.motoFloat - b.motoFloat;
                 break;
             case 'xmrAmount':
@@ -117,10 +117,23 @@ export function OrderBook({ onTakeSwap }: OrderBookProps): React.ReactElement {
     // Hide swaps created by the connected wallet (compare on-chain depositor)
     // This works correctly even when multiple wallets share the same browser.
     const myAddress = senderAddress?.toString().toLowerCase() ?? '';
-    const visibleSwaps = swaps.filter((s) => s.depositor.toLowerCase() !== myAddress);
+    const visibleSwaps = swaps.filter((s) => {
+        // Hide own swaps
+        if (s.depositor.toLowerCase() === myAddress) return false;
+        // Hide terminal states (claimed / refunded)
+        if (s.status === 2n || s.status === 3n) return false;
+        // Hide expired OPEN swaps
+        if (s.status === 0n && currentBlock !== null && s.refundBlock <= currentBlock) return false;
+        return true;
+    });
 
-    const enriched = visibleSwaps.map((s) => enrichSwap(s, currentBlock));
-    const sorted = sortSwaps(enriched, sortField, sortDir);
+    // Default sort: newest first (highest swapId at top)
+    const enriched = visibleSwaps
+        .map((s) => enrichSwap(s, currentBlock))
+        .sort((a, b) => Number(b.swapId - a.swapId));
+    const sorted = sortField === 'blocksRemaining' && sortDir === 'asc'
+        ? enriched
+        : sortSwaps(enriched, sortField, sortDir);
 
     const SortArrow = ({ field }: { field: SortField }): React.ReactElement => {
         if (sortField !== field)
@@ -222,10 +235,10 @@ export function OrderBook({ onTakeSwap }: OrderBookProps): React.ReactElement {
                             <tr style={{ background: 'rgba(255,255,255,0.02)' }}>
                                 <th
                                     style={thStyle}
-                                    onClick={() => handleSortClick('motoAmount')}
+                                    onClick={() => handleSortClick('tokenAmount')}
                                 >
-                                    MOTO Amount
-                                    <SortArrow field="motoAmount" />
+                                    Token Amount
+                                    <SortArrow field="tokenAmount" />
                                 </th>
                                 <th
                                     style={thStyle}
@@ -290,7 +303,7 @@ export function OrderBook({ onTakeSwap }: OrderBookProps): React.ReactElement {
                                                 }}
                                                 onMouseEnter={(e) => {
                                                     (e.currentTarget as HTMLTableRowElement).style.background =
-                                                        'rgba(232, 115, 42, 0.03)';
+                                                        'rgba(255, 107, 0, 0.03)';
                                                 }}
                                                 onMouseLeave={(e) => {
                                                     (e.currentTarget as HTMLTableRowElement).style.background =

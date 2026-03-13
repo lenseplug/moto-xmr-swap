@@ -1,15 +1,16 @@
 /**
- * Main application component for MOTO-XMR Atomic Swap.
+ * Main application component for OPNero — OP-20/XMR Private DEX.
  */
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { Header } from './components/Header';
 import { OrderBook } from './components/OrderBook';
 import { CreateSwap } from './components/CreateSwap';
 import { TakeSwap } from './components/TakeSwap';
 import { SwapStatus } from './components/SwapStatus';
 import { MySwaps } from './components/MySwaps';
+import { Docs } from './components/Docs';
 
-type TabId = 'orderbook' | 'create' | 'myswaps';
+type TabId = 'orderbook' | 'create' | 'myswaps' | 'docs';
 
 type ViewState =
     | { kind: 'tab'; tab: TabId }
@@ -21,6 +22,32 @@ type ViewState =
  */
 export default function App(): React.ReactElement {
     const [view, setView] = useState<ViewState>({ kind: 'tab', tab: 'orderbook' });
+
+    // Recover in-flight swap takes on page refresh
+    useEffect(() => {
+        try {
+            // Check for Bob's claim tokens (taker side)
+            const claimRaw = localStorage.getItem('moto_xmr_claim_tokens');
+            if (claimRaw) {
+                const tokens = JSON.parse(claimRaw) as Record<string, string>;
+                const firstSwapId = Object.keys(tokens)[0];
+                if (firstSwapId) {
+                    setView({ kind: 'status', swapId: BigInt(firstSwapId) });
+                    return;
+                }
+            }
+            // Check for Alice's secrets (creator side)
+            const secretRaw = localStorage.getItem('moto_xmr_swap_secrets');
+            if (secretRaw) {
+                const secrets = JSON.parse(secretRaw) as Array<{ swapId: string }>;
+                if (secrets.length > 0) {
+                    setView({ kind: 'status', swapId: BigInt(secrets[0].swapId) });
+                }
+            }
+        } catch {
+            // localStorage parse error — ignore
+        }
+    }, []);
 
     const activeTab: TabId =
         view.kind === 'tab' ? view.tab : view.kind === 'take' ? 'orderbook' : 'myswaps';
@@ -57,6 +84,42 @@ export default function App(): React.ReactElement {
 
     return (
         <>
+            {/* Subtle background glow elements */}
+            <div
+                style={{
+                    position: 'fixed',
+                    inset: 0,
+                    pointerEvents: 'none',
+                    zIndex: 0,
+                    overflow: 'hidden',
+                }}
+                aria-hidden="true"
+            >
+                {/* Top-center subtle orange glow */}
+                <div
+                    style={{
+                        position: 'absolute',
+                        top: '-20%',
+                        left: '50%',
+                        transform: 'translateX(-50%)',
+                        width: '60vw',
+                        height: '40vh',
+                        background: 'radial-gradient(ellipse, rgba(255, 107, 0, 0.04) 0%, transparent 70%)',
+                    }}
+                />
+                {/* Bottom-right violet glow */}
+                <div
+                    style={{
+                        position: 'absolute',
+                        bottom: '-10%',
+                        right: '-10%',
+                        width: '50vw',
+                        height: '50vh',
+                        background: 'radial-gradient(ellipse, rgba(124, 58, 237, 0.03) 0%, transparent 70%)',
+                    }}
+                />
+            </div>
+
             <Header activeTab={activeTab} onTabChange={handleTabChange} />
 
             {/* Title Banner */}
@@ -64,30 +127,73 @@ export default function App(): React.ReactElement {
                 style={{
                     textAlign: 'center',
                     padding: '40px 24px 20px',
+                    position: 'relative',
+                    zIndex: 1,
                 }}
             >
-                <h1
+                <div
                     style={{
-                        fontSize: 'clamp(1.8rem, 4vw, 2.8rem)',
-                        fontWeight: 700,
-                        letterSpacing: '0.04em',
-                        lineHeight: 1.2,
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        gap: '4px',
+                        marginBottom: '8px',
                     }}
                 >
-                    <span style={{ color: 'var(--color-purple-light)' }}>MOTO</span>
-                    <span style={{ color: 'var(--color-text-muted)', margin: '0 12px' }}>&gt;</span>
-                    <span style={{ color: 'var(--color-orange)' }}>XMR</span>
-                    <span style={{ color: 'var(--color-text-primary)', marginLeft: '12px' }}>SWAP</span>
-                </h1>
+                    <h1
+                        style={{
+                            fontSize: 'clamp(2rem, 5vw, 3.2rem)',
+                            fontWeight: 700,
+                            letterSpacing: '0.03em',
+                            lineHeight: 1.2,
+                            fontFamily: 'var(--font-display)',
+                        }}
+                    >
+                        <span style={{ color: '#ff6b00' }}>OP</span>
+                        <span style={{ color: '#ffffff' }}>Nero</span>
+                    </h1>
+                </div>
                 <p
                     style={{
-                        color: 'var(--color-text-secondary)',
-                        fontSize: '0.9rem',
-                        marginTop: '8px',
+                        color: '#888899',
+                        fontSize: '0.95rem',
+                        marginTop: '4px',
+                        letterSpacing: '0.06em',
+                        fontWeight: 400,
                     }}
                 >
-                    Hash-locked cross-chain swap — MOTO {'>'} XMR
+                    Private cross-chain swaps between OP-20 tokens and Monero
                 </p>
+
+                {/* Stats strip */}
+                <div
+                    style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        gap: '24px',
+                        marginTop: '16px',
+                    }}
+                >
+                    <div
+                        style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '8px',
+                            padding: '6px 16px',
+                            background: 'rgba(255, 107, 0, 0.04)',
+                            border: '1px solid rgba(255, 107, 0, 0.10)',
+                            borderRadius: '999px',
+                        }}
+                    >
+                        <span style={{ fontSize: '0.75rem', color: '#555566', textTransform: 'uppercase', fontWeight: 600, letterSpacing: '0.06em' }}>
+                            Powered by
+                        </span>
+                        <span style={{ fontSize: '0.8rem', fontWeight: 700, color: '#ff6b00' }}>
+                            OPNet
+                        </span>
+                    </div>
+                </div>
             </div>
 
             <main
@@ -97,6 +203,8 @@ export default function App(): React.ReactElement {
                     width: '100%',
                     margin: '0 auto',
                     padding: '12px 24px 64px',
+                    position: 'relative',
+                    zIndex: 1,
                 }}
             >
                 {view.kind === 'tab' && view.tab === 'orderbook' && (
@@ -111,6 +219,8 @@ export default function App(): React.ReactElement {
                     <MySwaps onViewStatus={handleViewStatus} />
                 )}
 
+                {view.kind === 'tab' && view.tab === 'docs' && <Docs />}
+
                 {view.kind === 'take' && (
                     <TakeSwap
                         swapId={view.swapId}
@@ -124,26 +234,91 @@ export default function App(): React.ReactElement {
                 )}
             </main>
 
-            {/* Powered by OPNET */}
-            <div
+            {/* Footer */}
+            <footer
                 style={{
-                    textAlign: 'center',
-                    padding: '40px 24px 16px',
+                    borderTop: '1px solid rgba(255, 107, 0, 0.06)',
+                    padding: '20px 24px',
+                    position: 'relative',
+                    zIndex: 1,
                 }}
             >
-                <p
+                <div
                     style={{
-                        fontSize: 'clamp(1.2rem, 2.5vw, 1.8rem)',
-                        fontWeight: 700,
-                        color: 'var(--color-text-primary)',
+                        maxWidth: '1200px',
+                        margin: '0 auto',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'space-between',
+                        flexWrap: 'wrap',
+                        gap: '12px',
                     }}
                 >
-                    Powered by{' '}
-                    <span style={{ color: 'var(--color-orange)' }}>OPNET</span>
-                </p>
-            </div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
+                        <a
+                            href="#"
+                            onClick={(e) => { e.preventDefault(); }}
+                            style={{
+                                fontSize: '0.8rem',
+                                color: '#555566',
+                                textDecoration: 'none',
+                                transition: 'color 150ms ease',
+                            }}
+                            onMouseEnter={(e) => { (e.currentTarget as HTMLAnchorElement).style.color = '#ff6b00'; }}
+                            onMouseLeave={(e) => { (e.currentTarget as HTMLAnchorElement).style.color = '#555566'; }}
+                        >
+                            Docs
+                        </a>
+                        <a
+                            href="https://github.com"
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            style={{
+                                fontSize: '0.8rem',
+                                color: '#555566',
+                                textDecoration: 'none',
+                                transition: 'color 150ms ease',
+                            }}
+                            onMouseEnter={(e) => { (e.currentTarget as HTMLAnchorElement).style.color = '#ff6b00'; }}
+                            onMouseLeave={(e) => { (e.currentTarget as HTMLAnchorElement).style.color = '#555566'; }}
+                        >
+                            GitHub
+                        </a>
+                        <a
+                            href="#"
+                            onClick={(e) => { e.preventDefault(); }}
+                            style={{
+                                fontSize: '0.8rem',
+                                color: '#555566',
+                                textDecoration: 'none',
+                                transition: 'color 150ms ease',
+                            }}
+                            onMouseEnter={(e) => { (e.currentTarget as HTMLAnchorElement).style.color = '#ff6b00'; }}
+                            onMouseLeave={(e) => { (e.currentTarget as HTMLAnchorElement).style.color = '#555566'; }}
+                        >
+                            Community
+                        </a>
+                    </div>
 
-            <footer style={{ padding: '24px' }} />
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                        <span style={{ fontSize: '0.75rem', color: '#555566' }}>
+                            Built with{' '}
+                            <span style={{ color: '#ff6b00', fontWeight: 600 }}>OPNet</span>
+                        </span>
+                        <span style={{ color: '#2a2a3a' }}>|</span>
+                        <span
+                            style={{
+                                fontSize: '0.75rem',
+                                fontFamily: 'var(--font-mono)',
+                                color: '#555566',
+                                fontWeight: 500,
+                            }}
+                        >
+                            opnero.xyz
+                        </span>
+                    </div>
+                </div>
+            </footer>
         </>
     );
 }

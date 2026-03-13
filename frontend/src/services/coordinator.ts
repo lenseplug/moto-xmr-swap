@@ -2,7 +2,7 @@
  * Coordinator REST client for XMR side of the atomic swap.
  * The coordinator handles Monero locking/unlocking off-chain.
  */
-import type { BobKeyMaterial, CoordinatorHealth, CoordinatorStatus } from '../types/swap';
+import type { BobKeyMaterial, CoordinatorHealth, CoordinatorStatus, ITokenRecord } from '../types/swap';
 
 const COORDINATOR_BASE = import.meta.env.VITE_COORDINATOR_URL;
 
@@ -26,6 +26,84 @@ export async function checkCoordinatorHealth(): Promise<CoordinatorHealth> {
         return (await res.json()) as CoordinatorHealth;
     } catch {
         return { status: 'error' };
+    }
+}
+
+/** Coordinator token list API response shape. */
+interface ICoordinatorTokenResponse {
+    readonly success: boolean;
+    readonly data: {
+        readonly tokens: ReadonlyArray<{
+            readonly address: string;
+            readonly symbol: string;
+            readonly name: string;
+            readonly decimals: number;
+            readonly listed: boolean;
+        }>;
+    } | null;
+}
+
+/**
+ * Fetches the list of supported tokens from the coordinator.
+ */
+export async function fetchTokens(): Promise<ITokenRecord[]> {
+    try {
+        const res = await fetch(`${COORDINATOR_BASE}/api/tokens`, {
+            signal: AbortSignal.timeout(10000),
+        });
+        if (!res.ok) return [];
+        const body = (await res.json()) as ICoordinatorTokenResponse;
+        if (!body.success || !body.data) return [];
+        return body.data.tokens.map((t) => ({
+            address: t.address,
+            symbol: t.symbol,
+            name: t.name,
+            decimals: t.decimals,
+            listed: t.listed,
+        }));
+    } catch {
+        return [];
+    }
+}
+
+/**
+ * Fetches active swaps from the coordinator, optionally filtered by token address.
+ *
+ * @param tokenFilter - Optional token address to filter swaps by
+ */
+export async function fetchSwaps(tokenFilter?: string): Promise<CoordinatorStatus[]> {
+    try {
+        const url = tokenFilter
+            ? `${COORDINATOR_BASE}/api/swaps?token=${encodeURIComponent(tokenFilter)}`
+            : `${COORDINATOR_BASE}/api/swaps`;
+        const res = await fetch(url, {
+            signal: AbortSignal.timeout(10000),
+        });
+        if (!res.ok) return [];
+        const body = (await res.json()) as ICoordinatorListResponse;
+        if (!body.success || !body.data) return [];
+
+        return body.data.swaps.map((swap) => {
+            const step = STATUS_TO_STEP[swap.status] ?? 'error';
+            return {
+                swapId: swap.swap_id,
+                step,
+                message: `Status: ${swap.status}`,
+                xmrTxId: swap.xmr_lock_tx ?? undefined,
+                xmrFee: swap.xmr_fee,
+                xmrTotal: swap.xmr_total,
+                xmrLockAddress: swap.xmr_address ?? undefined,
+                xmrLockConfirmations: swap.xmr_lock_confirmations,
+                trustlessMode: swap.trustless_mode === 1,
+                aliceEd25519Pub: swap.alice_ed25519_pub ?? undefined,
+                bobEd25519Pub: swap.bob_ed25519_pub ?? undefined,
+                sweepStatus: swap.sweep_status ?? undefined,
+                depositor: swap.depositor,
+                updatedAt: new Date(swap.updated_at).getTime(),
+            };
+        });
+    } catch {
+        return [];
     }
 }
 
@@ -56,6 +134,8 @@ interface ICoordinatorSwapResponse {
             readonly trustless_mode: number;
             readonly alice_ed25519_pub: string | null;
             readonly bob_ed25519_pub: string | null;
+            readonly sweep_status: string | null;
+            readonly depositor: string;
             readonly updated_at: string;
         };
     } | null;
@@ -91,6 +171,8 @@ export async function getCoordinatorSwapStatus(swapId: string): Promise<Coordina
             trustlessMode: swap.trustless_mode === 1,
             aliceEd25519Pub: swap.alice_ed25519_pub ?? undefined,
             bobEd25519Pub: swap.bob_ed25519_pub ?? undefined,
+            sweepStatus: swap.sweep_status ?? undefined,
+            depositor: swap.depositor,
             updatedAt: new Date(swap.updated_at).getTime(),
         };
     } catch {
@@ -146,6 +228,8 @@ interface ICoordinatorListResponse {
             readonly trustless_mode: number;
             readonly alice_ed25519_pub: string | null;
             readonly bob_ed25519_pub: string | null;
+            readonly sweep_status: string | null;
+            readonly depositor: string;
             readonly updated_at: string;
         }>;
     } | null;
@@ -177,6 +261,8 @@ export async function getAllCoordinatorStatuses(): Promise<CoordinatorStatus[]> 
                 trustlessMode: swap.trustless_mode === 1,
                 aliceEd25519Pub: swap.alice_ed25519_pub ?? undefined,
                 bobEd25519Pub: swap.bob_ed25519_pub ?? undefined,
+                sweepStatus: swap.sweep_status ?? undefined,
+                depositor: swap.depositor,
                 updatedAt: new Date(swap.updated_at).getTime(),
             };
         });
@@ -194,11 +280,14 @@ export async function getAllCoordinatorStatuses(): Promise<CoordinatorStatus[]> 
  * @param aliceViewKey - Optional Alice view key for split-key mode (64 hex chars)
  * @returns true if the secret was accepted
  */
-export async function submitSwapSecret(swapId: string, secret: string, aliceViewKey?: string): Promise<{ ok: boolean; error?: string }> {
+export async function submitSwapSecret(swapId: string, secret: string, aliceViewKey?: string, aliceXmrPayout?: string): Promise<{ ok: boolean; error?: string }> {
     try {
         const body: Record<string, string> = { secret };
         if (aliceViewKey) {
             body['aliceViewKey'] = aliceViewKey;
+        }
+        if (aliceXmrPayout) {
+            body['aliceXmrPayout'] = aliceXmrPayout;
         }
         const res = await fetch(`${COORDINATOR_BASE}/api/swaps/${swapId}/secret`, {
             method: 'POST',
@@ -234,5 +323,28 @@ export async function submitBobKeys(swapId: string, keys: BobKeyMaterial): Promi
         return res.ok;
     } catch {
         return false;
+    }
+}
+
+/**
+ * Alice triggers XMR claim (sweep from lock address to her payout address).
+ *
+ * @param swapId - The swap ID as a decimal string
+ * @returns Result with ok status and optional error message
+ */
+export async function claimXmr(swapId: string): Promise<{ ok: boolean; error?: string }> {
+    try {
+        const res = await fetch(`${COORDINATOR_BASE}/api/swaps/${swapId}/claim-xmr`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            signal: AbortSignal.timeout(15000),
+        });
+        if (!res.ok) {
+            const body = (await res.json().catch(() => ({}))) as { error?: { message?: string } };
+            return { ok: false, error: body.error?.message ?? `HTTP ${res.status}` };
+        }
+        return { ok: true };
+    } catch (err) {
+        return { ok: false, error: err instanceof Error ? err.message : 'unknown' };
     }
 }

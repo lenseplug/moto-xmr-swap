@@ -5,7 +5,17 @@
 import { getContract, JSONRpcProvider, ABIDataTypes, BitcoinAbiTypes, OP_NET_ABI, type BitcoinInterfaceAbi, type IOP_NETContract, type CallResult } from 'opnet';
 import { networks } from '@btc-vision/bitcoin';
 import type { Address } from '@btc-vision/transaction';
-import { type IOnChainSwap, type ISwapRecord, type IUpdateSwapParams, SwapStatus, calculateXmrFee, calculateXmrTotal } from './types.js';
+import {
+    type IOnChainSwap,
+    type ISwapRecord,
+    type IUpdateSwapParams,
+    SwapStatus,
+    calculateXmrFee,
+    calculateXmrTotal,
+    DEFAULT_TOKEN_ADDRESS,
+    DEFAULT_TOKEN_SYMBOL,
+    DEFAULT_TOKEN_DECIMALS,
+} from './types.js';
 import { StorageService } from './storage.js';
 import { SwapStateMachine } from './state-machine.js';
 
@@ -13,6 +23,7 @@ import { SwapStateMachine } from './state-machine.js';
 interface ISwapVaultContract extends IOP_NETContract {
     getSwapCount(): Promise<CallResult<{ count: bigint }>>;
     getSwap(swapId: bigint): Promise<CallResult<{
+        tokenAddress: Address;
         hashLock: bigint;
         refundBlock: bigint;
         amount: bigint;
@@ -290,6 +301,7 @@ export class OpnetWatcher {
 
         const onChain: IOnChainSwap = {
             swapId,
+            tokenAddress: props.tokenAddress?.toString() ?? DEFAULT_TOKEN_ADDRESS,
             hashLock: props.hashLock ?? 0n,
             refundBlock: props.refundBlock ?? 0n,
             amount: props.amount ?? 0n,
@@ -329,11 +341,20 @@ export class OpnetWatcher {
             const xmrFee = calculateXmrFee(xmrAmountStr);
             const xmrTotal = calculateXmrTotal(xmrAmountStr);
 
+            // Look up token metadata from storage, default to MOTO
+            const tokenRecord = this.storage.getToken(onChain.tokenAddress);
+            const tokenSymbol = tokenRecord?.symbol ?? DEFAULT_TOKEN_SYMBOL;
+            const tokenDecimals = tokenRecord?.decimals ?? DEFAULT_TOKEN_DECIMALS;
+
             this.storage.createSwap({
                 swap_id: swapIdStr,
                 hash_lock: onChain.hashLock.toString(16).padStart(64, '0'),
                 refund_block: Number(onChain.refundBlock),
                 moto_amount: onChain.amount.toString(),
+                token_address: onChain.tokenAddress,
+                token_symbol: tokenSymbol,
+                token_decimals: tokenDecimals,
+                token_amount: onChain.amount.toString(),
                 xmr_amount: xmrAmountStr,
                 xmr_fee: xmrFee,
                 xmr_total: xmrTotal,
@@ -354,6 +375,15 @@ export class OpnetWatcher {
             onChainMappedStatus !== SwapStatus.MOTO_CLAIMING &&
             onChainMappedStatus !== SwapStatus.REFUNDED
         ) {
+            // Still update counterparty if it changed (take confirmed on-chain while
+            // coordinator was already in XMR_LOCKING/XMR_LOCKED).
+            if (
+                onChain.counterparty.length > 0 &&
+                onChain.counterparty !== existing.counterparty
+            ) {
+                this.storage.updateSwap(swapIdStr, { counterparty: onChain.counterparty });
+                console.log(`[OPNet Watcher] Swap ${swapIdStr}: counterparty updated (on-chain confirmed)`);
+            }
             return;
         }
 

@@ -1,17 +1,21 @@
 /**
- * CreateSwap form component — allows users to create a new MOTO/XMR atomic swap.
+ * CreateSwap form component -- OPNero branded.
+ * Supports multiple OP-20 tokens via TokenSelector.
+ * Two-panel "YOU PAY" / "YOU RECEIVE" design from opnerodex concept.
  */
 import React, { useState, useCallback, useRef } from 'react';
 import { useWalletConnect } from '@btc-vision/walletconnect';
 import { networks } from '@btc-vision/bitcoin';
-import { getSwapVaultContract, getMotoContract, parseMotoAmount, parseXmrAmount, splitXmrAddress, getProvider } from '../services/opnet';
-import { generateTrustlessSecret, saveLocalSwapSecret, hashSecret } from '../utils/hashlock';
+import { getSwapVaultContract, getTokenContract, parseTokenAmount, parseXmrAmount, splitXmrAddress, getProvider } from '../services/opnet';
+import { generateTrustlessSecret, saveLocalSwapSecret, clearLocalSwapSecret, hashSecret } from '../utils/hashlock';
 import { submitSwapSecret } from '../services/coordinator';
 import { PrivacyBanner } from './PrivacyBanner';
 import { ExplorerLinks } from './ExplorerLinks';
+import { TokenSelector } from './TokenSelector';
+import { useTokens } from '../hooks/useTokens';
+import type { ITokenRecord } from '../types/swap';
 
 const SWAP_VAULT_ADDRESS = import.meta.env.VITE_SWAP_VAULT_ADDRESS;
-const MOTO_TOKEN_ADDRESS = import.meta.env.VITE_MOTO_TOKEN_ADDRESS;
 const BLOCKS_PER_HOUR = 6;
 // Coordinator requires at least 50 blocks remaining when locking XMR.
 // TODO(mainnet): Review and adjust for mainnet block times
@@ -22,7 +26,7 @@ interface CreateSwapProps {
 }
 
 interface FormState {
-    motoAmount: string;
+    tokenAmount: string;
     xmrAmount: string;
     xmrAddress: string;
     timeoutBlocks: string;
@@ -35,14 +39,22 @@ interface TxResult {
 
 /**
  * Create swap form with allowance check and hash-lock generation.
+ * Now supports any listed OP-20 token.
  */
 export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactElement {
     const { publicKey, address: senderAddress, walletAddress } = useWalletConnect();
+    const { tokens } = useTokens();
 
     const isConnected = publicKey !== null;
 
+    // Selected token state -- default to first available token (MOTO)
+    const [selectedToken, setSelectedToken] = useState<ITokenRecord | null>(null);
+
+    // Resolve the effective token: selected or first from list
+    const effectiveToken = selectedToken ?? tokens[0] ?? null;
+
     const [form, setForm] = useState<FormState>({
-        motoAmount: '',
+        tokenAmount: '',
         xmrAmount: '',
         xmrAddress: '',
         timeoutBlocks: String(DEFAULT_TIMEOUT_BLOCKS),
@@ -56,7 +68,7 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
     const [txResult, setTxResult] = useState<TxResult | null>(null);
     const [formError, setFormError] = useState<string | null>(null);
 
-    // Cancellation support — aborting before the wallet prompt is shown
+    // Cancellation support
     const cancelledRef = useRef(false);
 
     const handleCancel = useCallback((): void => {
@@ -75,12 +87,20 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
         [],
     );
 
+    const handleTokenSelect = useCallback((token: ITokenRecord): void => {
+        setSelectedToken(token);
+        setFormError(null);
+    }, []);
+
     const validateForm = useCallback((): string | null => {
-        const moto = parseMotoAmount(form.motoAmount);
-        if (moto <= 0n) return 'MOTO amount must be greater than zero';
+        if (effectiveToken === null) return 'Please select a token';
+
+        const tokenAmt = parseTokenAmount(form.tokenAmount, effectiveToken.decimals);
+        if (tokenAmt <= 0n) return `${effectiveToken.symbol} amount must be greater than zero`;
 
         const xmr = parseXmrAmount(form.xmrAmount);
         if (xmr <= 0n) return 'XMR amount must be greater than zero';
+        if (xmr < 25_000_000_000n) return 'Minimum XMR amount is 0.025 XMR. Amounts below this may result in lost funds due to network fees exceeding the swap fee.';
 
         if (form.xmrAddress.trim().length < 10) return 'Please enter a valid XMR address';
 
@@ -89,7 +109,7 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
             return 'Timeout must be between 60 and 10,000 blocks (coordinator needs at least 50 blocks to lock XMR safely)';
 
         return null;
-    }, [form]);
+    }, [form, effectiveToken]);
 
     const handleSubmit = useCallback(async (): Promise<void> => {
         if (!isConnected || !walletAddress || !publicKey || !senderAddress) {
@@ -103,13 +123,21 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
             return;
         }
 
-        if (!SWAP_VAULT_ADDRESS || !MOTO_TOKEN_ADDRESS) {
-            setFormError('Contract addresses not configured. Set VITE_SWAP_VAULT_ADDRESS and VITE_MOTO_TOKEN_ADDRESS.');
+        if (!SWAP_VAULT_ADDRESS) {
+            setFormError('Swap vault contract address not configured. Set VITE_SWAP_VAULT_ADDRESS.');
             return;
         }
-        const motoAmount = parseMotoAmount(form.motoAmount);
+
+        if (effectiveToken === null) {
+            setFormError('No token selected');
+            return;
+        }
+
+        const tokenAmount = parseTokenAmount(form.tokenAmount, effectiveToken.decimals);
         const xmrAmount = parseXmrAmount(form.xmrAmount);
         const timeoutBlocks = BigInt(parseInt(form.timeoutBlocks, 10));
+        const tokenSymbol = effectiveToken.symbol;
+        const tokenAddress = effectiveToken.address;
 
         setFormError(null);
         cancelledRef.current = false;
@@ -117,28 +145,26 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
         try {
             // Step 1: Check existing allowance
             setStep('checking_allowance');
-            setStatusMessage('Checking MOTO allowance...');
+            setStatusMessage(`Checking ${tokenSymbol} allowance...`);
 
-            // Initialise both contracts first so we can resolve the vault's Address.
             const swapContract = getSwapVaultContract(SWAP_VAULT_ADDRESS, senderAddress);
             const vaultAddress = await swapContract.contractAddress;
 
-            const motoContract = getMotoContract(MOTO_TOKEN_ADDRESS, senderAddress);
-            const allowanceResult = await motoContract.allowance(senderAddress, vaultAddress);
+            const tokenContract = getTokenContract(tokenAddress, senderAddress);
+            const allowanceResult = await tokenContract.allowance(senderAddress, vaultAddress);
             if ('error' in allowanceResult) {
                 throw new Error(`Allowance check failed: ${String(allowanceResult.error)}`);
             }
 
             const currentAllowance = allowanceResult.properties.remaining;
 
-            // Step 2: Approve if needed — use a large blanket approval so we only do this once
-            if (currentAllowance < motoAmount) {
-                // Approve a huge amount so future swaps never need another approval
-                const bigApproval = 2n ** 128n - 1n; // u128 max — way more than enough
+            // Step 2: Approve if needed
+            if (currentAllowance < tokenAmount) {
+                const bigApproval = 2n ** 128n - 1n;
                 setStep('approving');
-                setStatusMessage('Approving MOTO for SwapVault (one-time)...');
+                setStatusMessage(`Approving ${tokenSymbol} for SwapVault (one-time)...`);
 
-                const approveSim = await motoContract.increaseAllowance(vaultAddress, bigApproval);
+                const approveSim = await tokenContract.increaseAllowance(vaultAddress, bigApproval);
                 if ('error' in approveSim) {
                     throw new Error(`Allowance simulation failed: ${String(approveSim.error)}`);
                 }
@@ -149,7 +175,7 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
                     linkMLDSAPublicKeyToAddress: true,
                     refundTo: walletAddress,
                     maximumAllowedSatToSpend: 100_000n,
-                    network: networks.testnet,
+                    network: networks.opnetTestnet,
                 });
 
                 const approveObj = approveReceipt as unknown as Record<string, unknown>;
@@ -157,30 +183,30 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
                     throw new Error(`Allowance transaction failed: ${String(approveObj['error'])}`);
                 }
 
-                // Wait for the approval to be confirmed on-chain by polling allowance
-                setStatusMessage('Approving MOTO — waiting for block confirmation...');
-                const maxWaitMs = 10 * 60 * 1000; // 10 minutes max
-                const pollMs = 5_000; // check every 5s
+                // Wait for the approval to be confirmed on-chain
+                setStatusMessage(`Approving ${tokenSymbol} -- waiting for block confirmation...`);
+                const maxWaitMs = 10 * 60 * 1000;
+                const pollMs = 5_000;
                 const startTime = Date.now();
                 let confirmed = false;
 
                 while (Date.now() - startTime < maxWaitMs) {
                     await new Promise<void>((r) => setTimeout(r, pollMs));
                     const elapsed = Math.round((Date.now() - startTime) / 1000);
-                    setStatusMessage(`Approving MOTO — waiting for block confirmation (${elapsed}s)...`);
+                    setStatusMessage(`Approving ${tokenSymbol} -- waiting for block confirmation (${elapsed}s)...`);
                     try {
-                        const recheckResult = await motoContract.allowance(senderAddress, vaultAddress);
-                        if (!('error' in recheckResult) && recheckResult.properties.remaining >= motoAmount) {
+                        const recheckResult = await tokenContract.allowance(senderAddress, vaultAddress);
+                        if (!('error' in recheckResult) && recheckResult.properties.remaining >= tokenAmount) {
                             confirmed = true;
                             break;
                         }
                     } catch {
-                        // RPC hiccup — keep polling
+                        // RPC hiccup -- keep polling
                     }
                 }
 
                 if (!confirmed) {
-                    throw new Error('Approval timed out — the allowance TX may still be pending. Try again in a few minutes.');
+                    throw new Error('Approval timed out -- the allowance TX may still be pending. Try again in a few minutes.');
                 }
             }
 
@@ -190,10 +216,9 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
 
             const { secret, hashLock, hashLockHex, aliceViewKey } = await generateTrustlessSecret();
 
-            // Verify secret matches hashLock locally (defensive assertion)
             const verifyHash = await hashSecret(secret);
             if (verifyHash !== hashLock) {
-                throw new Error('BUG: SHA-256(secret) does not match hashLock — key generation failed');
+                throw new Error('BUG: SHA-256(secret) does not match hashLock -- key generation failed');
             }
 
             // Step 4: Encode XMR address
@@ -207,22 +232,20 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
                 typeof currentBlockRaw === 'bigint'
                     ? currentBlockRaw
                     : BigInt(currentBlockRaw as number);
-            // Add a 20-block safety buffer to account for blocks that may elapse
-            // between the block number fetch and the transaction being mined.
             const refundBlock = currentBlock + timeoutBlocks + 20n;
 
-            // Step 6: Simulate createSwap with retry (allowance may need a block to confirm)
-            // OPNet simulations can throw OR return error objects, so we handle both.
+            // Step 6: Simulate createSwap with retry
             setStatusMessage('Simulating swap creation...');
 
             let createSim: Awaited<ReturnType<typeof swapContract.createSwap>> | null = null;
-            const maxRetries = 36; // up to ~3 minutes of retries
+            const maxRetries = 36;
             for (let attempt = 1; attempt <= maxRetries; attempt++) {
                 try {
                     const simResult = await swapContract.createSwap(
+                        tokenAddress,
                         hashLock,
                         refundBlock,
-                        motoAmount,
+                        tokenAmount,
                         xmrAmount,
                         xmrAddressHi,
                         xmrAddressLo,
@@ -231,7 +254,6 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
                     if ('error' in simResult) {
                         const errMsg = String(simResult.error);
                         if (errMsg.includes('llowance') && attempt < maxRetries) {
-                            // Allowance not confirmed yet — keep waiting
                             throw new Error(errMsg);
                         }
                         throw new Error(`Swap simulation failed: ${errMsg}`);
@@ -242,15 +264,13 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
                 } catch (simErr: unknown) {
                     const errMsg = simErr instanceof Error ? simErr.message : String(simErr);
 
-                    // Retry on allowance errors (case-insensitive partial match)
                     if (errMsg.toLowerCase().includes('allowance') && attempt < maxRetries) {
                         setStep('approving');
-                        setStatusMessage(`Approving MOTO — waiting for block confirmation (${attempt}/${maxRetries})...`);
+                        setStatusMessage(`Approving ${tokenSymbol} -- waiting for block confirmation (${attempt}/${maxRetries})...`);
                         await new Promise<void>((r) => setTimeout(r, 5_000));
                         continue;
                     }
 
-                    // Non-allowance error or last retry — give up
                     throw new Error(`Swap simulation failed: ${errMsg}`);
                 }
             }
@@ -259,37 +279,9 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
                 throw new Error('Swap simulation failed: allowance not confirmed after retries. Try again in a few minutes.');
             }
 
-            // Check for cancellation before requesting wallet signature
-            if (cancelledRef.current) return;
-
-            // Step 7: Send transaction
-            setStatusMessage('Waiting for wallet signature...');
-
-            const createReceipt = await createSim.sendTransaction({
-                signer: null,
-                mldsaSigner: null,
-                refundTo: walletAddress,
-                maximumAllowedSatToSpend: 200_000n,
-                network: networks.testnet,
-            });
-
-            const receiptObj = createReceipt as unknown as Record<string, unknown>;
-
-            if ('error' in receiptObj) {
-                throw new Error(`Swap transaction failed: ${String(receiptObj['error'])}`);
-            }
-
-            const txId =
-                typeof receiptObj['result'] === 'string'
-                    ? receiptObj['result']
-                    : typeof receiptObj['txid'] === 'string'
-                      ? receiptObj['txid']
-                      : 'pending';
-
-            // Extract swapId — prefer return value, fallback to events
+            // Extract swapId from simulation
             let swapId = 0n;
 
-            // Try the simulation return value first (most reliable)
             if (createSim.properties && typeof createSim.properties === 'object') {
                 const props = createSim.properties as Record<string, unknown>;
                 if (typeof props['swapId'] === 'bigint') {
@@ -297,7 +289,6 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
                 }
             }
 
-            // Fallback: try events
             if (swapId === 0n) {
                 const events = createSim.events ?? [];
                 if (events.length > 0) {
@@ -314,18 +305,43 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
 
             console.log('[CreateSwap] Extracted swapId:', swapId.toString());
 
-            // Store secret + view key locally (persists in localStorage across refreshes)
-            saveLocalSwapSecret(swapId.toString(), secret, hashLockHex, aliceViewKey);
+            // Save secret to localStorage BEFORE sending transaction
+            const aliceXmrPayout = form.xmrAddress.trim();
+            saveLocalSwapSecret(swapId.toString(), secret, hashLockHex, aliceViewKey, aliceXmrPayout);
 
-            // Submit secret + view key to coordinator with retries.
-            // The coordinator may not know about this swap yet (it creates the record
-            // when the OPNet watcher detects the on-chain tx in the next block), so
-            // we retry for up to ~3 minutes. SwapStatus also retries as a fallback.
+            if (cancelledRef.current) return;
+
+            // Step 7: Send transaction
+            setStatusMessage('Waiting for wallet signature...');
+
+            const createReceipt = await createSim.sendTransaction({
+                signer: null,
+                mldsaSigner: null,
+                refundTo: walletAddress,
+                maximumAllowedSatToSpend: 200_000n,
+                network: networks.opnetTestnet,
+            });
+
+            const receiptObj = createReceipt as unknown as Record<string, unknown>;
+
+            if ('error' in receiptObj) {
+                clearLocalSwapSecret(swapId.toString());
+                throw new Error(`Swap transaction failed: ${String(receiptObj['error'])}`);
+            }
+
+            const txId =
+                typeof receiptObj['result'] === 'string'
+                    ? receiptObj['result']
+                    : typeof receiptObj['txid'] === 'string'
+                      ? receiptObj['txid']
+                      : 'pending';
+
+            // Submit secret to coordinator
             setStatusMessage('Registering swap secret with coordinator...');
             let secretSubmitted = false;
             for (let attempt = 0; attempt < 36; attempt++) {
                 if (cancelledRef.current) break;
-                const result = await submitSwapSecret(swapId.toString(), secret, aliceViewKey);
+                const result = await submitSwapSecret(swapId.toString(), secret, aliceViewKey, aliceXmrPayout);
                 if (result.ok) {
                     secretSubmitted = true;
                     break;
@@ -335,7 +351,7 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
                 }
             }
             if (!secretSubmitted) {
-                console.warn('[CreateSwap] Secret not confirmed by coordinator — SwapStatus will retry');
+                console.warn('[CreateSwap] Secret not confirmed by coordinator -- SwapStatus will retry');
             }
 
             setTxResult({ txId, swapId });
@@ -351,6 +367,7 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
         publicKey,
         senderAddress,
         form,
+        effectiveToken,
         validateForm,
         onSwapCreated,
     ]);
@@ -359,14 +376,24 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
 
     const isProcessing = step === 'checking_allowance' || step === 'approving' || step === 'creating';
 
+    const tokenSymbol = effectiveToken?.symbol ?? 'TOKEN';
+
     const fieldLabel: React.CSSProperties = {
         display: 'block',
-        fontSize: '0.8rem',
+        fontSize: '0.75rem',
         fontWeight: 600,
-        color: 'var(--color-text-secondary)',
+        color: '#555566',
         marginBottom: '6px',
-        letterSpacing: '0.04em',
+        letterSpacing: '0.08em',
         textTransform: 'uppercase',
+    };
+
+    // Shared panel style for YOU PAY / YOU RECEIVE
+    const panelStyle: React.CSSProperties = {
+        background: '#12121a',
+        border: '1px solid #2a2a3a',
+        borderRadius: '14px',
+        padding: '20px',
     };
 
     return (
@@ -377,12 +404,13 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
                         fontSize: '1.35rem',
                         fontWeight: 700,
                         marginBottom: '6px',
+                        color: '#ffffff',
                     }}
                 >
                     Create Swap
                 </h2>
-                <p style={{ fontSize: '0.875rem', color: 'var(--color-text-secondary)' }}>
-                    Offer MOTO tokens in exchange for Monero. Split ed25519 keys are generated locally.
+                <p style={{ fontSize: '0.875rem', color: '#888899' }}>
+                    Offer OP-20 tokens in exchange for Monero. Split ed25519 keys are generated locally.
                 </p>
             </div>
 
@@ -403,72 +431,174 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
             )}
 
             <div className="glass-card" style={{ padding: '24px' }}>
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
 
-                    {/* MOTO Amount */}
-                    <div>
-                        <label htmlFor="moto-amount" style={fieldLabel}>
-                            MOTO Amount
-                        </label>
-                        <input
-                            id="moto-amount"
-                            type="text"
-                            inputMode="decimal"
-                            className="input-field tabular-nums"
-                            placeholder="0.00"
-                            value={form.motoAmount}
-                            onChange={handleFieldChange('motoAmount')}
-                            disabled={isProcessing || step === 'done'}
-                        />
-                        <p style={{ fontSize: '0.75rem', color: 'var(--color-text-muted)', marginTop: '4px' }}>
-                            Amount of MOTO tokens to lock in the swap vault
-                        </p>
+                    {/* YOU PAY -- OP-20 Token Panel */}
+                    <div style={panelStyle}>
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '14px' }}>
+                            <span style={{ fontSize: '0.7rem', fontWeight: 700, color: '#555566', letterSpacing: '0.12em', textTransform: 'uppercase' }}>
+                                You Pay
+                            </span>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                                <div style={{
+                                    width: '24px',
+                                    height: '24px',
+                                    borderRadius: '50%',
+                                    background: 'linear-gradient(135deg, #ff6b00, #ff8533)',
+                                    display: 'flex',
+                                    alignItems: 'center',
+                                    justifyContent: 'center',
+                                    fontSize: '0.55rem',
+                                    fontWeight: 700,
+                                    color: '#fff',
+                                }}>
+                                    OP
+                                </div>
+                                <span style={{ fontSize: '0.8rem', fontWeight: 600, color: '#888899' }}>
+                                    OP-20
+                                </span>
+                            </div>
+                        </div>
+
+                        {/* Token Selector */}
+                        <div style={{ marginBottom: '12px' }}>
+                            <TokenSelector
+                                tokens={tokens}
+                                selectedToken={effectiveToken}
+                                onSelect={handleTokenSelect}
+                                disabled={isProcessing || step === 'done'}
+                            />
+                        </div>
+
+                        {/* Token Amount */}
+                        <div>
+                            <label htmlFor="token-amount" style={fieldLabel}>
+                                {tokenSymbol} Amount
+                            </label>
+                            <input
+                                id="token-amount"
+                                type="text"
+                                inputMode="decimal"
+                                className="input-field tabular-nums"
+                                placeholder="0.00"
+                                value={form.tokenAmount}
+                                onChange={handleFieldChange('tokenAmount')}
+                                disabled={isProcessing || step === 'done'}
+                                style={{ fontSize: '1.1rem', fontWeight: 600 }}
+                            />
+                            <p style={{ fontSize: '0.72rem', color: '#555566', marginTop: '4px' }}>
+                                Amount of {tokenSymbol} tokens to lock in the swap vault
+                            </p>
+                        </div>
                     </div>
 
-                    {/* XMR Amount */}
-                    <div>
-                        <label htmlFor="xmr-amount" style={fieldLabel}>
-                            Desired XMR Amount
-                        </label>
-                        <input
-                            id="xmr-amount"
-                            type="text"
-                            inputMode="decimal"
-                            className="input-field tabular-nums"
-                            placeholder="0.000000000000"
-                            value={form.xmrAmount}
-                            onChange={handleFieldChange('xmrAmount')}
-                            disabled={isProcessing || step === 'done'}
-                        />
-                        <p style={{ fontSize: '0.75rem', color: 'var(--color-text-muted)', marginTop: '4px' }}>
-                            XMR amount you want to receive (12 decimal places).
-                            The taker pays an additional 0.87% fee on top of this amount.
-                        </p>
+                    {/* Swap Direction Arrow */}
+                    <div style={{ display: 'flex', justifyContent: 'center', margin: '-8px 0' }}>
+                        <div
+                            style={{
+                                width: '40px',
+                                height: '40px',
+                                borderRadius: '12px',
+                                background: '#1a1a24',
+                                border: '2px solid #2a2a3a',
+                                display: 'flex',
+                                alignItems: 'center',
+                                justifyContent: 'center',
+                                zIndex: 2,
+                            }}
+                        >
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#ff6b00" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                                <line x1="12" y1="5" x2="12" y2="19" />
+                                <polyline points="19 12 12 19 5 12" />
+                            </svg>
+                        </div>
                     </div>
 
-                    {/* XMR Address */}
-                    <div>
-                        <label htmlFor="xmr-address" style={fieldLabel}>
-                            Your Monero Address
-                        </label>
-                        <PrivacyBanner />
-                        <input
-                            id="xmr-address"
-                            type="text"
-                            className="input-field input-mono"
-                            style={{ marginTop: '10px' }}
-                            placeholder="4... (standard Monero address)"
-                            value={form.xmrAddress}
-                            onChange={handleFieldChange('xmrAddress')}
-                            disabled={isProcessing || step === 'done'}
-                        />
-                        <p style={{ fontSize: '0.75rem', color: 'var(--color-text-muted)', marginTop: '4px' }}>
-                            Standard Monero address (starts with 4) or 128-char hex
-                        </p>
+                    {/* YOU RECEIVE -- XMR Panel */}
+                    <div style={panelStyle}>
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '14px' }}>
+                            <span style={{ fontSize: '0.7rem', fontWeight: 700, color: '#555566', letterSpacing: '0.12em', textTransform: 'uppercase' }}>
+                                You Receive
+                            </span>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                                <div style={{
+                                    width: '24px',
+                                    height: '24px',
+                                    borderRadius: '50%',
+                                    background: 'linear-gradient(135deg, #f26822, #ff8533)',
+                                    display: 'flex',
+                                    alignItems: 'center',
+                                    justifyContent: 'center',
+                                    fontSize: '0.55rem',
+                                    fontWeight: 700,
+                                    color: '#fff',
+                                }}>
+                                    M
+                                </div>
+                                <span style={{ fontSize: '0.8rem', fontWeight: 600, color: '#888899' }}>
+                                    XMR
+                                </span>
+                            </div>
+                        </div>
+
+                        {/* XMR Amount */}
+                        <div style={{ marginBottom: '12px' }}>
+                            <label htmlFor="xmr-amount" style={fieldLabel}>
+                                Desired XMR Amount
+                            </label>
+                            <input
+                                id="xmr-amount"
+                                type="text"
+                                inputMode="decimal"
+                                className="input-field tabular-nums"
+                                placeholder="0.000000000000"
+                                value={form.xmrAmount}
+                                onChange={handleFieldChange('xmrAmount')}
+                                disabled={isProcessing || step === 'done'}
+                                style={{ fontSize: '1.1rem', fontWeight: 600 }}
+                            />
+                            <p style={{ fontSize: '0.72rem', color: '#555566', marginTop: '4px' }}>
+                                Minimum 0.025 XMR. The taker pays an additional 0.87% fee on top of this amount.
+                            </p>
+                            {form.xmrAmount.trim() !== '' && parseXmrAmount(form.xmrAmount) > 0n && parseXmrAmount(form.xmrAmount) < 25_000_000_000n && (
+                                <p style={{
+                                    fontSize: '0.75rem',
+                                    color: 'var(--color-text-warning)',
+                                    marginTop: '6px',
+                                    padding: '8px 10px',
+                                    background: 'rgba(255, 215, 64, 0.08)',
+                                    border: '1px solid rgba(255, 215, 64, 0.25)',
+                                    borderRadius: 'var(--radius-sm)',
+                                }}>
+                                    Amounts below 0.025 XMR may result in lost funds -- network fees can exceed the swap fee at this size.
+                                </p>
+                            )}
+                        </div>
+
+                        {/* XMR Address */}
+                        <div>
+                            <label htmlFor="xmr-address" style={fieldLabel}>
+                                Your Monero Address
+                            </label>
+                            <PrivacyBanner />
+                            <input
+                                id="xmr-address"
+                                type="text"
+                                className="input-field input-mono"
+                                style={{ marginTop: '10px' }}
+                                placeholder="4... (standard Monero address)"
+                                value={form.xmrAddress}
+                                onChange={handleFieldChange('xmrAddress')}
+                                disabled={isProcessing || step === 'done'}
+                            />
+                            <p style={{ fontSize: '0.72rem', color: '#555566', marginTop: '4px' }}>
+                                Standard Monero address (starts with 4) or 128-char hex
+                            </p>
+                        </div>
                     </div>
 
                     {/* Timeout */}
-                    <div>
+                    <div style={{ padding: '0 4px' }}>
                         <label htmlFor="timeout-blocks" style={fieldLabel}>
                             Timeout (blocks)
                         </label>
@@ -482,7 +612,7 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
                             onChange={handleFieldChange('timeoutBlocks')}
                             disabled={isProcessing || step === 'done'}
                         />
-                        <p style={{ fontSize: '0.75rem', color: 'var(--color-text-muted)', marginTop: '4px' }}>
+                        <p style={{ fontSize: '0.72rem', color: '#555566', marginTop: '4px' }}>
                             {isNaN(parseInt(form.timeoutBlocks, 10))
                                 ? 'Invalid'
                                 : `~${estimatedHours} hour${estimatedHours !== 1 ? 's' : ''} at 6 blocks/hour`}
@@ -513,11 +643,11 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
                                 alignItems: 'center',
                                 gap: '10px',
                                 padding: '12px 14px',
-                                background: 'rgba(232, 115, 42, 0.06)',
-                                border: '1px solid var(--color-border-default)',
+                                background: 'rgba(255, 107, 0, 0.06)',
+                                border: '1px solid rgba(255, 107, 0, 0.12)',
                                 borderRadius: 'var(--radius-md)',
                                 fontSize: '0.875rem',
-                                color: 'var(--color-text-accent)',
+                                color: '#ff6b00',
                             }}
                         >
                             <div
@@ -525,7 +655,7 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
                                     width: '6px',
                                     height: '6px',
                                     borderRadius: '50%',
-                                    background: 'var(--color-orange)',
+                                    background: '#ff6b00',
                                     flexShrink: 0,
                                 }}
                             />
@@ -561,8 +691,8 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
                         <div
                             style={{
                                 padding: '16px',
-                                background: 'rgba(0, 230, 118, 0.06)',
-                                border: '1px solid rgba(0, 230, 118, 0.2)',
+                                background: 'rgba(34, 197, 94, 0.06)',
+                                border: '1px solid rgba(34, 197, 94, 0.2)',
                                 borderRadius: 'var(--radius-md)',
                             }}
                         >
@@ -570,23 +700,23 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
                                 style={{
                                     fontSize: '0.9rem',
                                     fontWeight: 600,
-                                    color: 'var(--color-text-success)',
+                                    color: '#22c55e',
                                     marginBottom: '4px',
                                 }}
                             >
                                 Swap Created
                             </p>
-                            <p style={{ fontSize: '0.8rem', color: 'var(--color-text-secondary)' }}>
+                            <p style={{ fontSize: '0.8rem', color: '#888899' }}>
                                 Swap ID: <span className="font-mono">{txResult.swapId.toString()}</span>
                             </p>
                             <p
                                 style={{
                                     fontSize: '0.75rem',
-                                    color: 'var(--color-text-muted)',
+                                    color: '#555566',
                                     marginTop: '6px',
                                 }}
                             >
-                                Swap keys saved to browser storage. Safe to refresh — do not clear browser data until the swap completes.
+                                Swap keys saved to browser storage. Safe to refresh -- do not clear browser data until the swap completes.
                             </p>
                             <ExplorerLinks txId={txResult.txId} address={walletAddress ?? undefined} />
                         </div>
@@ -598,10 +728,18 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
                             className="btn btn-primary btn-lg"
                             disabled={!isConnected || isProcessing}
                             onClick={() => void handleSubmit()}
+                            style={{
+                                width: '100%',
+                                background: '#ff6b00',
+                                borderColor: '#ff6b00',
+                                borderRadius: '12px',
+                                fontSize: '1rem',
+                                letterSpacing: '0.05em',
+                            }}
                         >
                             {isProcessing
                                 ? step === 'approving'
-                                    ? 'Approving MOTO...'
+                                    ? `Approving ${tokenSymbol}...`
                                     : step === 'creating'
                                       ? 'Creating Swap...'
                                       : 'Checking Allowance...'
@@ -616,7 +754,7 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
                                 setStep('idle');
                                 setTxResult(null);
                                 setForm({
-                                    motoAmount: '',
+                                    tokenAmount: '',
                                     xmrAmount: '',
                                     xmrAddress: '',
                                     timeoutBlocks: String(DEFAULT_TIMEOUT_BLOCKS),
@@ -626,6 +764,13 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
                             Create Another Swap
                         </button>
                     )}
+
+                    {/* Powered by OPNet badge near submit */}
+                    <div style={{ display: 'flex', justifyContent: 'center', marginTop: '4px' }}>
+                        <span style={{ fontSize: '0.7rem', color: '#555566', letterSpacing: '0.04em' }}>
+                            Powered by <span style={{ color: '#ff6b00', fontWeight: 600 }}>OPNet</span>
+                        </span>
+                    </div>
                 </div>
             </div>
         </div>

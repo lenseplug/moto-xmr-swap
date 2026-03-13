@@ -1,5 +1,5 @@
 /**
- * Application entry point.
+ * OPNero application entry point.
  * Wraps the app in WalletConnectProvider (v2 API).
  */
 import React from 'react';

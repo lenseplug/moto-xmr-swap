@@ -7,6 +7,7 @@ import { CallResult, OPNetEvent, IOP_NETContract } from 'opnet';
 export type SwapCreatedEvent = {
     readonly swapId: bigint;
     readonly depositor: Address;
+    readonly tokenAddress: Address;
     readonly hashLock: bigint;
     readonly refundBlock: bigint;
     readonly amount: bigint;
@@ -32,6 +33,26 @@ export type SwapRefundedEvent = {
 // ------------------------------------------------------------------
 // Call Results
 // ------------------------------------------------------------------
+
+/**
+ * @description Represents the result of the listToken function call.
+ */
+export type ListToken = CallResult<
+    {
+        success: boolean;
+    },
+    OPNetEvent<never>[]
+>;
+
+/**
+ * @description Represents the result of the delistToken function call.
+ */
+export type DelistToken = CallResult<
+    {
+        success: boolean;
+    },
+    OPNetEvent<never>[]
+>;
 
 /**
  * @description Represents the result of the createSwap function call.
@@ -78,6 +99,7 @@ export type Refund = CallResult<
  */
 export type GetSwap = CallResult<
     {
+        tokenAddress: Address;
         hashLock: bigint;
         refundBlock: bigint;
         amount: bigint;
@@ -121,11 +143,34 @@ export type GetTotalEscrow = CallResult<
     OPNetEvent<never>[]
 >;
 
+/**
+ * @description Represents the result of the isListed function call.
+ */
+export type IsListed = CallResult<
+    {
+        listed: boolean;
+    },
+    OPNetEvent<never>[]
+>;
+
+/**
+ * @description Represents the result of the getTokenCount function call.
+ */
+export type GetTokenCount = CallResult<
+    {
+        count: bigint;
+    },
+    OPNetEvent<never>[]
+>;
+
 // ------------------------------------------------------------------
 // ISwapVault
 // ------------------------------------------------------------------
 export interface ISwapVault extends IOP_NETContract {
+    listToken(tokenAddress: Address): Promise<ListToken>;
+    delistToken(tokenAddress: Address): Promise<DelistToken>;
     createSwap(
+        tokenAddress: Address,
         hashLock: bigint,
         refundBlock: bigint,
         amount: bigint,
@@ -140,4 +185,6 @@ export interface ISwapVault extends IOP_NETContract {
     getActiveSwaps(): Promise<GetActiveSwaps>;
     getSwapCount(): Promise<GetSwapCount>;
     getTotalEscrow(): Promise<GetTotalEscrow>;
+    isListed(tokenAddress: Address): Promise<IsListed>;
+    getTokenCount(): Promise<GetTokenCount>;
 }

@@ -9,7 +9,7 @@
 import { type IncomingMessage, type Server } from 'node:http';
 import { timingSafeEqual } from 'node:crypto';
 import { WebSocketServer, WebSocket } from 'ws';
-import { type ISwapRecord, type IWsMessage, type IWsPreimageReady, type IWsClientMessage } from './types.js';
+import { type ISwapRecord, type IWsMessage, type IWsPreimageReady, type IWsClientMessage, type IWsQueueUpdate } from './types.js';
 import { StorageService } from './storage.js';
 
 const ALLOWED_ORIGIN = process.env['CORS_ORIGIN'] ?? 'http://localhost:5173';
@@ -158,6 +158,16 @@ export class SwapWebSocketServer {
         console.log(`[WebSocket] Preimage sent to ${sent} subscriber(s) for swap ${swapId}`);
     }
 
+    /**
+     * Broadcasts sweep queue position updates to all connected clients.
+     * @param positions - Current queue positions for all queued sweeps.
+     */
+    public broadcastQueueUpdate(positions: ReadonlyArray<{ readonly swapId: string; readonly position: number; readonly total: number }>): void {
+        const data: IWsQueueUpdate = { queue: positions };
+        const message: IWsMessage = { type: 'queue_update', data };
+        this.broadcast(message);
+    }
+
     /** Removes a queued preimage (e.g., after swap completes or expires). */
     public clearPendingPreimage(swapId: string): void {
         this.pendingPreimages.delete(swapId);
@@ -260,28 +270,27 @@ export class SwapWebSocketServer {
                     return;
                 }
 
-                // ALWAYS require claim_token. If swap has no token yet
-                // (not taken), reject — preimage subscriptions are only
-                // for the taker who received the token via POST /take.
-                if (!swap.claim_token || swap.claim_token.length === 0) {
-                    this.sendToClient(ws, { type: 'error', data: 'Swap has no claim token — not yet taken' });
-                    console.log(`[WebSocket] Rejected subscription for swap ${msg.swapId} — no claim_token set`);
-                    return;
-                }
-
-                if (!msg.claimToken || typeof msg.claimToken !== 'string') {
-                    this.sendToClient(ws, { type: 'error', data: 'claim_token required' });
-                    console.log(`[WebSocket] Rejected subscription for swap ${msg.swapId} — no token provided`);
-                    return;
-                }
-
-                // Timing-safe comparison to prevent timing attacks
-                const expected = new TextEncoder().encode(swap.claim_token);
-                const provided = new TextEncoder().encode(msg.claimToken);
-                if (expected.length !== provided.length || !timingSafeEqual(expected, provided)) {
-                    this.sendToClient(ws, { type: 'error', data: 'Invalid claim_token' });
-                    console.log(`[WebSocket] Rejected subscription for swap ${msg.swapId} — invalid claim_token`);
-                    return;
+                // Authenticate via claim_token.
+                // Check DB state FIRST to decide auth strategy:
+                if (swap.claim_token && swap.claim_token.length > 0) {
+                    // DB has a claim_token — require and verify it
+                    if (!msg.claimToken || typeof msg.claimToken !== 'string') {
+                        this.sendToClient(ws, { type: 'error', data: 'claim_token required' });
+                        console.log(`[WebSocket] Rejected subscription for swap ${msg.swapId} — no token provided`);
+                        return;
+                    }
+                    const expected = new TextEncoder().encode(swap.claim_token);
+                    const provided = new TextEncoder().encode(msg.claimToken);
+                    if (expected.length !== provided.length || !timingSafeEqual(expected, provided)) {
+                        this.sendToClient(ws, { type: 'error', data: 'Invalid claim_token' });
+                        console.log(`[WebSocket] Rejected subscription for swap ${msg.swapId} — invalid claim_token`);
+                        return;
+                    }
+                } else {
+                    // No claim_token in DB — allow subscription for any status.
+                    // Safe because: swap_update messages are already public (no secrets),
+                    // and preimage delivery is separately gated by the preimage queue.
+                    console.log(`[WebSocket] No claim_token for swap ${msg.swapId} — allowing subscription (status: ${swap.status})`);
                 }
 
                 let subs = this.subscriptions.get(msg.swapId);
