@@ -23,7 +23,8 @@ import {
     handleSubmitKeys,
     handleAdminUpdateSwap,
 } from './routes/swaps.js';
-import { type ISwapRecord, SwapStatus } from './types.js';
+import { type ISwapRecord, SwapStatus, type IUpdateSwapParams } from './types.js';
+import { SweepQueue, type SweepJob } from './sweep-queue.js';
 import {
     createMoneroService,
     notifyXmrConfirmed,
@@ -368,32 +369,25 @@ const MIN_BLOCKS_REMAINING_FOR_XMR_LOCK = 50;
  * @param currentBlockGetter - Function returning the latest known block number.
  */
 /**
- * Sweeps XMR from a completed swap's shared lock address.
- * Reconstructs the full spend key from Alice + Bob private keys,
- * then calls moneroService.sweepToFeeWallet() to collect fees.
- *
- * Runs async in the background — errors are logged but don't block the state machine.
+ * Builds a SweepJob from a completed swap record.
+ * Validates that all required key material is present.
+ * Returns null if the swap cannot be swept (logs warning).
  */
-async function sweepCompletedSwap(
+function buildSweepJob(
     swap: ISwapRecord,
     storage: StorageService,
-    moneroService: IMoneroService,
-): Promise<void> {
+): SweepJob | null {
     const swapId = swap.swap_id;
 
     if (!swap.xmr_address) {
         console.warn(`[Sweep] ${swapId}: no XMR lock address — skipping sweep`);
-        return;
+        return null;
     }
 
-    // We need both parties' private keys to reconstruct the full spend/view keys.
-    // preimage IS Alice's private spend key (in split-key mode).
-    // alice_view_key and bob_view_key are the private view key shares.
-    // bob_spend_key is Bob's private spend key (submitted with his key material).
     if (!swap.preimage || !swap.alice_view_key || !swap.bob_view_key) {
         console.warn(`[Sweep] ${swapId}: missing key material (preimage/view keys scrubbed?) — skipping sweep`);
         storage.updateSwap(swapId, { sweep_status: 'failed:missing_keys' });
-        return;
+        return null;
     }
 
     if (!swap.bob_spend_key) {
@@ -402,61 +396,31 @@ async function sweepCompletedSwap(
             `Manual sweep needed via monero-wallet-rpc CLI.`,
         );
         storage.updateSwap(swapId, { sweep_status: 'failed:no_bob_spend_key' });
-        return;
+        return null;
     }
 
-    // sweep_status already set to 'pending' by caller (onStateChange callback)
-    try {
-        // Reconstruct the combined private spend key: s = s_alice + s_bob (mod l)
-        const aliceSpendBytes = hexToBytes(swap.preimage);
-        const bobSpendBytes = hexToBytes(swap.bob_spend_key);
-        const combinedSpendKey = addEd25519Scalars(aliceSpendBytes, bobSpendBytes);
-        const combinedSpendHex = bytesToHex(combinedSpendKey);
+    // Reconstruct the combined private spend key: s = s_alice + s_bob (mod l)
+    const aliceSpendBytes = hexToBytes(swap.preimage);
+    const bobSpendBytes = hexToBytes(swap.bob_spend_key);
+    const combinedSpendKey = addEd25519Scalars(aliceSpendBytes, bobSpendBytes);
+    const combinedSpendHex = bytesToHex(combinedSpendKey);
 
-        // Reconstruct the combined private view key: v = v_alice + v_bob (mod l)
-        const aliceViewBytes = hexToBytes(swap.alice_view_key);
-        const bobViewBytes = hexToBytes(swap.bob_view_key);
-        const combinedViewKey = addEd25519Scalars(aliceViewBytes, bobViewBytes);
-        const combinedViewHex = bytesToHex(combinedViewKey);
+    // Reconstruct the combined private view key: v = v_alice + v_bob (mod l)
+    const aliceViewBytes = hexToBytes(swap.alice_view_key);
+    const bobViewBytes = hexToBytes(swap.bob_view_key);
+    const combinedViewKey = addEd25519Scalars(aliceViewBytes, bobViewBytes);
+    const combinedViewHex = bytesToHex(combinedViewKey);
 
-        const aliceAmountPiconero = BigInt(swap.xmr_amount);
-        const aliceAddress = swap.alice_xmr_payout ?? undefined;
-        const result = await moneroService.sweepToFeeWallet(
-            swapId,
-            combinedSpendHex,
-            combinedViewHex,
-            swap.xmr_address,
-            aliceAmountPiconero,
-            aliceAddress,
-        );
-
-        if (result.ok) {
-            console.log(
-                `[Sweep] ${swapId}: SUCCESS — txId=${result.txId?.slice(0, 16) ?? 'unknown'}, ` +
-                `fee=${result.feeAmount}, alice=${result.aliceAmount}`,
-            );
-            storage.updateSwap(swapId, {
-                sweep_status: `done:${result.txId ?? 'unknown'}`,
-            });
-            // Now that sweep succeeded, scrub sensitive key material from DB.
-            storage.updateSwap(swapId, {
-                preimage: null,
-                alice_view_key: null,
-                bob_view_key: null,
-                bob_spend_key: null,
-            } as import('./types.js').IUpdateSwapParams);
-            console.log(`[Sweep] ${swapId}: scrubbed key material after successful sweep`);
-        } else {
-            console.error(`[Sweep] ${swapId}: FAILED — ${result.error ?? 'unknown error'}`);
-            storage.updateSwap(swapId, {
-                sweep_status: `failed:${result.error ?? 'unknown'}`,
-            });
-        }
-    } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : 'Unknown error';
-        console.error(`[Sweep] ${swapId}: error — ${msg}`);
-        storage.updateSwap(swapId, { sweep_status: `failed:${msg}` });
-    }
+    return {
+        swapId,
+        sweepArgs: {
+            spendKeyHex: combinedSpendHex,
+            viewKeyHex: combinedViewHex,
+            lockAddress: swap.xmr_address,
+            aliceAmountPiconero: BigInt(swap.xmr_amount),
+            aliceAddress: swap.alice_xmr_payout ?? undefined,
+        },
+    };
 }
 
 /** Converts a hex string to Uint8Array. */
@@ -734,6 +698,56 @@ async function main(): Promise<void> {
 
     let wsServer: SwapWebSocketServer | null = null;
 
+    // Sweep queue — serializes wallet-rpc sweep operations
+    const sweepQueue = new SweepQueue(
+        async (job) => {
+            const { swapId, sweepArgs } = job;
+            try {
+                const result = await moneroService.sweepToFeeWallet(
+                    swapId,
+                    sweepArgs.spendKeyHex,
+                    sweepArgs.viewKeyHex,
+                    sweepArgs.lockAddress,
+                    sweepArgs.aliceAmountPiconero,
+                    sweepArgs.aliceAddress,
+                );
+
+                if (result.ok) {
+                    console.log(
+                        `[Sweep] ${swapId}: SUCCESS — txId=${result.txId?.slice(0, 16) ?? 'unknown'}, ` +
+                        `fee=${result.feeAmount}, alice=${result.aliceAmount}`,
+                    );
+                    storage.updateSwap(swapId, {
+                        sweep_status: `done:${result.txId ?? 'unknown'}`,
+                    });
+                    storage.updateSwap(swapId, {
+                        preimage: null,
+                        alice_view_key: null,
+                        bob_view_key: null,
+                        bob_spend_key: null,
+                    } as IUpdateSwapParams);
+                    console.log(`[Sweep] ${swapId}: scrubbed key material after successful sweep`);
+                } else {
+                    console.error(`[Sweep] ${swapId}: FAILED — ${result.error ?? 'unknown error'}`);
+                    storage.updateSwap(swapId, {
+                        sweep_status: `failed:${result.error ?? 'unknown'}`,
+                    });
+                }
+            } catch (err: unknown) {
+                const msg = err instanceof Error ? err.message : 'Unknown error';
+                console.error(`[Sweep] ${swapId}: error — ${msg}`);
+                storage.updateSwap(swapId, { sweep_status: `failed:${msg}` });
+            }
+
+            // Broadcast updated swap state after sweep completes
+            const updated = storage.getSwap(swapId);
+            if (updated) wsServer?.broadcastSwapUpdate(updated);
+        },
+        (positions) => {
+            wsServer?.broadcastQueueUpdate(positions);
+        },
+    );
+
     stateMachine.onStateChange((swap: ISwapRecord, from: SwapStatus, to: SwapStatus) => {
         console.log(`[StateMachine] ${swap.swap_id}: ${from} → ${to}`);
         wsServer?.broadcastSwapUpdate(swap);
@@ -748,14 +762,12 @@ async function main(): Promise<void> {
             // On COMPLETED trustless swaps: auto-sweep XMR to Alice + fee wallet.
             // Keys must remain in DB until sweep succeeds (retries read from DB).
             if (to === SwapStatus.COMPLETED && swap.trustless_mode === 1) {
-                storage.updateSwap(swap.swap_id, { sweep_status: 'pending', claim_token: null } as import('./types.js').IUpdateSwapParams);
-                console.log(`[Sweep] ${swap.swap_id}: auto-sweeping XMR to Alice + fee wallet`);
+                storage.updateSwap(swap.swap_id, { sweep_status: 'pending', claim_token: null } as IUpdateSwapParams);
+                console.log(`[Sweep] ${swap.swap_id}: enqueuing XMR sweep to Alice + fee wallet`);
                 const freshSwap = storage.getSwap(swap.swap_id);
                 if (freshSwap) {
-                    void sweepCompletedSwap(freshSwap, storage, moneroService).then(() => {
-                        const updated = storage.getSwap(swap.swap_id);
-                        if (updated) wsServer?.broadcastSwapUpdate(updated);
-                    });
+                    const job = buildSweepJob(freshSwap, storage);
+                    if (job) sweepQueue.enqueue(job);
                 }
             } else {
                 // Non-trustless or non-COMPLETED: scrub all sensitive data immediately
@@ -846,7 +858,7 @@ async function main(): Promise<void> {
                     notFound(res);
                     break;
                 }
-                handleGetSwap(req, res, storage, id);
+                handleGetSwap(req, res, storage, id, (swapId) => sweepQueue.getPosition(swapId));
                 break;
             }
 
@@ -1002,18 +1014,19 @@ async function main(): Promise<void> {
                     res.end(JSON.stringify({ success: false, data: null, error: { code: 'IN_PROGRESS', message: 'XMR claim is already in progress', retryable: true } }));
                     break;
                 }
-                // Start the sweep
+                // Start the sweep via queue
                 storage.updateSwap(id, { sweep_status: 'pending' });
-                res.writeHead(200, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: true, data: { message: 'XMR claim initiated' } }));
-                // Re-read swap for latest data and run sweep async
                 const freshSwap = storage.getSwap(id);
-                if (freshSwap) {
-                    void sweepCompletedSwap(freshSwap, storage, moneroService).then(() => {
-                        const updated = storage.getSwap(id);
-                        if (updated) wsServer?.broadcastSwapUpdate(updated);
-                    });
+                const job = freshSwap ? buildSweepJob(freshSwap, storage) : null;
+                if (job) {
+                    sweepQueue.enqueue(job);
                 }
+                const queuePos = sweepQueue.getPosition(id);
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: true, data: {
+                    message: 'XMR claim initiated',
+                    ...(queuePos ? { sweepQueuePosition: queuePos.position, sweepQueueTotal: queuePos.total } : {}),
+                } }));
                 break;
             }
 
@@ -1055,7 +1068,7 @@ async function main(): Promise<void> {
         server.on('error', reject);
     });
 
-    recoverInterruptedSwaps(storage, stateMachine, moneroService, wsServer, () => watcher.getCurrentBlock());
+    recoverInterruptedSwaps(storage, stateMachine, moneroService, wsServer, () => watcher.getCurrentBlock(), sweepQueue);
 
     watcher.start();
 
@@ -1120,10 +1133,11 @@ async function main(): Promise<void> {
     const sweepRetryTimer = setInterval(() => {
         const failed = storage.getFailedSweeps();
         if (failed.length > 0) {
-            console.log(`[Sweep Retry] Found ${failed.length} failed sweep(s) — retrying`);
+            console.log(`[Sweep Retry] Found ${failed.length} failed sweep(s) — enqueuing`);
             for (const swap of failed) {
                 if (swap.trustless_mode === 1) {
-                    void sweepCompletedSwap(swap, storage, moneroService);
+                    const job = buildSweepJob(swap, storage);
+                    if (job) sweepQueue.enqueue(job);
                 }
             }
         }
@@ -1153,6 +1167,7 @@ function recoverInterruptedSwaps(
     moneroService: IMoneroService,
     wsServer: SwapWebSocketServer,
     currentBlockGetter: () => bigint,
+    sweepQueue: SweepQueue,
 ): void {
     const interrupted = storage.listInterruptedSwaps();
     if (interrupted.length === 0) {
@@ -1233,13 +1248,14 @@ function recoverInterruptedSwaps(
         }
     }
 
-    // Retry failed sweeps on startup
+    // Retry failed sweeps on startup via queue
     const failedSweeps = storage.getFailedSweeps();
     if (failedSweeps.length > 0) {
-        console.log(`[Recovery] Found ${failedSweeps.length} failed sweep(s) — retrying`);
+        console.log(`[Recovery] Found ${failedSweeps.length} failed sweep(s) — enqueuing`);
         for (const swap of failedSweeps) {
             if (swap.trustless_mode === 1) {
-                void sweepCompletedSwap(swap, storage, moneroService);
+                const job = buildSweepJob(swap, storage);
+                if (job) sweepQueue.enqueue(job);
             }
         }
     }

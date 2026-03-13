@@ -96,7 +96,7 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
 
     // WebSocket connection for real-time preimage delivery (authenticated)
     // Pass hashLock so received preimages are verified before acceptance
-    const { preimage: wsPreimage } = useCoordinatorWs(swapId.toString(), claimToken, localSecret?.hashLock ?? null);
+    const { preimage: wsPreimage, queuePosition } = useCoordinatorWs(swapId.toString(), claimToken, localSecret?.hashLock ?? null);
 
     // Combined preimage: prefer local secret, fall back to WebSocket preimage
     const claimablePreimage = localSecret?.secret ?? wsPreimage;
@@ -1028,7 +1028,7 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
             )}
 
             {/* Auto XMR Sweep Status */}
-            {(isAlice || isDepositor) && (xmrClaimDone || xmrClaimPending || coordinatorStatus?.sweepStatus?.startsWith('failed:')) && (
+            {(isAlice || isDepositor) && (xmrClaimDone || xmrClaimPending || coordinatorStatus?.sweepStatus?.startsWith('failed:') || queuePosition !== null) && (
                 <div
                     style={{
                         padding: '14px 18px',
@@ -1056,7 +1056,11 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
                             ? 'XMR has been sent to your Monero wallet. It may take a few minutes to appear.'
                             : coordinatorStatus?.sweepStatus?.startsWith('failed:')
                                 ? 'XMR sweep failed. The coordinator will automatically retry every 5 minutes.'
-                                : 'XMR is being automatically sent to your Monero wallet...'}
+                                : queuePosition !== null && queuePosition.position === 1
+                                    ? 'Your XMR sweep is processing now...'
+                                    : queuePosition !== null && queuePosition.position > 1
+                                        ? `Your XMR is being processed — Position #${queuePosition.position} of ${queuePosition.total} in queue`
+                                        : 'XMR is being automatically sent to your Monero wallet...'}
                     </p>
                 </div>
             )}

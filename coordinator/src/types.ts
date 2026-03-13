@@ -218,10 +218,15 @@ export interface IWsClientMessage {
     readonly claimToken?: string;
 }
 
+/** Queue position info broadcast via WebSocket. */
+export interface IWsQueueUpdate {
+    readonly queue: ReadonlyArray<{ readonly swapId: string; readonly position: number; readonly total: number }>;
+}
+
 /** WebSocket message shape. */
 export interface IWsMessage {
-    readonly type: 'swap_update' | 'active_swaps' | 'error' | 'preimage_ready';
-    readonly data: ISwapRecord | ISwapRecord[] | string | IWsPreimageReady;
+    readonly type: 'swap_update' | 'active_swaps' | 'error' | 'preimage_ready' | 'queue_update';
+    readonly data: ISwapRecord | ISwapRecord[] | string | IWsPreimageReady | IWsQueueUpdate;
 }
 
 /** Structured API response wrapper. */

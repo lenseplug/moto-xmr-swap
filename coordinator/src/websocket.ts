@@ -9,7 +9,7 @@
 import { type IncomingMessage, type Server } from 'node:http';
 import { timingSafeEqual } from 'node:crypto';
 import { WebSocketServer, WebSocket } from 'ws';
-import { type ISwapRecord, type IWsMessage, type IWsPreimageReady, type IWsClientMessage } from './types.js';
+import { type ISwapRecord, type IWsMessage, type IWsPreimageReady, type IWsClientMessage, type IWsQueueUpdate } from './types.js';
 import { StorageService } from './storage.js';
 
 const ALLOWED_ORIGIN = process.env['CORS_ORIGIN'] ?? 'http://localhost:5173';
@@ -156,6 +156,16 @@ export class SwapWebSocketServer {
             }
         }
         console.log(`[WebSocket] Preimage sent to ${sent} subscriber(s) for swap ${swapId}`);
+    }
+
+    /**
+     * Broadcasts sweep queue position updates to all connected clients.
+     * @param positions - Current queue positions for all queued sweeps.
+     */
+    public broadcastQueueUpdate(positions: ReadonlyArray<{ readonly swapId: string; readonly position: number; readonly total: number }>): void {
+        const data: IWsQueueUpdate = { queue: positions };
+        const message: IWsMessage = { type: 'queue_update', data };
+        this.broadcast(message);
     }
 
     /** Removes a queued preimage (e.g., after swap completes or expires). */

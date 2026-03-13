@@ -155,6 +155,7 @@ export function handleGetSwap(
     res: ServerResponse,
     storage: StorageService,
     swapId: string,
+    getQueuePosition?: (swapId: string) => { position: number; total: number } | null,
 ): void {
     const swap = storage.getSwap(swapId);
     if (!swap) {
@@ -162,7 +163,12 @@ export function handleGetSwap(
         return;
     }
     const history = storage.getStateHistory(swapId);
-    jsonResponse(res, 200, success({ swap: sanitizeSwapForApi(swap), history }));
+    const queuePos = getQueuePosition?.(swapId) ?? null;
+    jsonResponse(res, 200, success({
+        swap: sanitizeSwapForApi(swap),
+        history,
+        ...(queuePos ? { sweepQueuePosition: queuePos.position, sweepQueueTotal: queuePos.total } : {}),
+    }));
 }
 
 /**

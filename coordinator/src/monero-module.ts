@@ -242,6 +242,8 @@ export interface ISweepResult {
 
 /** Service interface for Monero wallet operations. */
 export interface IMoneroService {
+    /** Whether a sweep is currently in progress (wallet-rpc exclusivity). */
+    readonly sweepActive: boolean;
     createLockAddress(swapId: string): Promise<ILockAddressResult>;
     startMonitoring(
         swapId: string,
@@ -307,9 +309,20 @@ const XMR_MOCK_CONFIRM_DELAY_MS = parseInt(
     10,
 );
 
+/** Artificial delay for mock sweeps (ms). Set via XMR_MOCK_SWEEP_DELAY_MS env. */
+const XMR_MOCK_SWEEP_DELAY_MS = parseInt(
+    process.env['XMR_MOCK_SWEEP_DELAY_MS'] ?? '500',
+    10,
+);
+
 export class MockMoneroService implements IMoneroService {
     private readonly timers = new Map<string, NodeJS.Timeout[]>();
     private counter = 0;
+    private _sweepActive = false;
+
+    public get sweepActive(): boolean {
+        return this._sweepActive;
+    }
 
     public createLockAddress(swapId: string): Promise<ILockAddressResult> {
         this.counter++;
@@ -404,7 +417,7 @@ export class MockMoneroService implements IMoneroService {
         return Promise.resolve({ ok: true, txId: fakeTxId, error: null });
     }
 
-    public sweepToFeeWallet(
+    public async sweepToFeeWallet(
         swapId: string,
         _spendKeyHex: string,
         _viewKeyHex: string,
@@ -412,17 +425,26 @@ export class MockMoneroService implements IMoneroService {
         aliceAmountPiconero: bigint,
         aliceAddress?: string,
     ): Promise<ISweepResult> {
-        const fakeTxId = randomBytes(32).toString('hex');
-        console.log(
-            `[MockMonero] sweepToFeeWallet(${swapId}): alice=${aliceAmountPiconero} piconero → ${aliceAddress ?? 'fee wallet'} (fakeTx: ${fakeTxId.slice(0, 16)}...)`,
-        );
-        return Promise.resolve({
-            ok: true,
-            txId: fakeTxId,
-            feeAmount: '(simulated)',
-            aliceAmount: aliceAmountPiconero.toString(),
-            error: null,
-        });
+        this._sweepActive = true;
+        try {
+            const fakeTxId = randomBytes(32).toString('hex');
+            console.log(
+                `[MockMonero] sweepToFeeWallet(${swapId}): alice=${aliceAmountPiconero} piconero → ${aliceAddress ?? 'fee wallet'} (fakeTx: ${fakeTxId.slice(0, 16)}...)`,
+            );
+            // Artificial delay for queue testing
+            if (XMR_MOCK_SWEEP_DELAY_MS > 0) {
+                await new Promise((r) => setTimeout(r, XMR_MOCK_SWEEP_DELAY_MS));
+            }
+            return {
+                ok: true,
+                txId: fakeTxId,
+                feeAmount: '(simulated)',
+                aliceAmount: aliceAmountPiconero.toString(),
+                error: null,
+            };
+        } finally {
+            this._sweepActive = false;
+        }
     }
 }
 
@@ -460,8 +482,12 @@ export class RealMoneroService implements IMoneroService {
     /** Maps swapId → subaddress index for filtering incoming transfers. */
     private readonly subaddrIndices = new Map<string, number>();
 
-    /** Mutex to prevent concurrent sweeps competing for wallet-rpc. */
-    private sweepInProgress = false;
+    /** Whether a sweep is currently active (wallet-rpc exclusivity). */
+    private _sweepActive = false;
+
+    public get sweepActive(): boolean {
+        return this._sweepActive;
+    }
 
     public constructor() {
         this.rpcUrl = process.env['XMR_WALLET_RPC_URL'] ?? 'http://localhost:18082/json_rpc';
@@ -625,7 +651,7 @@ export class RealMoneroService implements IMoneroService {
 
             return async (info: { viewKeyHex: string; restoreHeight?: number }): Promise<void> => {
                 // Skip if a sweep or another poll is in progress
-                if (this.sweepInProgress || pollInFlight) return;
+                if (this._sweepActive || pollInFlight) return;
                 pollInFlight = true;
 
                 try {
@@ -933,16 +959,12 @@ export class RealMoneroService implements IMoneroService {
         aliceAmountPiconero: bigint,
         aliceAddress?: string,
     ): Promise<ISweepResult> {
-        // Prevent concurrent sweeps — wallet-rpc only handles one wallet at a time
-        if (this.sweepInProgress) {
-            console.log(`[RealMonero] sweep(${swapId}): another sweep in progress — skipping`);
-            return { ok: false, txId: null, feeAmount: '0', aliceAmount: '0', error: 'Another sweep in progress — will retry' };
-        }
-        this.sweepInProgress = true;
+        // Queue handles serialization now — flag only used for split-key poll gating
+        this._sweepActive = true;
         try {
             return await this.doSweep(swapId, spendKeyHex, viewKeyHex, lockAddress, aliceAmountPiconero, aliceAddress);
         } finally {
-            this.sweepInProgress = false;
+            this._sweepActive = false;
         }
     }
 

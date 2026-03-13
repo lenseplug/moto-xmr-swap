@@ -24,7 +24,7 @@ interface WsSwapData {
 }
 
 interface WsMessage {
-    readonly type: 'swap_update' | 'active_swaps' | 'preimage_ready' | 'error';
+    readonly type: 'swap_update' | 'active_swaps' | 'preimage_ready' | 'queue_update' | 'error';
     readonly data: unknown;
 }
 
@@ -33,10 +33,26 @@ interface PreimageReadyPayload {
     readonly preimage: string;
 }
 
+interface WsQueueEntry {
+    readonly swapId: string;
+    readonly position: number;
+    readonly total: number;
+}
+
+interface WsQueueUpdatePayload {
+    readonly queue: WsQueueEntry[];
+}
+
+export interface QueuePositionInfo {
+    readonly position: number;
+    readonly total: number;
+}
+
 export interface UseCoordinatorWsResult {
     readonly preimage: string | null;
     readonly latestUpdate: WsSwapData | null;
     readonly connected: boolean;
+    readonly queuePosition: QueuePositionInfo | null;
 }
 
 /**
@@ -71,6 +87,7 @@ export function useCoordinatorWs(swapId: string | null, claimToken?: string | nu
     const [preimage, setPreimage] = useState<string | null>(null);
     const [latestUpdate, setLatestUpdate] = useState<WsSwapData | null>(null);
     const [connected, setConnected] = useState(false);
+    const [queuePosition, setQueuePosition] = useState<QueuePositionInfo | null>(null);
     const wsRef = useRef<WebSocket | null>(null);
     const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const mountedRef = useRef(true);
@@ -132,6 +149,14 @@ export function useCoordinatorWs(swapId: string | null, claimToken?: string | nu
                             setLatestUpdate(data);
                         }
                     }
+
+                    if (msg.type === 'queue_update') {
+                        const payload = msg.data as WsQueueUpdatePayload;
+                        if (payload.queue && Array.isArray(payload.queue)) {
+                            const myEntry = payload.queue.find((e) => e.swapId === swapId);
+                            setQueuePosition(myEntry ? { position: myEntry.position, total: myEntry.total } : null);
+                        }
+                    }
                 } catch {
                     // Ignore malformed messages
                 }
@@ -175,5 +200,5 @@ export function useCoordinatorWs(swapId: string | null, claimToken?: string | nu
         };
     }, [connect]);
 
-    return { preimage, latestUpdate, connected };
+    return { preimage, latestUpdate, connected, queuePosition };
 }
