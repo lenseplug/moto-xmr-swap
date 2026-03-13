@@ -89,7 +89,7 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
     const localXmrPayout = localSecret?.aliceXmrPayout ?? undefined;
 
     // Debug: track secret submission status visibly
-    const [secretDebug, setSecretDebug] = useState<string>('checking...');
+    const [_secretDebug, setSecretDebug] = useState<string>('checking...');
 
     // Retrieve claim_token for authenticated WebSocket subscription
     const claimToken = getClaimToken(swapId.toString());

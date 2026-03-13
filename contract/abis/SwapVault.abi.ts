@@ -6,6 +6,7 @@ export const SwapVaultEvents = [
         values: [
             { name: 'swapId', type: ABIDataTypes.UINT256 },
             { name: 'depositor', type: ABIDataTypes.ADDRESS },
+            { name: 'tokenAddress', type: ABIDataTypes.ADDRESS },
             { name: 'hashLock', type: ABIDataTypes.UINT256 },
             { name: 'refundBlock', type: ABIDataTypes.UINT256 },
             { name: 'amount', type: ABIDataTypes.UINT256 },
@@ -45,8 +46,21 @@ export const SwapVaultEvents = [
 
 export const SwapVaultAbi = [
     {
+        name: 'listToken',
+        inputs: [{ name: 'tokenAddress', type: ABIDataTypes.ADDRESS }],
+        outputs: [{ name: 'success', type: ABIDataTypes.BOOL }],
+        type: BitcoinAbiTypes.Function,
+    },
+    {
+        name: 'delistToken',
+        inputs: [{ name: 'tokenAddress', type: ABIDataTypes.ADDRESS }],
+        outputs: [{ name: 'success', type: ABIDataTypes.BOOL }],
+        type: BitcoinAbiTypes.Function,
+    },
+    {
         name: 'createSwap',
         inputs: [
+            { name: 'tokenAddress', type: ABIDataTypes.ADDRESS },
             { name: 'hashLock', type: ABIDataTypes.UINT256 },
             { name: 'refundBlock', type: ABIDataTypes.UINT256 },
             { name: 'amount', type: ABIDataTypes.UINT256 },
@@ -82,6 +96,7 @@ export const SwapVaultAbi = [
         name: 'getSwap',
         inputs: [{ name: 'swapId', type: ABIDataTypes.UINT256 }],
         outputs: [
+            { name: 'tokenAddress', type: ABIDataTypes.ADDRESS },
             { name: 'hashLock', type: ABIDataTypes.UINT256 },
             { name: 'refundBlock', type: ABIDataTypes.UINT256 },
             { name: 'amount', type: ABIDataTypes.UINT256 },
@@ -110,6 +125,18 @@ export const SwapVaultAbi = [
         name: 'getTotalEscrow',
         inputs: [],
         outputs: [{ name: 'totalEscrow', type: ABIDataTypes.UINT256 }],
+        type: BitcoinAbiTypes.Function,
+    },
+    {
+        name: 'isListed',
+        inputs: [{ name: 'tokenAddress', type: ABIDataTypes.ADDRESS }],
+        outputs: [{ name: 'listed', type: ABIDataTypes.BOOL }],
+        type: BitcoinAbiTypes.Function,
+    },
+    {
+        name: 'getTokenCount',
+        inputs: [],
+        outputs: [{ name: 'count', type: ABIDataTypes.UINT256 }],
         type: BitcoinAbiTypes.Function,
     },
     ...SwapVaultEvents,

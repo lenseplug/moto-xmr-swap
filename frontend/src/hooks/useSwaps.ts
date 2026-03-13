@@ -73,9 +73,13 @@ export function useSwaps(): UseSwapsResult {
                     const counterpartyStr = typeof p.counterparty === 'object' && p.counterparty !== null
                         ? (p.counterparty as { toString(): string }).toString()
                         : String(p.counterparty);
+                    const tokenAddrStr = typeof p.tokenAddress === 'object' && p.tokenAddress !== null
+                        ? (p.tokenAddress as { toString(): string }).toString()
+                        : String(p.tokenAddress ?? '');
 
                     swapDataArr.push({
                         swapId: i,
+                        tokenAddress: tokenAddrStr,
                         hashLock: p.hashLock,
                         refundBlock: p.refundBlock,
                         amount: p.amount,
@@ -170,8 +174,13 @@ export function useSwap(swapId: bigint | null): {
                 ? (p.counterparty as { toString(): string }).toString()
                 : String(p.counterparty);
 
+            const tokenAddrStr = typeof p.tokenAddress === 'object' && p.tokenAddress !== null
+                ? (p.tokenAddress as { toString(): string }).toString()
+                : String(p.tokenAddress ?? '');
+
             const swapData: SwapData = {
                 swapId,
+                tokenAddress: tokenAddrStr,
                 hashLock: p.hashLock,
                 refundBlock: p.refundBlock,
                 amount: p.amount,

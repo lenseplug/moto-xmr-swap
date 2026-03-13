@@ -1,5 +1,5 @@
 /**
- * Main application component for MOTO-XMR Atomic Swap.
+ * Main application component for OPNero — OP-20/XMR Private DEX.
  */
 import React, { useState, useEffect } from 'react';
 import { Header } from './components/Header';
@@ -84,7 +84,7 @@ export default function App(): React.ReactElement {
 
     return (
         <>
-            {/* Watermark logos */}
+            {/* Subtle background glow elements */}
             <div
                 style={{
                     position: 'fixed',
@@ -95,32 +95,27 @@ export default function App(): React.ReactElement {
                 }}
                 aria-hidden="true"
             >
-                <img
-                    src="/moto-logo.png"
-                    alt=""
+                {/* Top-center subtle orange glow */}
+                <div
                     style={{
                         position: 'absolute',
-                        top: '15%',
-                        left: '-5%',
-                        width: '45vw',
-                        maxWidth: '500px',
-                        opacity: 0.03,
-                        filter: 'blur(1px)',
-                        transform: 'rotate(-15deg)',
+                        top: '-20%',
+                        left: '50%',
+                        transform: 'translateX(-50%)',
+                        width: '60vw',
+                        height: '40vh',
+                        background: 'radial-gradient(ellipse, rgba(255, 107, 0, 0.04) 0%, transparent 70%)',
                     }}
                 />
-                <img
-                    src="/xmr-logo.png"
-                    alt=""
+                {/* Bottom-right violet glow */}
+                <div
                     style={{
                         position: 'absolute',
-                        bottom: '10%',
-                        right: '-5%',
-                        width: '40vw',
-                        maxWidth: '450px',
-                        opacity: 0.03,
-                        filter: 'blur(1px)',
-                        transform: 'rotate(12deg)',
+                        bottom: '-10%',
+                        right: '-10%',
+                        width: '50vw',
+                        height: '50vh',
+                        background: 'radial-gradient(ellipse, rgba(124, 58, 237, 0.03) 0%, transparent 70%)',
                     }}
                 />
             </div>
@@ -141,47 +136,64 @@ export default function App(): React.ReactElement {
                         display: 'flex',
                         alignItems: 'center',
                         justifyContent: 'center',
-                        gap: '16px',
+                        gap: '4px',
                         marginBottom: '8px',
                     }}
                 >
-                    <img
-                        src="/moto-logo.png"
-                        alt="MOTO"
-                        width={52}
-                        height={52}
-                        style={{ borderRadius: '50%', boxShadow: '0 0 20px rgba(196, 86, 255, 0.3)' }}
-                    />
                     <h1
                         style={{
-                            fontSize: 'clamp(1.8rem, 4vw, 2.8rem)',
+                            fontSize: 'clamp(2rem, 5vw, 3.2rem)',
                             fontWeight: 700,
-                            letterSpacing: '0.04em',
+                            letterSpacing: '0.03em',
                             lineHeight: 1.2,
+                            fontFamily: 'var(--font-display)',
                         }}
                     >
-                        <span style={{ color: '#c456ff' }}>MOTO</span>
-                        <span style={{ color: 'var(--color-text-muted)', margin: '0 12px' }}>&gt;</span>
-                        <span style={{ color: '#f26822' }}>XMR</span>
-                        <span style={{ color: 'var(--color-text-primary)', marginLeft: '12px' }}>SWAP</span>
+                        <span style={{ color: '#ff6b00' }}>OP</span>
+                        <span style={{ color: '#ffffff' }}>Nero</span>
                     </h1>
-                    <img
-                        src="/xmr-logo.png"
-                        alt="XMR"
-                        width={52}
-                        height={52}
-                        style={{ borderRadius: '50%', boxShadow: '0 0 20px rgba(242, 104, 34, 0.3)' }}
-                    />
                 </div>
                 <p
                     style={{
-                        color: 'var(--color-text-secondary)',
-                        fontSize: '0.9rem',
-                        marginTop: '8px',
+                        color: '#888899',
+                        fontSize: '0.95rem',
+                        marginTop: '4px',
+                        letterSpacing: '0.06em',
+                        fontWeight: 400,
                     }}
                 >
-                    Buy MOTO Anonymously
+                    Private cross-chain swaps between OP-20 tokens and Monero
                 </p>
+
+                {/* Stats strip */}
+                <div
+                    style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        gap: '24px',
+                        marginTop: '16px',
+                    }}
+                >
+                    <div
+                        style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '8px',
+                            padding: '6px 16px',
+                            background: 'rgba(255, 107, 0, 0.04)',
+                            border: '1px solid rgba(255, 107, 0, 0.10)',
+                            borderRadius: '999px',
+                        }}
+                    >
+                        <span style={{ fontSize: '0.75rem', color: '#555566', textTransform: 'uppercase', fontWeight: 600, letterSpacing: '0.06em' }}>
+                            Powered by
+                        </span>
+                        <span style={{ fontSize: '0.8rem', fontWeight: 700, color: '#ff6b00' }}>
+                            OPNet
+                        </span>
+                    </div>
+                </div>
             </div>
 
             <main
@@ -222,26 +234,91 @@ export default function App(): React.ReactElement {
                 )}
             </main>
 
-            {/* Powered by OPNET */}
-            <div
+            {/* Footer */}
+            <footer
                 style={{
-                    textAlign: 'center',
-                    padding: '40px 24px 16px',
+                    borderTop: '1px solid rgba(255, 107, 0, 0.06)',
+                    padding: '20px 24px',
+                    position: 'relative',
+                    zIndex: 1,
                 }}
             >
-                <p
+                <div
                     style={{
-                        fontSize: 'clamp(1.2rem, 2.5vw, 1.8rem)',
-                        fontWeight: 700,
-                        color: 'var(--color-text-primary)',
+                        maxWidth: '1200px',
+                        margin: '0 auto',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'space-between',
+                        flexWrap: 'wrap',
+                        gap: '12px',
                     }}
                 >
-                    Powered by{' '}
-                    <span style={{ color: 'var(--color-orange)' }}>OPNET</span>
-                </p>
-            </div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
+                        <a
+                            href="#"
+                            onClick={(e) => { e.preventDefault(); }}
+                            style={{
+                                fontSize: '0.8rem',
+                                color: '#555566',
+                                textDecoration: 'none',
+                                transition: 'color 150ms ease',
+                            }}
+                            onMouseEnter={(e) => { (e.currentTarget as HTMLAnchorElement).style.color = '#ff6b00'; }}
+                            onMouseLeave={(e) => { (e.currentTarget as HTMLAnchorElement).style.color = '#555566'; }}
+                        >
+                            Docs
+                        </a>
+                        <a
+                            href="https://github.com"
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            style={{
+                                fontSize: '0.8rem',
+                                color: '#555566',
+                                textDecoration: 'none',
+                                transition: 'color 150ms ease',
+                            }}
+                            onMouseEnter={(e) => { (e.currentTarget as HTMLAnchorElement).style.color = '#ff6b00'; }}
+                            onMouseLeave={(e) => { (e.currentTarget as HTMLAnchorElement).style.color = '#555566'; }}
+                        >
+                            GitHub
+                        </a>
+                        <a
+                            href="#"
+                            onClick={(e) => { e.preventDefault(); }}
+                            style={{
+                                fontSize: '0.8rem',
+                                color: '#555566',
+                                textDecoration: 'none',
+                                transition: 'color 150ms ease',
+                            }}
+                            onMouseEnter={(e) => { (e.currentTarget as HTMLAnchorElement).style.color = '#ff6b00'; }}
+                            onMouseLeave={(e) => { (e.currentTarget as HTMLAnchorElement).style.color = '#555566'; }}
+                        >
+                            Community
+                        </a>
+                    </div>
 
-            <footer style={{ padding: '24px' }} />
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                        <span style={{ fontSize: '0.75rem', color: '#555566' }}>
+                            Built with{' '}
+                            <span style={{ color: '#ff6b00', fontWeight: 600 }}>OPNet</span>
+                        </span>
+                        <span style={{ color: '#2a2a3a' }}>|</span>
+                        <span
+                            style={{
+                                fontSize: '0.75rem',
+                                fontFamily: 'var(--font-mono)',
+                                color: '#555566',
+                                fontWeight: 500,
+                            }}
+                        >
+                            opnero.xyz
+                        </span>
+                    </div>
+                </div>
+            </footer>
         </>
     );
 }

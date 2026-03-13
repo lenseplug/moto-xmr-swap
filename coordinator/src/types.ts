@@ -2,6 +2,15 @@
  * Shared types for the MOTO-XMR Coordinator.
  */
 
+/** Default MOTO token contract address. Used for backward compatibility. */
+export const DEFAULT_TOKEN_ADDRESS = 'opt1sqzkx6wm5acawl9m6nay2mjsm6wagv7gazcgtczds';
+
+/** Default token symbol. */
+export const DEFAULT_TOKEN_SYMBOL = 'MOTO';
+
+/** Default token decimals. */
+export const DEFAULT_TOKEN_DECIMALS = 18;
+
 /** Swap fee in basis points (0.87% = 87 bps). Paid by the taker on the XMR side. */
 export const FEE_BPS = 87;
 
@@ -127,6 +136,14 @@ export interface ISwapRecord {
     readonly alice_xmr_payout: string | null;
     /** Sweep status: null = not attempted, 'pending' = queued, 'done' = swept, 'failed:reason' = error. */
     readonly sweep_status: string | null;
+    /** Token contract address (e.g. MOTO). Defaults to MOTO for backward compat. */
+    readonly token_address: string;
+    /** Token symbol (e.g. 'MOTO'). */
+    readonly token_symbol: string;
+    /** Token decimals (e.g. 18). */
+    readonly token_decimals: number;
+    /** Token-side amount in atomic units. Mirrors moto_amount for MOTO swaps. */
+    readonly token_amount: string;
     readonly created_at: string;
     readonly updated_at: string;
 }
@@ -144,6 +161,14 @@ export interface ICreateSwapParams {
     readonly depositor: string;
     readonly opnet_create_tx: string | null;
     readonly alice_xmr_payout: string | null;
+    /** Token contract address. Defaults to MOTO if not provided. */
+    readonly token_address: string;
+    /** Token symbol. Defaults to 'MOTO' if not provided. */
+    readonly token_symbol: string;
+    /** Token decimals. Defaults to 18 if not provided. */
+    readonly token_decimals: number;
+    /** Token-side amount in atomic units. Mirrors moto_amount for MOTO swaps. */
+    readonly token_amount: string;
 }
 
 /** Fields that can be updated on an existing swap. */
@@ -194,6 +219,8 @@ export interface IMonitorLockResult {
 /** On-chain swap data returned by the OPNet watcher. */
 export interface IOnChainSwap {
     readonly swapId: bigint;
+    /** Token contract address (new: first field in getSwap return). */
+    readonly tokenAddress: string;
     readonly hashLock: bigint;
     readonly refundBlock: bigint;
     readonly amount: bigint;
@@ -203,6 +230,18 @@ export interface IOnChainSwap {
     readonly status: bigint;
     readonly xmrAddressHi: bigint;
     readonly xmrAddressLo: bigint;
+}
+
+/** A supported token record as stored in the tokens table. */
+export interface ITokenRecord {
+    readonly id: number;
+    readonly address: string;
+    readonly symbol: string;
+    readonly name: string;
+    readonly decimals: number;
+    readonly logo_url: string | null;
+    readonly is_active: boolean;
+    readonly created_at: string;
 }
 
 /** Preimage-ready WebSocket message payload. */

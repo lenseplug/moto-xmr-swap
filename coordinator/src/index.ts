@@ -23,6 +23,7 @@ import {
     handleSubmitKeys,
     handleAdminUpdateSwap,
 } from './routes/swaps.js';
+import { handleGetTokens, handleAddToken, handleDeactivateToken } from './routes/tokens.js';
 import { type ISwapRecord, SwapStatus, type IUpdateSwapParams } from './types.js';
 import { SweepQueue, type SweepJob } from './sweep-queue.js';
 import {
@@ -151,8 +152,8 @@ function addCorsHeaders(res: ServerResponse, req?: IncomingMessage): void {
         res.setHeader('Access-Control-Allow-Origin', requestOrigin);
     }
     res.setHeader('Vary', 'Origin');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Admin-Key');
     res.setHeader('Access-Control-Max-Age', '86400');
     // Security headers
     res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains; preload');
@@ -195,6 +196,15 @@ function matchRoute(
 
     if (pathname === '/api/fee-address' && method === 'PUT') {
         return { route: 'set_fee_address', params: {} };
+    }
+
+    // Token management
+    if (pathname === '/api/tokens' && method === 'GET') {
+        return { route: 'list_tokens', params: {} };
+    }
+
+    if (pathname === '/api/tokens' && method === 'POST') {
+        return { route: 'add_token', params: {} };
     }
 
     const part0 = parts[0];
@@ -279,6 +289,17 @@ function matchRoute(
         part3 !== undefined
     ) {
         return { route: 'admin_update_swap', params: { id: part3 } };
+    }
+
+    // DELETE /api/tokens/:address — deactivate a token (admin)
+    if (
+        parts.length === 3 &&
+        part0 === 'api' &&
+        part1 === 'tokens' &&
+        method === 'DELETE' &&
+        part2 !== undefined
+    ) {
+        return { route: 'deactivate_token', params: { address: part2 } };
     }
 
     return null;
@@ -836,6 +857,35 @@ async function main(): Promise<void> {
                     serverError(res, msg);
                 });
                 break;
+
+            case 'list_tokens':
+                handleGetTokens(req, res, storage);
+                break;
+
+            case 'add_token':
+                if (!isAdminAuthorized(req)) {
+                    unauthorized(res);
+                    break;
+                }
+                handleAddToken(req, res, storage).catch((err: unknown) => {
+                    const msg = err instanceof Error ? err.message : 'Unknown error';
+                    serverError(res, msg);
+                });
+                break;
+
+            case 'deactivate_token': {
+                const addr = match.params['address'];
+                if (!addr) {
+                    notFound(res);
+                    break;
+                }
+                if (!isAdminAuthorized(req)) {
+                    unauthorized(res);
+                    break;
+                }
+                handleDeactivateToken(req, res, storage, addr);
+                break;
+            }
 
             case 'get_fee_address':
                 handleGetFeeAddress(req, res);

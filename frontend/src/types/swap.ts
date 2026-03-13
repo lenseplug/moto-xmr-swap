@@ -1,4 +1,15 @@
 /**
+ * Token record from the coordinator API.
+ */
+export interface ITokenRecord {
+    readonly address: string;
+    readonly symbol: string;
+    readonly name: string;
+    readonly decimals: number;
+    readonly listed: boolean;
+}
+
+/**
  * Swap status enum matching contract values.
  * 0 = OPEN, 1 = TAKEN, 2 = CLAIMED, 3 = REFUNDED
  */
@@ -26,6 +37,7 @@ export const SWAP_STATUS_LABELS: Record<string, string> = {
  */
 export interface SwapData {
     readonly swapId: bigint;
+    readonly tokenAddress: string;
     readonly hashLock: bigint;
     readonly refundBlock: bigint;
     readonly amount: bigint;
@@ -35,13 +47,17 @@ export interface SwapData {
     readonly status: bigint;
     readonly xmrAddressHi: bigint;
     readonly xmrAddressLo: bigint;
+    /** Token symbol for display (resolved from coordinator token list). */
+    readonly tokenSymbol?: string;
+    /** Token decimals for formatting (defaults to 18 if unknown). */
+    readonly tokenDecimals?: number;
 }
 
 /**
  * Extended swap data with computed display fields.
  */
 export interface SwapDisplayData extends SwapData {
-    readonly motoAmount: string;
+    readonly displayAmount: string;
     readonly xmrDisplayAmount: string;
     readonly statusLabel: string;
     readonly xmrAddress: string;
@@ -53,6 +69,7 @@ export interface SwapDisplayData extends SwapData {
  * Parameters for creating a new swap.
  */
 export interface CreateSwapParams {
+    readonly tokenAddress: string;
     readonly hashLock: bigint;
     readonly refundBlock: bigint;
     readonly amount: bigint;
@@ -145,7 +162,7 @@ export interface CoordinatorHealth {
 /**
  * Sort field for order book.
  */
-export type SortField = 'motoAmount' | 'xmrAmount' | 'rate' | 'blocksRemaining';
+export type SortField = 'tokenAmount' | 'xmrAmount' | 'rate' | 'blocksRemaining';
 export type SortDirection = 'asc' | 'desc';
 
 export interface SortState {

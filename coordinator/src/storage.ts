@@ -10,9 +10,13 @@ import {
     type ICreateSwapParams,
     type IStateHistoryEntry,
     type ISwapRecord,
+    type ITokenRecord,
     type IUpdateSwapParams,
     SwapStatus,
     SETTLED_STATES,
+    DEFAULT_TOKEN_ADDRESS,
+    DEFAULT_TOKEN_SYMBOL,
+    DEFAULT_TOKEN_DECIMALS,
 } from './types.js';
 import { encryptIfPresent, decryptIfPresent } from './encryption.js';
 
@@ -63,9 +67,29 @@ CREATE TABLE IF NOT EXISTS state_history (
 );
 `;
 
+const CREATE_TOKENS_TABLE = `
+CREATE TABLE IF NOT EXISTS tokens (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    address TEXT UNIQUE NOT NULL,
+    symbol TEXT NOT NULL,
+    name TEXT NOT NULL,
+    decimals INTEGER NOT NULL DEFAULT 18,
+    logo_url TEXT,
+    is_active BOOLEAN NOT NULL DEFAULT 1,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+`;
+
+const SEED_MOTO_TOKEN = `
+INSERT OR IGNORE INTO tokens (address, symbol, name, decimals)
+VALUES ('opt1sqzkx6wm5acawl9m6nay2mjsm6wagv7gazcgtczds', 'MOTO', 'MOTO', 18);
+`;
+
 const CREATE_INDEXES = `
 CREATE INDEX IF NOT EXISTS idx_swaps_status ON swaps (status);
 CREATE INDEX IF NOT EXISTS idx_history_swap_id ON state_history (swap_id);
+CREATE INDEX IF NOT EXISTS idx_swaps_token_address ON swaps (token_address);
+CREATE INDEX IF NOT EXISTS idx_tokens_symbol ON tokens (symbol);
 `;
 
 /** Row returned from a sql.js query — values are positional. */
@@ -139,8 +163,8 @@ export class StorageService {
     public createSwap(params: ICreateSwapParams): ISwapRecord {
         this.exec(
             `INSERT INTO swaps
-                (swap_id, hash_lock, refund_block, moto_amount, xmr_amount, xmr_fee, xmr_total, xmr_address, depositor, opnet_create_tx, alice_xmr_payout)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                (swap_id, hash_lock, refund_block, moto_amount, xmr_amount, xmr_fee, xmr_total, xmr_address, depositor, opnet_create_tx, alice_xmr_payout, token_address, token_symbol, token_decimals, token_amount)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             [
                 params.swap_id,
                 params.hash_lock,
@@ -153,6 +177,10 @@ export class StorageService {
                 params.depositor,
                 params.opnet_create_tx ?? null,
                 params.alice_xmr_payout ?? null,
+                params.token_address,
+                params.token_symbol,
+                params.token_decimals,
+                params.token_amount,
             ],
         );
         this.scheduleSave();
@@ -347,6 +375,109 @@ export class StorageService {
         return rows as unknown as ISwapRecord[];
     }
 
+    // -----------------------------------------------------------------------
+    // Token CRUD
+    // -----------------------------------------------------------------------
+
+    /**
+     * Returns all active tokens.
+     */
+    public getTokens(): ITokenRecord[] {
+        const rows = this.query('SELECT * FROM tokens WHERE is_active = 1 ORDER BY symbol ASC');
+        return rows as unknown as ITokenRecord[];
+    }
+
+    /**
+     * Returns a token by its contract address, or null if not found.
+     * @param address - The token contract address.
+     */
+    public getToken(address: string): ITokenRecord | null {
+        const rows = this.query('SELECT * FROM tokens WHERE address = ?', [address]);
+        if (rows.length === 0) return null;
+        return rows[0] as unknown as ITokenRecord;
+    }
+
+    /**
+     * Returns a token by its symbol, or null if not found.
+     * @param symbol - The token symbol (case-insensitive).
+     */
+    public getTokenBySymbol(symbol: string): ITokenRecord | null {
+        const rows = this.query('SELECT * FROM tokens WHERE UPPER(symbol) = UPPER(?) AND is_active = 1', [symbol]);
+        if (rows.length === 0) return null;
+        return rows[0] as unknown as ITokenRecord;
+    }
+
+    /**
+     * Adds a new supported token. Returns the created record.
+     * @param address - Token contract address.
+     * @param symbol - Token symbol (e.g. 'MOTO').
+     * @param name - Human-readable token name.
+     * @param decimals - Token decimals (default 18).
+     * @param logoUrl - Optional logo URL.
+     */
+    public addToken(
+        address: string,
+        symbol: string,
+        name: string,
+        decimals = 18,
+        logoUrl: string | null = null,
+    ): ITokenRecord {
+        this.exec(
+            'INSERT INTO tokens (address, symbol, name, decimals, logo_url) VALUES (?, ?, ?, ?, ?)',
+            [address, symbol, name, decimals, logoUrl],
+        );
+        this.scheduleSave();
+        const created = this.getToken(address);
+        if (!created) {
+            throw new Error(`Failed to retrieve token after creation: ${address}`);
+        }
+        return created;
+    }
+
+    /**
+     * Deactivates a token by its contract address.
+     * @param address - The token contract address.
+     * @returns true if the token was found and deactivated.
+     */
+    public deactivateToken(address: string): boolean {
+        const existing = this.getToken(address);
+        if (!existing) return false;
+        this.exec('UPDATE tokens SET is_active = 0 WHERE address = ?', [address]);
+        this.scheduleSave();
+        return true;
+    }
+
+    /**
+     * Returns a paginated list of swaps filtered by token.
+     * @param page - 1-based page number.
+     * @param limit - Items per page.
+     * @param tokenAddress - Optional token contract address to filter by.
+     * @param tokenSymbol - Optional token symbol to filter by (case-insensitive).
+     */
+    public listSwapsFiltered(
+        page: number,
+        limit: number,
+        tokenAddress?: string,
+        tokenSymbol?: string,
+    ): ISwapRecord[] {
+        const offset = (page - 1) * limit;
+        if (tokenAddress) {
+            const rows = this.query(
+                'SELECT * FROM swaps WHERE token_address = ? ORDER BY created_at DESC LIMIT ? OFFSET ?',
+                [tokenAddress, limit, offset],
+            );
+            return rows as unknown as ISwapRecord[];
+        }
+        if (tokenSymbol) {
+            const rows = this.query(
+                'SELECT * FROM swaps WHERE UPPER(token_symbol) = UPPER(?) ORDER BY created_at DESC LIMIT ? OFFSET ?',
+                [tokenSymbol, limit, offset],
+            );
+            return rows as unknown as ISwapRecord[];
+        }
+        return this.listSwaps(page, limit);
+    }
+
     /**
      * Returns state history for a swap ordered by timestamp ascending.
      * @param swapId - The swap identifier.
@@ -371,6 +502,8 @@ export class StorageService {
 
         this.exec(CREATE_SWAPS_TABLE);
         this.exec(CREATE_STATE_HISTORY_TABLE);
+        this.exec(CREATE_TOKENS_TABLE);
+        this.exec(SEED_MOTO_TOKEN);
         this.exec(CREATE_INDEXES);
 
         // Migrations: add columns if missing (existing DBs)
@@ -386,6 +519,14 @@ export class StorageService {
         this.migrateAddColumn('swaps', 'bob_spend_key', 'TEXT');
         this.migrateAddColumn('swaps', 'alice_xmr_payout', 'TEXT');
         this.migrateAddColumn('swaps', 'sweep_status', 'TEXT');
+
+        // Multi-token migration: add token columns to swaps table
+        this.migrateAddColumnWithDefault('swaps', 'token_address', 'TEXT', `'${DEFAULT_TOKEN_ADDRESS}'`);
+        this.migrateAddColumnWithDefault('swaps', 'token_symbol', 'TEXT', `'${DEFAULT_TOKEN_SYMBOL}'`);
+        this.migrateAddColumnWithDefault('swaps', 'token_decimals', 'INTEGER', `${DEFAULT_TOKEN_DECIMALS}`);
+        this.migrateAddColumn('swaps', 'token_amount', 'TEXT');
+        // Backfill token_amount from moto_amount for existing rows
+        this.exec('UPDATE swaps SET token_amount = moto_amount WHERE token_amount IS NULL');
 
         this.saveTimer = setInterval(() => {
             this.persistToDisk();

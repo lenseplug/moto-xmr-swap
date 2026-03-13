@@ -2,7 +2,7 @@
  * Coordinator REST client for XMR side of the atomic swap.
  * The coordinator handles Monero locking/unlocking off-chain.
  */
-import type { BobKeyMaterial, CoordinatorHealth, CoordinatorStatus } from '../types/swap';
+import type { BobKeyMaterial, CoordinatorHealth, CoordinatorStatus, ITokenRecord } from '../types/swap';
 
 const COORDINATOR_BASE = import.meta.env.VITE_COORDINATOR_URL;
 
@@ -26,6 +26,84 @@ export async function checkCoordinatorHealth(): Promise<CoordinatorHealth> {
         return (await res.json()) as CoordinatorHealth;
     } catch {
         return { status: 'error' };
+    }
+}
+
+/** Coordinator token list API response shape. */
+interface ICoordinatorTokenResponse {
+    readonly success: boolean;
+    readonly data: {
+        readonly tokens: ReadonlyArray<{
+            readonly address: string;
+            readonly symbol: string;
+            readonly name: string;
+            readonly decimals: number;
+            readonly listed: boolean;
+        }>;
+    } | null;
+}
+
+/**
+ * Fetches the list of supported tokens from the coordinator.
+ */
+export async function fetchTokens(): Promise<ITokenRecord[]> {
+    try {
+        const res = await fetch(`${COORDINATOR_BASE}/api/tokens`, {
+            signal: AbortSignal.timeout(10000),
+        });
+        if (!res.ok) return [];
+        const body = (await res.json()) as ICoordinatorTokenResponse;
+        if (!body.success || !body.data) return [];
+        return body.data.tokens.map((t) => ({
+            address: t.address,
+            symbol: t.symbol,
+            name: t.name,
+            decimals: t.decimals,
+            listed: t.listed,
+        }));
+    } catch {
+        return [];
+    }
+}
+
+/**
+ * Fetches active swaps from the coordinator, optionally filtered by token address.
+ *
+ * @param tokenFilter - Optional token address to filter swaps by
+ */
+export async function fetchSwaps(tokenFilter?: string): Promise<CoordinatorStatus[]> {
+    try {
+        const url = tokenFilter
+            ? `${COORDINATOR_BASE}/api/swaps?token=${encodeURIComponent(tokenFilter)}`
+            : `${COORDINATOR_BASE}/api/swaps`;
+        const res = await fetch(url, {
+            signal: AbortSignal.timeout(10000),
+        });
+        if (!res.ok) return [];
+        const body = (await res.json()) as ICoordinatorListResponse;
+        if (!body.success || !body.data) return [];
+
+        return body.data.swaps.map((swap) => {
+            const step = STATUS_TO_STEP[swap.status] ?? 'error';
+            return {
+                swapId: swap.swap_id,
+                step,
+                message: `Status: ${swap.status}`,
+                xmrTxId: swap.xmr_lock_tx ?? undefined,
+                xmrFee: swap.xmr_fee,
+                xmrTotal: swap.xmr_total,
+                xmrLockAddress: swap.xmr_address ?? undefined,
+                xmrLockConfirmations: swap.xmr_lock_confirmations,
+                trustlessMode: swap.trustless_mode === 1,
+                aliceEd25519Pub: swap.alice_ed25519_pub ?? undefined,
+                bobEd25519Pub: swap.bob_ed25519_pub ?? undefined,
+                sweepStatus: swap.sweep_status ?? undefined,
+                depositor: swap.depositor,
+                updatedAt: new Date(swap.updated_at).getTime(),
+            };
+        });
+    } catch {
+        return [];
     }
 }
 

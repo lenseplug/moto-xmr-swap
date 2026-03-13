@@ -1,11 +1,51 @@
 {
     "functions": [
         {
+            "name": "listToken",
+            "type": "Function",
+            "payable": false,
+            "onlyOwner": false,
+            "inputs": [
+                {
+                    "name": "tokenAddress",
+                    "type": "ADDRESS"
+                }
+            ],
+            "outputs": [
+                {
+                    "name": "success",
+                    "type": "BOOL"
+                }
+            ]
+        },
+        {
+            "name": "delistToken",
+            "type": "Function",
+            "payable": false,
+            "onlyOwner": false,
+            "inputs": [
+                {
+                    "name": "tokenAddress",
+                    "type": "ADDRESS"
+                }
+            ],
+            "outputs": [
+                {
+                    "name": "success",
+                    "type": "BOOL"
+                }
+            ]
+        },
+        {
             "name": "createSwap",
             "type": "Function",
             "payable": false,
             "onlyOwner": false,
             "inputs": [
+                {
+                    "name": "tokenAddress",
+                    "type": "ADDRESS"
+                },
                 {
                     "name": "hashLock",
                     "type": "UINT256"
@@ -109,6 +149,10 @@
             ],
             "outputs": [
                 {
+                    "name": "tokenAddress",
+                    "type": "ADDRESS"
+                },
+                {
                     "name": "hashLock",
                     "type": "UINT256"
                 },
@@ -184,6 +228,37 @@
                     "type": "UINT256"
                 }
             ]
+        },
+        {
+            "name": "isListed",
+            "type": "Function",
+            "payable": false,
+            "onlyOwner": false,
+            "inputs": [
+                {
+                    "name": "tokenAddress",
+                    "type": "ADDRESS"
+                }
+            ],
+            "outputs": [
+                {
+                    "name": "listed",
+                    "type": "BOOL"
+                }
+            ]
+        },
+        {
+            "name": "getTokenCount",
+            "type": "Function",
+            "payable": false,
+            "onlyOwner": false,
+            "inputs": [],
+            "outputs": [
+                {
+                    "name": "count",
+                    "type": "UINT256"
+                }
+            ]
         }
     ],
     "events": [
@@ -196,6 +271,10 @@
                 },
                 {
                     "name": "depositor",
+                    "type": "ADDRESS"
+                },
+                {
+                    "name": "tokenAddress",
                     "type": "ADDRESS"
                 },
                 {
