@@ -5,6 +5,7 @@ build/
 *.js.map
 .env
 .env.*
+!.env.example
 *.db
 coordinator/dist/
 coordinator/data/
