@@ -9,7 +9,7 @@
         "build:test": "tsc -p tsconfig.test.json",
         "typecheck": "tsc --noEmit",
         "lint": "eslint src/",
-        "start": "node dist/index.js",
+        "start": "node --env-file=.env dist/index.js",
         "dev": "node --watch dist/index.js",
         "test": "npm run build:test && node --test dist/tests/e2e.test.js",
         "test:fast": "node --test dist/tests/e2e.test.js",
