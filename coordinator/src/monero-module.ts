@@ -861,23 +861,29 @@ export class RealMoneroService implements IMoneroService {
             return `monero-wallet-rpc unreachable: ${msg}`;
         }
 
-        // Auto-open the coordinator wallet if XMR_WALLET_NAME is set
-        const walletName = process.env['XMR_WALLET_NAME'];
-        if (walletName) {
+        // Always check if a wallet is open, and open one if needed
+        const walletName = process.env['XMR_WALLET_NAME'] ?? '';
+        let walletOpen = false;
+        try {
+            await this.rpcCall('get_balance', { account_index: 0 });
+            console.log(`[RealMonero] healthCheck: wallet already open`);
+            walletOpen = true;
+        } catch {
+            console.log(`[RealMonero] healthCheck: no wallet open`);
+        }
+
+        if (!walletOpen) {
+            if (!walletName) {
+                return 'No wallet open and XMR_WALLET_NAME not set — cannot auto-open';
+            }
+            const walletPass = process.env['XMR_WALLET_PASS'] ?? '';
+            console.log(`[RealMonero] healthCheck: opening wallet '${walletName}'...`);
             try {
-                // Check if a wallet is already open by calling get_balance
-                await this.rpcCall('get_balance', { account_index: 0 });
-                console.log(`[RealMonero] healthCheck: wallet already open`);
-            } catch {
-                // No wallet open — open it
-                const walletPass = process.env['XMR_WALLET_PASS'] ?? '';
-                try {
-                    await this.rpcCall('open_wallet', { filename: walletName, password: walletPass });
-                    console.log(`[RealMonero] healthCheck: opened wallet '${walletName}'`);
-                } catch (err: unknown) {
-                    const msg = err instanceof Error ? err.message : 'Unknown error';
-                    return `Failed to open wallet '${walletName}': ${msg}`;
-                }
+                await this.rpcCall('open_wallet', { filename: walletName, password: walletPass });
+                console.log(`[RealMonero] healthCheck: opened wallet '${walletName}'`);
+            } catch (err: unknown) {
+                const msg = err instanceof Error ? err.message : 'Unknown error';
+                return `Failed to open wallet '${walletName}': ${msg}`;
             }
         }
 
