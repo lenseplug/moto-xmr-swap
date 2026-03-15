@@ -11,7 +11,7 @@ export type StateChangeCallback = (swap: ISwapRecord, from: SwapStatus, to: Swap
 const VALID_TRANSITIONS: ReadonlyMap<SwapStatus, ReadonlySet<SwapStatus>> = new Map([
     [
         SwapStatus.OPEN,
-        new Set([SwapStatus.TAKEN, SwapStatus.EXPIRED]),
+        new Set([SwapStatus.TAKEN, SwapStatus.EXPIRED, SwapStatus.REFUNDED]),
     ],
     [
         SwapStatus.TAKEN,
@@ -19,11 +19,11 @@ const VALID_TRANSITIONS: ReadonlyMap<SwapStatus, ReadonlySet<SwapStatus>> = new 
     ],
     [
         SwapStatus.XMR_LOCKING,
-        new Set([SwapStatus.XMR_LOCKED, SwapStatus.COMPLETED, SwapStatus.REFUNDED]),
+        new Set([SwapStatus.XMR_LOCKED, SwapStatus.COMPLETED, SwapStatus.REFUNDED, SwapStatus.EXPIRED]),
     ],
     [
         SwapStatus.XMR_LOCKED,
-        new Set([SwapStatus.MOTO_CLAIMING, SwapStatus.COMPLETED, SwapStatus.REFUNDED]),
+        new Set([SwapStatus.MOTO_CLAIMING, SwapStatus.COMPLETED, SwapStatus.REFUNDED, SwapStatus.EXPIRED]),
     ],
     [
         SwapStatus.MOTO_CLAIMING,

@@ -79,6 +79,7 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
     const [coordinatorStatus, setCoordinatorStatus] = useState<CoordinatorStatus | null>(null);
     const [claimStep, setClaimStep] = useState<'idle' | 'claiming' | 'done' | 'error'>('idle');
     const [refundStep, setRefundStep] = useState<'idle' | 'refunding' | 'done' | 'error'>('idle');
+    const [cancelStep, setCancelStep] = useState<'idle' | 'cancelling' | 'done' | 'error'>('idle');
     const [actionTxId, setActionTxId] = useState<string | null>(null);
     const [actionError, setActionError] = useState<string | null>(null);
 
@@ -378,6 +379,51 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
             setRefundStep('done');
         } catch (err) {
             setRefundStep('error');
+            setActionError(err instanceof Error ? err.message : 'Unknown error');
+        }
+    }, [isConnected, walletAddress, publicKey, senderAddress, swapId]);
+
+    const handleCancel = useCallback(async (): Promise<void> => {
+        if (!isConnected || !walletAddress || !publicKey || !senderAddress) {
+            setActionError('Connect your wallet first');
+            return;
+        }
+        if (!SWAP_VAULT_ADDRESS) {
+            setActionError('Contract address not configured');
+            return;
+        }
+
+        setCancelStep('cancelling');
+        setActionError(null);
+
+        try {
+            const contract = getSwapVaultContract(SWAP_VAULT_ADDRESS, senderAddress);
+
+            const sim = await contract.cancel(swapId);
+            if ('error' in sim) throw new Error(`Simulation failed: ${String(sim.error)}`);
+
+            const receipt = await sim.sendTransaction({
+                signer: null,
+                mldsaSigner: null,
+                refundTo: walletAddress,
+                maximumAllowedSatToSpend: 150_000n,
+                network: networks.opnetTestnet,
+            });
+
+            const receiptObj = receipt as unknown as Record<string, unknown>;
+            if ('error' in receiptObj) {
+                throw new Error(`Transaction failed: ${String(receiptObj['error'])}`);
+            }
+
+            const resultTxId =
+                typeof receiptObj['result'] === 'string'
+                    ? receiptObj['result']
+                    : 'pending';
+
+            setActionTxId(resultTxId);
+            setCancelStep('done');
+        } catch (err) {
+            setCancelStep('error');
             setActionError(err instanceof Error ? err.message : 'Unknown error');
         }
     }, [isConnected, walletAddress, publicKey, senderAddress, swapId]);
@@ -899,7 +945,7 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
                 </div>
             )}
 
-            {(claimStep === 'done' || refundStep === 'done') && actionTxId !== null && (
+            {(claimStep === 'done' || refundStep === 'done' || cancelStep === 'done') && actionTxId !== null && (
                 <div
                     style={{
                         padding: '16px',
@@ -910,7 +956,7 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
                     }}
                 >
                     <p style={{ fontWeight: 600, color: 'var(--color-text-success)', marginBottom: '8px' }}>
-                        {claimStep === 'done' ? 'Claim Submitted' : 'Refund Submitted'}
+                        {claimStep === 'done' ? 'Claim Submitted' : cancelStep === 'done' ? 'Cancel Submitted' : 'Refund Submitted'}
                     </p>
                     <ExplorerLinks txId={actionTxId} address={walletAddress ?? undefined} />
                 </div>
@@ -1062,6 +1108,41 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
                                         ? `Your XMR is being processed — Position #${queuePosition.position} of ${queuePosition.total} in queue`
                                         : 'XMR is being automatically sent to your Monero wallet...'}
                     </p>
+                </div>
+            )}
+
+            {/* Cancel action — OPEN swaps only, depositor only, no timelock needed */}
+            {swap !== null && swap.status === 0n && isDepositor && cancelStep === 'idle' && !isExpired && (
+                <button
+                    className="btn btn-ghost btn-lg"
+                    style={{ width: '100%', marginBottom: '12px' }}
+                    disabled={!isConnected}
+                    onClick={() => void handleCancel()}
+                >
+                    Cancel Swap
+                </button>
+            )}
+
+            {cancelStep === 'cancelling' && (
+                <button className="btn btn-ghost btn-lg" style={{ width: '100%', marginBottom: '12px' }} disabled>
+                    Cancelling...
+                </button>
+            )}
+
+            {cancelStep === 'done' && actionTxId !== null && (
+                <div
+                    style={{
+                        padding: '16px',
+                        background: 'rgba(0, 230, 118, 0.06)',
+                        border: '1px solid rgba(0, 230, 118, 0.2)',
+                        borderRadius: 'var(--radius-md)',
+                        marginBottom: '12px',
+                    }}
+                >
+                    <p style={{ fontWeight: 600, color: 'var(--color-text-success)', marginBottom: '8px' }}>
+                        Swap Cancelled — MOTO returned
+                    </p>
+                    <ExplorerLinks txId={actionTxId} address={walletAddress ?? undefined} />
                 </div>
             )}
 

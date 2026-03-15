@@ -368,6 +368,45 @@ export class SwapVault extends OP_NET {
     @method({ name: 'swapId', type: ABIDataTypes.UINT256 })
     @returns({ name: 'success', type: ABIDataTypes.BOOL })
     @emit('SwapRefunded')
+    public cancel(calldata: Calldata): BytesWriter {
+        if (!Blockchain.tx.sender.equals(Blockchain.tx.origin)) {
+            throw new Revert('Direct calls only');
+        }
+
+        const swapId = calldata.readU256();
+
+        // Only OPEN swaps can be cancelled (no counterparty committed)
+        const status = this.swapStatuses.get(swapId);
+        if (!u256.eq(status, STATUS_OPEN)) {
+            throw new Revert('Swap not open');
+        }
+
+        // Verify caller is the depositor
+        const caller    = Blockchain.tx.sender;
+        const depositor = this._u256ToAddr(this.swapDepositors.get(swapId));
+        if (!caller.equals(depositor)) {
+            throw new Revert('Not depositor');
+        }
+
+        const amount = this.swapAmounts.get(swapId);
+
+        // Effects: update state BEFORE transfer
+        this.swapStatuses.set(swapId, STATUS_REFUNDED);
+        this.totalEscrow.value = SafeMath.sub(this.totalEscrow.value, amount);
+
+        // Interaction: transfer MOTO back to depositor
+        TransferHelper.transfer(this._moto(), depositor, amount);
+
+        this.emitEvent(new SwapRefundedEvent(swapId, depositor, amount));
+
+        const w = new BytesWriter(1);
+        w.writeBoolean(true);
+        return w;
+    }
+
+    @method({ name: 'swapId', type: ABIDataTypes.UINT256 })
+    @returns({ name: 'success', type: ABIDataTypes.BOOL })
+    @emit('SwapRefunded')
     public refund(calldata: Calldata): BytesWriter {
         if (!Blockchain.tx.sender.equals(Blockchain.tx.origin)) {
             throw new Revert('Direct calls only');

@@ -298,6 +298,12 @@ export interface IMoneroService {
         aliceAmountPiconero: bigint,
         aliceAddress?: string,
     ): Promise<ISweepResult>;
+
+    /**
+     * Returns the operator's primary XMR address (used as refund destination
+     * for expired swaps where XMR needs recovery).
+     */
+    getOperatorAddress(): Promise<string | null>;
 }
 
 // ---------------------------------------------------------------------------
@@ -445,6 +451,10 @@ export class MockMoneroService implements IMoneroService {
         } finally {
             this._sweepActive = false;
         }
+    }
+
+    public async getOperatorAddress(): Promise<string | null> {
+        return 'mock_operator_address_for_testing';
     }
 }
 
@@ -888,6 +898,19 @@ export class RealMoneroService implements IMoneroService {
         }
 
         return null;
+    }
+
+    public async getOperatorAddress(): Promise<string | null> {
+        try {
+            const resp = await this.rpcCall<{
+                result: { address: string };
+            }>('get_address', { account_index: 0 });
+            return resp.result?.address ?? null;
+        } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : 'Unknown error';
+            console.warn(`[RealMonero] getOperatorAddress failed: ${msg}`);
+            return null;
+        }
     }
 
     /**

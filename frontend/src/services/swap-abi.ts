@@ -77,6 +77,12 @@ export const SwapVaultAbi = [
         type: BitcoinAbiTypes.Function,
     },
     {
+        name: 'cancel',
+        inputs: [{ name: 'swapId', type: ABIDataTypes.UINT256 }],
+        outputs: [{ name: 'success', type: ABIDataTypes.BOOL }],
+        type: BitcoinAbiTypes.Function,
+    },
+    {
         name: 'refund',
         inputs: [{ name: 'swapId', type: ABIDataTypes.UINT256 }],
         outputs: [{ name: 'success', type: ABIDataTypes.BOOL }],
@@ -163,6 +169,11 @@ export type ClaimResult = CallResult<
     OPNetEvent<SwapClaimedEvent>[]
 >;
 
+export type CancelResult = CallResult<
+    { success: boolean },
+    OPNetEvent<SwapRefundedEvent>[]
+>;
+
 export type RefundResult = CallResult<
     { success: boolean },
     OPNetEvent<SwapRefundedEvent>[]
@@ -211,6 +222,7 @@ export interface ISwapVault extends IOP_NETContract {
     ): Promise<CreateSwapResult>;
     takeSwap(swapId: bigint): Promise<TakeSwapResult>;
     claim(swapId: bigint, preimage: bigint): Promise<ClaimResult>;
+    cancel(swapId: bigint): Promise<CancelResult>;
     refund(swapId: bigint): Promise<RefundResult>;
     getSwap(swapId: bigint): Promise<GetSwapResult>;
     getActiveSwaps(): Promise<GetActiveSwapsResult>;

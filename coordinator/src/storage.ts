@@ -348,6 +348,18 @@ export class StorageService {
     }
 
     /**
+     * Returns expired swaps whose XMR refund sweep failed and need retry.
+     * Matches sweep_status starting with 'failed:' or 'pending'.
+     */
+    public getFailedRefundSweeps(): ISwapRecord[] {
+        const rows = this.query(
+            `SELECT * FROM swaps WHERE status = ? AND (sweep_status LIKE 'failed:%' OR sweep_status = 'pending') ORDER BY updated_at ASC LIMIT 20`,
+            [SwapStatus.EXPIRED],
+        );
+        return rows as unknown as ISwapRecord[];
+    }
+
+    /**
      * Returns state history for a swap ordered by timestamp ascending.
      * @param swapId - The swap identifier.
      */
