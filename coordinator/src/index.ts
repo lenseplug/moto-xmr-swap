@@ -978,8 +978,23 @@ async function main(): Promise<void> {
                 if (!id) { notFound(res); break; }
                 if (!isAdminAuthorized(req)) { unauthorized(res); break; }
                 let bodyStr = '';
-                req.on('data', (chunk: Buffer) => { bodyStr += chunk.toString(); });
+                let bytesRead = 0;
+                let destroyed = false;
+                const MAX_TXID_BODY = 4096;
+                req.on('data', (chunk: Buffer) => {
+                    if (destroyed) return;
+                    bytesRead += chunk.length;
+                    if (bytesRead > MAX_TXID_BODY) {
+                        destroyed = true;
+                        req.destroy();
+                        res.writeHead(413, { 'Content-Type': 'application/json' });
+                        res.end(JSON.stringify({ success: false, data: null, error: { code: 'PAYLOAD_TOO_LARGE', message: 'Request body too large', retryable: false } }));
+                        return;
+                    }
+                    bodyStr += chunk.toString();
+                });
                 req.on('end', () => {
+                    if (destroyed) return;
                     try {
                         const parsed = JSON.parse(bodyStr) as Record<string, unknown>;
                         const txid = parsed['txid'];
@@ -1026,6 +1041,7 @@ async function main(): Promise<void> {
             case 'claim_xmr': {
                 const id = match.params['id'];
                 if (!id) { notFound(res); break; }
+                if (!isAdminAuthorized(req)) { unauthorized(res); break; }
                 const swap = storage.getSwap(id);
                 if (!swap) { notFound(res); break; }
                 // Only allow claim on COMPLETED trustless swaps awaiting claim
@@ -1126,10 +1142,12 @@ async function main(): Promise<void> {
             const createdMs = new Date(swap.created_at).getTime();
             const age = now - createdMs;
 
-            // Only auto-expire OPEN and TAKEN (no XMR at risk)
+            // Only auto-expire OPEN and TAKEN (no XMR at risk).
+            // Skip expiry if XMR locking is actively in progress for this swap.
             if (
                 (swap.status === SwapStatus.OPEN || swap.status === SwapStatus.TAKEN) &&
                 age > MAX_SWAP_AGE_MS &&
+                !xmrLockingInProgress.has(swap.swap_id) &&
                 stateMachine.canTransition(swap.status, SwapStatus.EXPIRED)
             ) {
                 const prev = swap.status;
@@ -1354,7 +1372,7 @@ function hexNibble(c: number): number {
     if (c >= 48 && c <= 57) return c - 48;       // 0-9
     if (c >= 97 && c <= 102) return c - 87;       // a-f
     if (c >= 65 && c <= 70) return c - 55;        // A-F
-    return 0;
+    throw new Error(`Invalid hex character: ${String.fromCharCode(c)}`);
 }
 
 main().catch((err: unknown) => {

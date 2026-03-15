@@ -89,8 +89,6 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
     const localViewKey = localSecret?.aliceViewKey ?? undefined;
     const localXmrPayout = localSecret?.aliceXmrPayout ?? undefined;
 
-    // Debug: track secret submission status visibly
-    const [secretDebug, setSecretDebug] = useState<string>('checking...');
 
     // Retrieve claim_token for authenticated WebSocket subscription
     const claimToken = getClaimToken(swapId.toString());
@@ -106,15 +104,15 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
     const secretSubmitted = useRef(false);
     useEffect(() => {
         if (!localSecretHex) {
-            setSecretDebug(`No secret in localStorage for swap "${swapId.toString()}"`);
+
             return;
         }
         if (secretSubmitted.current) {
-            setSecretDebug('Secret submitted OK');
+
             return;
         }
 
-        setSecretDebug(`Has secret (${localSecretHex.slice(0, 8)}...) — submitting...`);
+
 
         let cancelled = false;
         let attemptCount = 0;
@@ -122,11 +120,6 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
         const trySubmit = async (): Promise<boolean> => {
             attemptCount++;
             const result = await submitSwapSecret(swapId.toString(), localSecretHex, localViewKey, localXmrPayout);
-            if (!cancelled) {
-                setSecretDebug(result.ok
-                    ? 'Secret submitted OK!'
-                    : `Attempt ${attemptCount} failed: ${result.error ?? 'unknown'}`);
-            }
             return result.ok;
         };
 
@@ -175,7 +168,7 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
                     bobViewKey: storedBobKeys.bobViewKey,
                     bobKeyProof: storedBobKeys.bobKeyProof,
                     bobSpendKey: storedBobKeys.bobSpendKey,
-                });
+                }, claimToken ?? undefined);
             } catch {
                 return false;
             }
@@ -286,7 +279,11 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
     const showRefundWarn = blocksLeft !== null && blocksLeft <= REFUND_WARN_BLOCKS && !isExpired;
     const canRefund = swap !== null && (swap.status === 0n || swap.status === 1n) && isExpired;
 
+    // Mutex guard to prevent double-submit on claim/refund/cancel
+    const actionInProgressRef = useRef(false);
+
     const handleClaim = useCallback(async (): Promise<void> => {
+        if (actionInProgressRef.current) return;
         if (!isConnected || !walletAddress || !publicKey || !senderAddress) {
             setActionError('Connect your wallet first');
             return;
@@ -300,6 +297,7 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
             return;
         }
 
+        actionInProgressRef.current = true;
         setClaimStep('claiming');
         setActionError(null);
 
@@ -334,10 +332,13 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
         } catch (err) {
             setClaimStep('error');
             setActionError(err instanceof Error ? err.message : 'Unknown error');
+        } finally {
+            actionInProgressRef.current = false;
         }
     }, [isConnected, walletAddress, publicKey, senderAddress, claimablePreimage, swapId]);
 
     const handleRefund = useCallback(async (): Promise<void> => {
+        if (actionInProgressRef.current) return;
         if (!isConnected || !walletAddress || !publicKey || !senderAddress) {
             setActionError('Connect your wallet first');
             return;
@@ -347,6 +348,7 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
             return;
         }
 
+        actionInProgressRef.current = true;
         setRefundStep('refunding');
         setActionError(null);
 
@@ -380,10 +382,13 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
         } catch (err) {
             setRefundStep('error');
             setActionError(err instanceof Error ? err.message : 'Unknown error');
+        } finally {
+            actionInProgressRef.current = false;
         }
     }, [isConnected, walletAddress, publicKey, senderAddress, swapId]);
 
     const handleCancel = useCallback(async (): Promise<void> => {
+        if (actionInProgressRef.current) return;
         if (!isConnected || !walletAddress || !publicKey || !senderAddress) {
             setActionError('Connect your wallet first');
             return;
@@ -393,6 +398,7 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
             return;
         }
 
+        actionInProgressRef.current = true;
         setCancelStep('cancelling');
         setActionError(null);
 
@@ -425,6 +431,8 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
         } catch (err) {
             setCancelStep('error');
             setActionError(err instanceof Error ? err.message : 'Unknown error');
+        } finally {
+            actionInProgressRef.current = false;
         }
     }, [isConnected, walletAddress, publicKey, senderAddress, swapId]);
 
@@ -834,6 +842,7 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
             {/* XMR Lock Address */}
             {coordinatorStatus !== null &&
                 coordinatorStatus.xmrLockAddress !== undefined &&
+                /^[48][1-9A-HJ-NP-Za-km-z]{94}$/.test(coordinatorStatus.xmrLockAddress) &&
                 (coordinatorStatus.step === 'xmr_locking' || coordinatorStatus.step === 'xmr_locked') && (
                 <div
                     style={{

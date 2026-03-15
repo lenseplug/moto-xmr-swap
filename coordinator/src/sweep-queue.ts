@@ -30,6 +30,8 @@ export interface QueuePosition {
 export type SweepExecutor = (job: SweepJob) => Promise<void>;
 export type QueueUpdateCallback = (positions: QueuePosition[]) => void;
 
+const MAX_QUEUE_SIZE = 100;
+
 export class SweepQueue {
     private readonly queue: SweepJob[] = [];
     private processing = false;
@@ -41,10 +43,14 @@ export class SweepQueue {
         this.onUpdate = onUpdate;
     }
 
-    /** Enqueue a sweep job. No-op if swapId is already queued. */
+    /** Enqueue a sweep job. No-op if swapId is already queued. Rejects if queue is full. */
     public enqueue(job: SweepJob): void {
         if (this.queue.some((j) => j.swapId === job.swapId)) {
             console.log(`[SweepQueue] ${job.swapId} already queued — skipping`);
+            return;
+        }
+        if (this.queue.length >= MAX_QUEUE_SIZE) {
+            console.warn(`[SweepQueue] Queue full (${MAX_QUEUE_SIZE}) — rejecting ${job.swapId}`);
             return;
         }
         this.queue.push(job);

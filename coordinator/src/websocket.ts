@@ -61,6 +61,9 @@ export class SwapWebSocketServer {
     /** Per-connection subscription count. */
     private readonly clientSubCounts = new WeakMap<WebSocket, number>();
 
+    /** Tracks which (swapId, client) pairs are authenticated for preimage delivery. */
+    private readonly authenticatedSubs = new Map<string, Set<WebSocket>>();
+
     /** Ping interval timer. */
     private readonly pingTimer: NodeJS.Timeout;
 
@@ -142,20 +145,21 @@ export class SwapWebSocketServer {
         const message: IWsMessage = { type: 'preimage_ready', data: payload };
         const json = JSON.stringify(message);
 
-        const subscribers = this.subscriptions.get(swapId);
-        if (!subscribers || subscribers.size === 0) {
-            console.log(`[WebSocket] Preimage ready for swap ${swapId} — queued for late subscribers`);
+        // Only deliver preimages to authenticated subscribers (those who proved claim_token)
+        const authSubscribers = this.authenticatedSubs.get(swapId);
+        if (!authSubscribers || authSubscribers.size === 0) {
+            console.log(`[WebSocket] Preimage ready for swap ${swapId} — queued for late authenticated subscribers`);
             return;
         }
 
         let sent = 0;
-        for (const client of subscribers) {
+        for (const client of authSubscribers) {
             if (client.readyState === WebSocket.OPEN) {
                 client.send(json);
                 sent++;
             }
         }
-        console.log(`[WebSocket] Preimage sent to ${sent} subscriber(s) for swap ${swapId}`);
+        console.log(`[WebSocket] Preimage sent to ${sent} authenticated subscriber(s) for swap ${swapId}`);
     }
 
     /**
@@ -287,11 +291,13 @@ export class SwapWebSocketServer {
                         return;
                     }
                 } else {
-                    // No claim_token in DB — allow subscription for any status.
-                    // Safe because: swap_update messages are already public (no secrets),
-                    // and preimage delivery is separately gated by the preimage queue.
-                    console.log(`[WebSocket] No claim_token for swap ${msg.swapId} — allowing subscription (status: ${swap.status})`);
+                    // No claim_token in DB — allow subscription for public swap_update messages,
+                    // but mark the client as unauthenticated so preimages are NOT delivered.
+                    console.log(`[WebSocket] No claim_token for swap ${msg.swapId} — allowing public-only subscription (status: ${swap.status})`);
                 }
+
+                // Track whether this client proved claim_token ownership
+                const isAuthenticated = !!(swap.claim_token && swap.claim_token.length > 0);
 
                 let subs = this.subscriptions.get(msg.swapId);
                 if (!subs) {
@@ -300,15 +306,28 @@ export class SwapWebSocketServer {
                 }
                 subs.add(ws);
                 this.clientSubCounts.set(ws, currentCount + 1);
-                console.log(`[WebSocket] Client subscribed to swap ${msg.swapId} (authenticated)`);
 
-                // Deliver queued preimage if one was broadcast before this client subscribed
-                const pending = this.pendingPreimages.get(msg.swapId);
-                if (pending) {
-                    const payload: IWsPreimageReady = { swapId: msg.swapId, preimage: pending.preimage };
-                    const preimageMsg: IWsMessage = { type: 'preimage_ready', data: payload };
-                    this.sendToClient(ws, preimageMsg);
-                    console.log(`[WebSocket] Delivered queued preimage to late subscriber for swap ${msg.swapId}`);
+                // Only authenticated subscribers can receive preimages
+                if (isAuthenticated) {
+                    let authSubs = this.authenticatedSubs.get(msg.swapId);
+                    if (!authSubs) {
+                        authSubs = new Set();
+                        this.authenticatedSubs.set(msg.swapId, authSubs);
+                    }
+                    authSubs.add(ws);
+                }
+
+                console.log(`[WebSocket] Client subscribed to swap ${msg.swapId} (${isAuthenticated ? 'authenticated' : 'public-only'})`);
+
+                // Deliver queued preimage ONLY to authenticated subscribers
+                if (isAuthenticated) {
+                    const pending = this.pendingPreimages.get(msg.swapId);
+                    if (pending) {
+                        const payload: IWsPreimageReady = { swapId: msg.swapId, preimage: pending.preimage };
+                        const preimageMsg: IWsMessage = { type: 'preimage_ready', data: payload };
+                        this.sendToClient(ws, preimageMsg);
+                        console.log(`[WebSocket] Delivered queued preimage to late authenticated subscriber for swap ${msg.swapId}`);
+                    }
                 }
             }
         } catch {
@@ -321,6 +340,13 @@ export class SwapWebSocketServer {
             subs.delete(ws);
             if (subs.size === 0) {
                 this.subscriptions.delete(swapId);
+            }
+        }
+        // Also clean up authenticated subscription tracking
+        for (const [swapId, authSubs] of this.authenticatedSubs) {
+            authSubs.delete(ws);
+            if (authSubs.size === 0) {
+                this.authenticatedSubs.delete(swapId);
             }
         }
     }

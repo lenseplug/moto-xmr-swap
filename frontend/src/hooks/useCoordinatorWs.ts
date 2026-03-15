@@ -6,7 +6,8 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 
 const WS_URL = (import.meta.env.VITE_COORDINATOR_WS_URL ?? 'ws://localhost:3001');
-const RECONNECT_DELAY_MS = 3000;
+const WS_RECONNECT_BASE_MS = 1000;
+const WS_RECONNECT_MAX_MS = 30000;
 
 // In production, warn about non-WSS WebSocket URL
 if (import.meta.env.PROD && WS_URL && !WS_URL.startsWith('wss://')) {
@@ -90,6 +91,7 @@ export function useCoordinatorWs(swapId: string | null, claimToken?: string | nu
     const [queuePosition, setQueuePosition] = useState<QueuePositionInfo | null>(null);
     const wsRef = useRef<WebSocket | null>(null);
     const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const reconnectAttemptRef = useRef(0);
     const mountedRef = useRef(true);
 
     const connect = useCallback(() => {
@@ -108,6 +110,7 @@ export function useCoordinatorWs(swapId: string | null, claimToken?: string | nu
             ws.onopen = () => {
                 if (!mountedRef.current) return;
                 setConnected(true);
+                reconnectAttemptRef.current = 0;
                 // Subscribe to this swap with optional claim_token for auth
                 const msg: Record<string, string> = { type: 'subscribe', swapId };
                 if (claimToken) {
@@ -137,8 +140,8 @@ export function useCoordinatorWs(swapId: string | null, claimToken?: string | nu
                                     }
                                 });
                             } else {
-                                // No hash lock available for verification — accept on trust
-                                setPreimage(payload.preimage);
+                                // No hash lock available — cannot verify preimage integrity
+                                console.error('[WS] Cannot verify preimage — no hash lock provided. Ignoring.');
                             }
                         }
                     }
@@ -166,20 +169,24 @@ export function useCoordinatorWs(swapId: string | null, claimToken?: string | nu
                 if (!mountedRef.current) return;
                 setConnected(false);
                 wsRef.current = null;
-                // Auto-reconnect
+                // Auto-reconnect with exponential backoff
+                const attempt = reconnectAttemptRef.current++;
+                const delay = Math.min(WS_RECONNECT_BASE_MS * Math.pow(2, attempt), WS_RECONNECT_MAX_MS);
                 reconnectTimerRef.current = setTimeout(() => {
                     if (mountedRef.current) connect();
-                }, RECONNECT_DELAY_MS);
+                }, delay);
             };
 
             ws.onerror = () => {
                 // onclose will fire after onerror, triggering reconnect
             };
         } catch {
-            // Connection failed, try again
+            // Connection failed, try again with backoff
+            const attempt = reconnectAttemptRef.current++;
+            const delay = Math.min(WS_RECONNECT_BASE_MS * Math.pow(2, attempt), WS_RECONNECT_MAX_MS);
             reconnectTimerRef.current = setTimeout(() => {
                 if (mountedRef.current) connect();
-            }, RECONNECT_DELAY_MS);
+            }, delay);
         }
     }, [swapId, claimToken, hashLockHex]);
 

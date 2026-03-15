@@ -134,12 +134,12 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
 
             // Step 2: Approve if needed — use a large blanket approval so we only do this once
             if (currentAllowance < motoAmount) {
-                // Approve a huge amount so future swaps never need another approval
-                const bigApproval = 2n ** 128n - 1n; // u128 max — way more than enough
                 setStep('approving');
-                setStatusMessage('Approving MOTO for SwapVault (one-time)...');
+                setStatusMessage('Approving MOTO for SwapVault...');
 
-                const approveSim = await motoContract.increaseAllowance(vaultAddress, bigApproval);
+                // Use increaseAllowance with exact deficit to prevent accumulation over repeated create/cancel cycles
+                const deficit = motoAmount - currentAllowance;
+                const approveSim = await motoContract.increaseAllowance(vaultAddress, deficit);
                 if ('error' in approveSim) {
                     throw new Error(`Allowance simulation failed: ${String(approveSim.error)}`);
                 }
@@ -286,7 +286,6 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
                 }
             }
 
-            console.log('[CreateSwap] Extracted swapId:', swapId.toString());
 
             // CRITICAL: Save secret to localStorage BEFORE sending transaction.
             // If sendTransaction hangs or the page is closed, the secret survives.

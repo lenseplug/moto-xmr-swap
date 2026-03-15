@@ -495,6 +495,23 @@ export class RealMoneroService implements IMoneroService {
     /** Whether a sweep is currently active (wallet-rpc exclusivity). */
     private _sweepActive = false;
 
+    /**
+     * Global wallet-rpc mutex — serializes ALL operations that switch wallets
+     * (split-key polls + sweeps). Prevents interleaving where two polls
+     * swap wallets concurrently and corrupt each other's data.
+     */
+    private _walletRpcLock: Promise<void> = Promise.resolve();
+
+    /** Acquires the wallet-rpc lock. Returns a release function. */
+    private async acquireWalletRpcLock(): Promise<() => void> {
+        let release: () => void;
+        const next = new Promise<void>((resolve) => { release = resolve; });
+        const prev = this._walletRpcLock;
+        this._walletRpcLock = next;
+        await prev;
+        return release!;
+    }
+
     public get sweepActive(): boolean {
         return this._sweepActive;
     }
@@ -660,10 +677,12 @@ export class RealMoneroService implements IMoneroService {
             let pollInFlight = false;
 
             return async (info: { viewKeyHex: string; restoreHeight?: number }): Promise<void> => {
-                // Skip if a sweep or another poll is in progress
-                if (this._sweepActive || pollInFlight) return;
+                // Skip if another poll for this swap is in progress
+                if (pollInFlight) return;
                 pollInFlight = true;
 
+                // Acquire global wallet-rpc lock to prevent interleaving with other polls/sweeps
+                const releaseLock = await this.acquireWalletRpcLock();
                 try {
                     // Create watch wallet on first poll
                     if (!walletCreated) {
@@ -771,6 +790,7 @@ export class RealMoneroService implements IMoneroService {
                     }
                 } finally {
                     pollInFlight = false;
+                    releaseLock();
                 }
             };
         })();
@@ -988,12 +1008,14 @@ export class RealMoneroService implements IMoneroService {
         aliceAmountPiconero: bigint,
         aliceAddress?: string,
     ): Promise<ISweepResult> {
-        // Queue handles serialization now — flag only used for split-key poll gating
+        // Acquire global wallet-rpc lock (prevents interleaving with split-key polls)
+        const releaseLock = await this.acquireWalletRpcLock();
         this._sweepActive = true;
         try {
             return await this.doSweep(swapId, spendKeyHex, viewKeyHex, lockAddress, aliceAmountPiconero, aliceAddress);
         } finally {
             this._sweepActive = false;
+            releaseLock();
         }
     }
 
@@ -1006,6 +1028,7 @@ export class RealMoneroService implements IMoneroService {
         aliceAddress?: string,
     ): Promise<ISweepResult> {
         const walletName = `sweep-${swapId}-${Date.now()}`;
+        const sweepWalletPass = process.env['XMR_WALLET_PASS'] ?? '';
         const feeAddr = xmrFeeAddress;
 
         if (feeAddr.length === 0 && !aliceAddress) {
@@ -1045,13 +1068,13 @@ export class RealMoneroService implements IMoneroService {
                 address: lockAddress,
                 spendkey: spendKeyHex,
                 viewkey: viewKeyHex,
-                password: '',
+                password: sweepWalletPass,
                 restore_height: restoreHeight,
                 autosave_current: false,
             });
 
             // 2. Open the wallet and refresh to find our balance
-            await this.rpcCall('open_wallet', { filename: walletName, password: '' });
+            await this.rpcCall('open_wallet', { filename: walletName, password: sweepWalletPass });
             console.log(`[RealMonero] sweep(${swapId}): refreshing wallet (10min timeout)...`);
             await this.rpcCall('refresh', {}, 600_000);
 

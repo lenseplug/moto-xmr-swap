@@ -6,6 +6,14 @@ import type { BobKeyMaterial, CoordinatorHealth, CoordinatorStatus } from '../ty
 
 const COORDINATOR_BASE = import.meta.env.VITE_COORDINATOR_URL;
 
+/** Validates that a swap ID is a non-negative integer string before URL interpolation. */
+function sanitizeSwapId(swapId: string): string {
+    if (!/^\d+$/.test(swapId)) {
+        throw new Error(`Invalid swap ID: ${swapId}`);
+    }
+    return swapId;
+}
+
 // In production builds, warn about non-HTTPS coordinator URL
 if (import.meta.env.PROD && COORDINATOR_BASE && !COORDINATOR_BASE.startsWith('https://')) {
     console.warn(
@@ -74,7 +82,7 @@ interface ICoordinatorSwapResponse {
  */
 export async function getCoordinatorSwapStatus(swapId: string): Promise<CoordinatorStatus | null> {
     try {
-        const res = await fetch(`${COORDINATOR_BASE}/api/swaps/${swapId}`, {
+        const res = await fetch(`${COORDINATOR_BASE}/api/swaps/${sanitizeSwapId(swapId)}`, {
             signal: AbortSignal.timeout(10000),
         });
         if (!res.ok) return null;
@@ -123,7 +131,7 @@ export interface TakeSwapResult {
  */
 export async function notifySwapTaken(swapId: string, txId: string): Promise<TakeSwapResult> {
     try {
-        const res = await fetch(`${COORDINATOR_BASE}/api/swaps/${swapId}/take`, {
+        const res = await fetch(`${COORDINATOR_BASE}/api/swaps/${sanitizeSwapId(swapId)}/take`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ opnetTxId: txId }),
@@ -225,7 +233,7 @@ export async function submitSwapSecret(swapId: string, secret: string, aliceView
         if (aliceXmrPayout) {
             body['aliceXmrPayout'] = aliceXmrPayout;
         }
-        const res = await fetch(`${COORDINATOR_BASE}/api/swaps/${swapId}/secret`, {
+        const res = await fetch(`${COORDINATOR_BASE}/api/swaps/${sanitizeSwapId(swapId)}/secret`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(body),
@@ -248,12 +256,16 @@ export async function submitSwapSecret(swapId: string, secret: string, aliceView
  * @param keys - Bob's ed25519 public key, view key, and key proof-of-knowledge
  * @returns true if the keys were accepted
  */
-export async function submitBobKeys(swapId: string, keys: BobKeyMaterial): Promise<boolean> {
+export async function submitBobKeys(swapId: string, keys: BobKeyMaterial, claimToken?: string): Promise<boolean> {
     try {
-        const res = await fetch(`${COORDINATOR_BASE}/api/swaps/${swapId}/keys`, {
+        const body: Record<string, string> = { ...keys };
+        if (claimToken) {
+            body['claimToken'] = claimToken;
+        }
+        const res = await fetch(`${COORDINATOR_BASE}/api/swaps/${sanitizeSwapId(swapId)}/keys`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(keys),
+            body: JSON.stringify(body),
             signal: AbortSignal.timeout(10000),
         });
         return res.ok;
@@ -270,7 +282,7 @@ export async function submitBobKeys(swapId: string, keys: BobKeyMaterial): Promi
  */
 export async function claimXmr(swapId: string): Promise<{ ok: boolean; error?: string }> {
     try {
-        const res = await fetch(`${COORDINATOR_BASE}/api/swaps/${swapId}/claim-xmr`, {
+        const res = await fetch(`${COORDINATOR_BASE}/api/swaps/${sanitizeSwapId(swapId)}/claim-xmr`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             signal: AbortSignal.timeout(15000),

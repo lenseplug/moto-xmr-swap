@@ -43,6 +43,7 @@ const PTR_SWAP_COUNTERPARTS:  u16 = Blockchain.nextPointer;
 const PTR_SWAP_STATUSES:      u16 = Blockchain.nextPointer;
 const PTR_SWAP_XMR_ADDR_HI:   u16 = Blockchain.nextPointer;
 const PTR_SWAP_XMR_ADDR_LO:   u16 = Blockchain.nextPointer;
+const PTR_HASHLOCK_USED:       u16 = Blockchain.nextPointer;
 
 // ── Events ───────────────────────────────────────────────────────────────────
 
@@ -128,6 +129,7 @@ export class SwapVault extends OP_NET {
     private _swapStatuses:     StoredMapU256 | null = null;
     private _swapXmrAddrHi:    StoredMapU256 | null = null;
     private _swapXmrAddrLo:    StoredMapU256 | null = null;
+    private _hashLockUsed:     StoredMapU256 | null = null;
 
     private get nextSwapId(): StoredU256 {
         if (!this._nextSwapId) this._nextSwapId = new StoredU256(PTR_NEXT_SWAP_ID, EMPTY_POINTER);
@@ -184,6 +186,22 @@ export class SwapVault extends OP_NET {
         return this._swapXmrAddrLo!;
     }
 
+    private get hashLockUsed(): StoredMapU256 {
+        if (!this._hashLockUsed) this._hashLockUsed = new StoredMapU256(PTR_HASHLOCK_USED);
+        return this._hashLockUsed!;
+    }
+
+    /**
+     * Reverts if swapId >= nextSwapId (i.e. the swap does not exist).
+     * Prevents phantom swap interactions where default zero-values would
+     * cause STATUS_OPEN to match for non-existent swaps.
+     */
+    private _requireSwapExists(swapId: u256): void {
+        if (!u256.lt(swapId, this.nextSwapId.value)) {
+            throw new Revert('Swap does not exist');
+        }
+    }
+
     public constructor() {
         super();
         // ONLY pointer declarations and super() here — 20M gas limit
@@ -231,6 +249,11 @@ export class SwapVault extends OP_NET {
             throw new Revert('XMR amount must be > 0');
         }
 
+        // HashLock uniqueness — prevents two swaps sharing the same preimage
+        if (!u256.eq(this.hashLockUsed.get(hashLock), u256.Zero)) {
+            throw new Revert('HashLock already used');
+        }
+
         // refundBlock must be > current block + MIN_TIMEOUT
         const minRefundBlock = SafeMath.add(Blockchain.block.numberU256, MIN_TIMEOUT);
         if (!u256.gt(refundBlock, minRefundBlock)) {
@@ -250,6 +273,7 @@ export class SwapVault extends OP_NET {
         this.swapStatuses.set(swapId, STATUS_OPEN);
         this.swapXmrAddrHi.set(swapId, xmrAddressHi);
         this.swapXmrAddrLo.set(swapId, xmrAddressLo);
+        this.hashLockUsed.set(hashLock, u256.One);
 
         this.nextSwapId.value = SafeMath.add(swapId, u256.One);
         this.totalEscrow.value = SafeMath.add(this.totalEscrow.value, amount);
@@ -282,6 +306,7 @@ export class SwapVault extends OP_NET {
         }
 
         const swapId = calldata.readU256();
+        this._requireSwapExists(swapId);
 
         // Verify swap exists and is open
         const status = this.swapStatuses.get(swapId);
@@ -321,6 +346,7 @@ export class SwapVault extends OP_NET {
 
         const swapId  = calldata.readU256();
         const preimage = calldata.readU256();
+        this._requireSwapExists(swapId);
 
         // Verify swap is taken
         const status = this.swapStatuses.get(swapId);
@@ -374,6 +400,7 @@ export class SwapVault extends OP_NET {
         }
 
         const swapId = calldata.readU256();
+        this._requireSwapExists(swapId);
 
         // Only OPEN swaps can be cancelled (no counterparty committed)
         const status = this.swapStatuses.get(swapId);
@@ -413,6 +440,7 @@ export class SwapVault extends OP_NET {
         }
 
         const swapId = calldata.readU256();
+        this._requireSwapExists(swapId);
 
         // Verify status is OPEN or TAKEN (not already finalized)
         const status = this.swapStatuses.get(swapId);
@@ -465,6 +493,7 @@ export class SwapVault extends OP_NET {
     )
     public getSwap(calldata: Calldata): BytesWriter {
         const swapId = calldata.readU256();
+        this._requireSwapExists(swapId);
 
         // 7x u256 (224 bytes) + 2x address (64 bytes) = 288 bytes
         const w = new BytesWriter(U256_BYTE_LENGTH * 7 + ADDRESS_BYTE_LENGTH * 2);

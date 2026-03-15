@@ -20,7 +20,7 @@ import {
 import { StorageService } from '../storage.js';
 import { SwapStateMachine } from '../state-machine.js';
 import { SwapWebSocketServer } from '../websocket.js';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { getFeeAddress, setFeeAddress, verifyPreimage, validateMoneroAddress } from '../monero-module.js';
 import { ed25519PublicFromPrivate, verifyBobKeyProof } from '../crypto/index.js';
 
@@ -258,7 +258,7 @@ export async function handleTakeSwap(
             storage.updateSwap(swapId, {
                 claim_token: claimToken,
                 status: SwapStatus.TAKEN,
-                counterparty: body.opnetTxId.trim(),
+                counterparty: body.opnetTxId.trim().replace(/[^0-9a-fA-F]/g, '').slice(0, 64),
             });
         } else {
             storage.updateSwap(swapId, { claim_token: claimToken });
@@ -340,6 +340,11 @@ export async function handleSubmitSecret(
             }
             if (typeof candidate['aliceXmrPayout'] === 'string' && candidate['aliceXmrPayout'].length > 0) {
                 aliceXmrPayout = candidate['aliceXmrPayout'].trim();
+                const addrErr = validateMoneroAddress(aliceXmrPayout);
+                if (addrErr !== null) {
+                    jsonResponse(res, 400, fail('VALIDATION', `Invalid aliceXmrPayout address: ${addrErr}`));
+                    return;
+                }
             }
         } catch (err: unknown) {
             const msg = err instanceof Error ? err.message : 'Invalid request';
@@ -390,6 +395,13 @@ export async function handleSubmitSecret(
         }
 
         if (aliceXmrPayout) {
+            // Prevent overwriting an existing payout address with a different one
+            // (blocks attacker who intercepts preimage from redirecting XMR)
+            if (freshSwap && freshSwap.alice_xmr_payout && freshSwap.alice_xmr_payout.length > 0
+                && freshSwap.alice_xmr_payout !== aliceXmrPayout) {
+                jsonResponse(res, 409, fail('PAYOUT_LOCKED', 'Alice XMR payout address already set and cannot be changed'));
+                return;
+            }
             updateParams['alice_xmr_payout'] = aliceXmrPayout;
             console.log(`[Routes] Alice XMR payout address set for swap ${swapId}: ${aliceXmrPayout.slice(0, 12)}...`);
         }
@@ -577,9 +589,18 @@ export async function handleSubmitKeys(
     storage: StorageService,
     swapId: string,
 ): Promise<void> {
+    // Per-swap lock prevents concurrent key submissions from racing
+    return withSwapLock(swapId, async () => {
     const swap = storage.getSwap(swapId);
     if (!swap) {
         jsonResponse(res, 404, fail('NOT_FOUND', `Swap ${swapId} not found`));
+        return;
+    }
+
+    // Require claim_token — only the Bob who took this swap should submit keys.
+    // Without this, an attacker could inject fraudulent keys before legitimate Bob.
+    if (!swap.claim_token || swap.claim_token.length === 0) {
+        jsonResponse(res, 409, fail('NOT_TAKEN', 'Swap has not been taken yet — no claim token'));
         return;
     }
 
@@ -610,6 +631,7 @@ export async function handleSubmitKeys(
     let bobViewKey: string;
     let bobKeyProof: string;
     let bobSpendKey: string | undefined;
+    let claimToken: string | undefined;
     try {
         const parsed = await readBody(req);
         const candidate = parsed as Record<string, unknown>;
@@ -628,9 +650,25 @@ export async function handleSubmitKeys(
         if (typeof candidate['bobSpendKey'] === 'string') {
             bobSpendKey = candidate['bobSpendKey'].trim().toLowerCase();
         }
+        if (typeof candidate['claimToken'] === 'string') {
+            claimToken = candidate['claimToken'];
+        }
     } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : 'Invalid request';
         jsonResponse(res, 400, fail('INVALID_BODY', msg));
+        return;
+    }
+
+    // Verify claim_token (timing-safe comparison)
+    if (!claimToken) {
+        jsonResponse(res, 401, fail('AUTH_REQUIRED', 'claimToken is required for key submission'));
+        return;
+    }
+    const expectedToken = new TextEncoder().encode(swap.claim_token);
+    const providedToken = new TextEncoder().encode(claimToken);
+    if (expectedToken.length !== providedToken.length || !timingSafeEqual(expectedToken, providedToken)) {
+        jsonResponse(res, 401, fail('AUTH_FAILED', 'Invalid claim token'));
+        console.log(`[Routes] Rejected key submission for swap ${swapId} — invalid claim_token`);
         return;
     }
 
@@ -673,6 +711,7 @@ export async function handleSubmitKeys(
     console.log(`[Routes] Bob's keys verified and stored for split-key swap ${swapId}`);
 
     jsonResponse(res, 200, success({ stored: true }));
+    });
 }
 
 /**

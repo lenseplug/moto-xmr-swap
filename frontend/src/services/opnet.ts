@@ -153,6 +153,7 @@ export function parseMotoAmount(display: string): bigint {
 export function parseXmrAmount(display: string): bigint {
     const trimmed = display.trim();
     if (!trimmed || trimmed === '') return 0n;
+    if (!/^\d*\.?\d*$/.test(trimmed) || trimmed === '.') return 0n;
     const [wholeStr, fracStr = ''] = trimmed.split('.');
     const whole = BigInt(wholeStr || '0');
     const paddedFrac = fracStr.padEnd(12, '0').slice(0, 12);

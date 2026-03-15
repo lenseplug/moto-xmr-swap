@@ -141,7 +141,7 @@ export function TakeSwap({ swapId, onBack, onTaken }: TakeSwapProps): React.Reac
                     bobViewKey: bobViewHex,
                     bobKeyProof: proofHex,
                     bobSpendKey: bobSpendHex,
-                });
+                }, takeResult.claimToken ?? undefined);
                 if (keysOk) {
                     markBobKeysSubmitted(swapId.toString());
                 } else {
