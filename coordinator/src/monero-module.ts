@@ -645,7 +645,7 @@ export class RealMoneroService implements IMoneroService {
         const pollBySplitKeyWallet = (() => {
             const walletName = `monitor-${swapId}`;
             const mainWallet = process.env['XMR_WALLET_NAME'] ?? 'motoxmr-mainnet';
-            const mainPassword = process.env['XMR_WALLET_PASSWORD'] ?? 'motoxmr2026';
+            const mainPassword = process.env['XMR_WALLET_PASS'] ?? process.env['XMR_WALLET_PASSWORD'] ?? '';
             let walletCreated = false;
             let pollInFlight = false;
 
@@ -680,14 +680,14 @@ export class RealMoneroService implements IMoneroService {
                                 filename: walletName,
                                 address,
                                 viewkey: info.viewKeyHex,
-                                password: '',
+                                password: mainPassword,
                                 restore_height: restoreHeight,
                             });
                         } catch (genErr: unknown) {
                             // Wallet may already exist from a previous run — try opening it
                             const genMsg = genErr instanceof Error ? genErr.message : '';
                             if (genMsg.includes('already exists')) {
-                                await this.rpcCall('open_wallet', { filename: walletName, password: '' });
+                                await this.rpcCall('open_wallet', { filename: walletName, password: mainPassword });
                             } else {
                                 throw genErr;
                             }
@@ -697,7 +697,7 @@ export class RealMoneroService implements IMoneroService {
                     } else {
                         // Subsequent polls: swap from main to watch wallet
                         await this.rpcCall('close_wallet', {});
-                        await this.rpcCall('open_wallet', { filename: walletName, password: '' });
+                        await this.rpcCall('open_wallet', { filename: walletName, password: mainPassword });
                     }
 
                     // Refresh and check transfers
