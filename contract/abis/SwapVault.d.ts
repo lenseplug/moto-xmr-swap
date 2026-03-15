@@ -64,6 +64,16 @@ export type Claim = CallResult<
 >;
 
 /**
+ * @description Represents the result of the cancel function call.
+ */
+export type Cancel = CallResult<
+    {
+        success: boolean;
+    },
+    OPNetEvent<SwapRefundedEvent>[]
+>;
+
+/**
  * @description Represents the result of the refund function call.
  */
 export type Refund = CallResult<
@@ -135,6 +145,7 @@ export interface ISwapVault extends IOP_NETContract {
     ): Promise<CreateSwap>;
     takeSwap(swapId: bigint): Promise<TakeSwap>;
     claim(swapId: bigint, preimage: bigint): Promise<Claim>;
+    cancel(swapId: bigint): Promise<Cancel>;
     refund(swapId: bigint): Promise<Refund>;
     getSwap(swapId: bigint): Promise<GetSwap>;
     getActiveSwaps(): Promise<GetActiveSwaps>;

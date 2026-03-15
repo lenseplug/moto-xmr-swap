@@ -42,24 +42,27 @@ const STATUS_TO_STEP: Record<string, CoordinatorStatus['step']> = {
 };
 
 /** Coordinator API swap record shape (snake_case). */
+interface ICoordinatorSwapFields {
+    readonly swap_id: string;
+    readonly status: string;
+    readonly hash_lock: string;
+    readonly xmr_lock_tx: string | null;
+    readonly xmr_address: string | null;
+    readonly xmr_lock_confirmations: number;
+    readonly xmr_fee: string;
+    readonly xmr_total: string;
+    readonly trustless_mode: number;
+    readonly alice_ed25519_pub: string | null;
+    readonly bob_ed25519_pub: string | null;
+    readonly sweep_status: string | null;
+    readonly depositor: string;
+    readonly updated_at: string;
+}
+
 interface ICoordinatorSwapResponse {
     readonly success: boolean;
     readonly data: {
-        readonly swap: {
-            readonly swap_id: string;
-            readonly status: string;
-            readonly xmr_lock_tx: string | null;
-            readonly xmr_address: string | null;
-            readonly xmr_lock_confirmations: number;
-            readonly xmr_fee: string;
-            readonly xmr_total: string;
-            readonly trustless_mode: number;
-            readonly alice_ed25519_pub: string | null;
-            readonly bob_ed25519_pub: string | null;
-            readonly sweep_status: string | null;
-            readonly depositor: string;
-            readonly updated_at: string;
-        };
+        readonly swap: ICoordinatorSwapFields;
     } | null;
 }
 
@@ -139,21 +142,7 @@ export async function notifySwapTaken(swapId: string, txId: string): Promise<Tak
 interface ICoordinatorListResponse {
     readonly success: boolean;
     readonly data: {
-        readonly swaps: ReadonlyArray<{
-            readonly swap_id: string;
-            readonly status: string;
-            readonly xmr_lock_tx: string | null;
-            readonly xmr_address: string | null;
-            readonly xmr_lock_confirmations: number;
-            readonly xmr_fee: string;
-            readonly xmr_total: string;
-            readonly trustless_mode: number;
-            readonly alice_ed25519_pub: string | null;
-            readonly bob_ed25519_pub: string | null;
-            readonly sweep_status: string | null;
-            readonly depositor: string;
-            readonly updated_at: string;
-        }>;
+        readonly swaps: ReadonlyArray<ICoordinatorSwapFields>;
     } | null;
 }
 
@@ -190,6 +179,31 @@ export async function getAllCoordinatorStatuses(): Promise<CoordinatorStatus[]> 
         });
     } catch {
         return [];
+    }
+}
+
+/**
+ * Resolves the actual on-chain swap ID by matching hashLock.
+ * Needed because the simulated swap ID may differ from the on-chain ID
+ * if another swap was mined between simulation and confirmation.
+ *
+ * @param hashLock - The 64-char hex hash lock to search for
+ * @returns The matching swap_id string, or null if not found
+ */
+export async function resolveSwapIdByHashLock(hashLock: string): Promise<string | null> {
+    try {
+        const res = await fetch(`${COORDINATOR_BASE}/api/swaps`, {
+            signal: AbortSignal.timeout(10000),
+        });
+        if (!res.ok) return null;
+        const body = (await res.json()) as ICoordinatorListResponse;
+        if (!body.success || !body.data) return null;
+
+        const needle = hashLock.toLowerCase();
+        const match = body.data.swaps.find((s) => s.hash_lock.toLowerCase() === needle);
+        return match?.swap_id ?? null;
+    } catch {
+        return null;
     }
 }
 

@@ -73,6 +73,12 @@ export const SwapVaultAbi = [
         type: BitcoinAbiTypes.Function,
     },
     {
+        name: 'cancel',
+        inputs: [{ name: 'swapId', type: ABIDataTypes.UINT256 }],
+        outputs: [{ name: 'success', type: ABIDataTypes.BOOL }],
+        type: BitcoinAbiTypes.Function,
+    },
+    {
         name: 'refund',
         inputs: [{ name: 'swapId', type: ABIDataTypes.UINT256 }],
         outputs: [{ name: 'success', type: ABIDataTypes.BOOL }],

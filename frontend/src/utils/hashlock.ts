@@ -172,6 +172,25 @@ export function getLocalSwapSecret(swapId: string): LocalSwapSecret | null {
 }
 
 /**
+ * Updates the swap ID on an existing localStorage secret entry.
+ * Used when the on-chain swap ID differs from the simulated one (race condition).
+ *
+ * @param oldSwapId - The original (simulated) swap ID
+ * @param newSwapId - The actual on-chain swap ID
+ */
+export function updateLocalSwapSecretId(oldSwapId: string, newSwapId: string): void {
+    try {
+        const secrets = loadLocalSwapSecrets();
+        const idx = secrets.findIndex((s) => s.swapId === oldSwapId);
+        if (idx === -1) return;
+        secrets[idx] = { ...secrets[idx], swapId: newSwapId };
+        localStorage.setItem(LOCAL_SECRETS_KEY, JSON.stringify(secrets));
+    } catch {
+        // localStorage unavailable — ignore
+    }
+}
+
+/**
  * Removes the secret for a specific swap ID from localStorage.
  * Call this when a swap reaches a terminal state (COMPLETED, REFUNDED, EXPIRED).
  *

@@ -5,8 +5,8 @@ import React, { useState, useCallback, useRef } from 'react';
 import { useWalletConnect } from '@btc-vision/walletconnect';
 import { networks } from '@btc-vision/bitcoin';
 import { getSwapVaultContract, getMotoContract, parseMotoAmount, parseXmrAmount, splitXmrAddress, getProvider } from '../services/opnet';
-import { generateTrustlessSecret, saveLocalSwapSecret, clearLocalSwapSecret, hashSecret } from '../utils/hashlock';
-import { submitSwapSecret } from '../services/coordinator';
+import { generateTrustlessSecret, saveLocalSwapSecret, clearLocalSwapSecret, updateLocalSwapSecretId, hashSecret } from '../utils/hashlock';
+import { submitSwapSecret, resolveSwapIdByHashLock } from '../services/coordinator';
 import { PrivacyBanner } from './PrivacyBanner';
 import { ExplorerLinks } from './ExplorerLinks';
 
@@ -322,6 +322,29 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
                       ? receiptObj['txid']
                       : 'pending';
 
+            // Step 8: Resolve the ACTUAL on-chain swap ID via coordinator.
+            // The simulation swap ID may differ if another swap was mined between
+            // simulation and confirmation (race condition).
+            setStatusMessage('Verifying swap ID on-chain...');
+            let resolvedSwapId = swapId;
+            for (let attempt = 0; attempt < 36; attempt++) {
+                if (cancelledRef.current) break;
+                const actualId = await resolveSwapIdByHashLock(hashLockHex);
+                if (actualId !== null) {
+                    const actualBigInt = BigInt(actualId);
+                    if (actualBigInt !== swapId) {
+                        console.warn(`[CreateSwap] Swap ID corrected: simulated=${swapId}, actual=${actualId}`);
+                        updateLocalSwapSecretId(swapId.toString(), actualId);
+                        resolvedSwapId = actualBigInt;
+                    }
+                    break;
+                }
+                // Coordinator hasn't detected the swap yet — wait and retry
+                if (attempt < 35) {
+                    await new Promise<void>((r) => setTimeout(r, 5_000));
+                }
+            }
+
             // Submit secret + view key + XMR payout to coordinator with retries.
             // The coordinator may not know about this swap yet (it creates the record
             // when the OPNet watcher detects the on-chain tx in the next block), so
@@ -330,7 +353,7 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
             let secretSubmitted = false;
             for (let attempt = 0; attempt < 36; attempt++) {
                 if (cancelledRef.current) break;
-                const result = await submitSwapSecret(swapId.toString(), secret, aliceViewKey, aliceXmrPayout);
+                const result = await submitSwapSecret(resolvedSwapId.toString(), secret, aliceViewKey, aliceXmrPayout);
                 if (result.ok) {
                     secretSubmitted = true;
                     break;
@@ -343,9 +366,9 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
                 console.warn('[CreateSwap] Secret not confirmed by coordinator — SwapStatus will retry');
             }
 
-            setTxResult({ txId, swapId });
+            setTxResult({ txId, swapId: resolvedSwapId });
             setStep('done');
-            onSwapCreated(swapId);
+            onSwapCreated(resolvedSwapId);
         } catch (err) {
             setStep('error');
             setStatusMessage(err instanceof Error ? err.message : 'Unknown error occurred');
