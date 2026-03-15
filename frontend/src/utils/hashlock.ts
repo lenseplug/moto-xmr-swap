@@ -3,6 +3,7 @@
  * Uses SHA-256 (Bitcoin's hash function, not Keccak-256).
  * All operations use Uint8Array — never Buffer.
  */
+import { sha256 } from '@noble/hashes/sha2.js';
 import { generateEd25519KeyPair } from './ed25519';
 import type { LocalSwapSecret } from '../types/swap';
 
@@ -31,8 +32,7 @@ export async function generateSecretAndHashLock(): Promise<{
     const secretBytes = crypto.getRandomValues(new Uint8Array(32));
     const secretHex = uint8ArrayToHex(secretBytes);
 
-    const hashBytes = await crypto.subtle.digest('SHA-256', secretBytes);
-    const hashHex = uint8ArrayToHex(new Uint8Array(hashBytes));
+    const hashHex = uint8ArrayToHex(sha256(secretBytes));
     const hashLock = BigInt('0x' + hashHex);
 
     return { secret: secretHex, hashLock, hashLockHex: hashHex };
@@ -69,8 +69,7 @@ export async function generateTrustlessSecret(): Promise<{
     const aliceViewKey = uint8ArrayToHex(viewKeyPair.privateKey);
 
     // hash_lock = SHA-256(spend_private_key)
-    const hashBytes = await crypto.subtle.digest('SHA-256', spendKeyPair.privateKey.buffer as ArrayBuffer);
-    const hashHex = uint8ArrayToHex(new Uint8Array(hashBytes));
+    const hashHex = uint8ArrayToHex(sha256(spendKeyPair.privateKey));
     const hashLock = BigInt('0x' + hashHex);
 
     return { secret, hashLock, hashLockHex: hashHex, aliceViewKey, aliceEd25519Pub };
@@ -108,8 +107,7 @@ export function hexToUint8Array(hex: string): Uint8Array {
  */
 export async function hashSecret(secretHex: string): Promise<bigint> {
     const secretBytes = hexToUint8Array(secretHex);
-    const hashBytes = await crypto.subtle.digest('SHA-256', secretBytes.buffer as ArrayBuffer);
-    const hashHex = uint8ArrayToHex(new Uint8Array(hashBytes));
+    const hashHex = uint8ArrayToHex(sha256(secretBytes));
     return BigInt('0x' + hashHex);
 }
 

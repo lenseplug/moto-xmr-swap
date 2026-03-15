@@ -10,6 +10,7 @@
  */
 
 import { ed25519 } from '@noble/curves/ed25519.js';
+import { sha256 } from '@noble/hashes/sha2.js';
 
 /** Ed25519 curve order (l). */
 const ED25519_ORDER = 2n ** 252n + 27742317777372353535851937790883648493n;
@@ -101,8 +102,7 @@ export async function signBobKeyProof(
 ): Promise<Uint8Array> {
     // 1. Compute deterministic challenge
     const challengeData = new TextEncoder().encode('bob-key-proof:' + swapId);
-    const challengeBuffer = await crypto.subtle.digest('SHA-256', challengeData);
-    const challenge = new Uint8Array(challengeBuffer);
+    const challenge = sha256(challengeData);
 
     // 2. Generate random nonce k
     const kRaw = crypto.getRandomValues(new Uint8Array(32));
@@ -117,8 +117,7 @@ export async function signBobKeyProof(
     hashInput.set(R_bytes, 0);
     hashInput.set(bobPublicKey, 32);
     hashInput.set(challenge, 64);
-    const eBuffer = await crypto.subtle.digest('SHA-256', hashInput);
-    const e = bytesToScalar(new Uint8Array(eBuffer)) % ED25519_ORDER;
+    const e = bytesToScalar(sha256(hashInput)) % ED25519_ORDER;
 
     // 5. Compute s = (k + e * bobPriv) mod l
     const x = bytesToScalar(bobPrivateKey) % ED25519_ORDER;

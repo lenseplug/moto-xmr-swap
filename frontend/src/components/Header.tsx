@@ -3,6 +3,8 @@
  */
 import React from 'react';
 import { useWalletConnect, SupportedWallets } from '@btc-vision/walletconnect';
+import motoLogo from '../assets/motoswap-logo.png';
+import xmrLogo from '../assets/monero-xmr-logo.png';
 
 type TabId = 'orderbook' | 'create' | 'myswaps' | 'docs';
 
@@ -67,14 +69,14 @@ export function Header({ activeTab, onTabChange }: HeaderProps): React.ReactElem
                     <div style={{ display: 'flex', alignItems: 'center', gap: '16px', flexShrink: 0 }}>
                         <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
                             <img
-                                src="/moto-logo.png"
+                                src={motoLogo}
                                 alt="MOTO"
                                 width={34}
                                 height={34}
                                 style={{ borderRadius: '50%' }}
                             />
                             <img
-                                src="/xmr-logo.png"
+                                src={xmrLogo}
                                 alt="XMR"
                                 width={34}
                                 height={34}

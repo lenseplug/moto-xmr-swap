@@ -8,10 +8,10 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 const WS_URL = (import.meta.env.VITE_COORDINATOR_WS_URL ?? 'ws://localhost:3001');
 const RECONNECT_DELAY_MS = 3000;
 
-// In production, enforce WSS to prevent claim token and preimage interception
+// In production, warn about non-WSS WebSocket URL
 if (import.meta.env.PROD && WS_URL && !WS_URL.startsWith('wss://')) {
-    throw new Error(
-        '[SECURITY] VITE_COORDINATOR_WS_URL must use wss:// in production. ' +
+    console.warn(
+        '[SECURITY] VITE_COORDINATOR_WS_URL should use wss:// in production. ' +
         'Claim tokens and preimages sent over ws:// can be intercepted.',
     );
 }

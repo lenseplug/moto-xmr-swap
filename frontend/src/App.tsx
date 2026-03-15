@@ -9,6 +9,8 @@ import { TakeSwap } from './components/TakeSwap';
 import { SwapStatus } from './components/SwapStatus';
 import { MySwaps } from './components/MySwaps';
 import { Docs } from './components/Docs';
+import motoLogo from './assets/motoswap-logo.png';
+import xmrLogo from './assets/monero-xmr-logo.png';
 
 type TabId = 'orderbook' | 'create' | 'myswaps' | 'docs';
 
@@ -96,7 +98,7 @@ export default function App(): React.ReactElement {
                 aria-hidden="true"
             >
                 <img
-                    src="/moto-logo.png"
+                    src={motoLogo}
                     alt=""
                     style={{
                         position: 'absolute',
@@ -110,7 +112,7 @@ export default function App(): React.ReactElement {
                     }}
                 />
                 <img
-                    src="/xmr-logo.png"
+                    src={xmrLogo}
                     alt=""
                     style={{
                         position: 'absolute',
@@ -146,7 +148,7 @@ export default function App(): React.ReactElement {
                     }}
                 >
                     <img
-                        src="/moto-logo.png"
+                        src={motoLogo}
                         alt="MOTO"
                         width={52}
                         height={52}
@@ -166,7 +168,7 @@ export default function App(): React.ReactElement {
                         <span style={{ color: 'var(--color-text-primary)', marginLeft: '12px' }}>SWAP</span>
                     </h1>
                     <img
-                        src="/xmr-logo.png"
+                        src={xmrLogo}
                         alt="XMR"
                         width={52}
                         height={52}
