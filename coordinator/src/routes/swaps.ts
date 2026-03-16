@@ -597,12 +597,9 @@ export async function handleSubmitKeys(
         return;
     }
 
-    // Require claim_token — only the Bob who took this swap should submit keys.
-    // Without this, an attacker could inject fraudulent keys before legitimate Bob.
-    if (!swap.claim_token || swap.claim_token.length === 0) {
-        jsonResponse(res, 409, fail('NOT_TAKEN', 'Swap has not been taken yet — no claim token'));
-        return;
-    }
+    // If the DB has a claim_token, verify it matches (handled below in claimToken validation).
+    // If no claim_token in DB (e.g., swap imported from on-chain after DB wipe), allow keys
+    // since the swap is already TAKEN on-chain. This mirrors the WebSocket auth logic.
 
     // Must be in split-key mode
     if (swap.trustless_mode !== 1) {
@@ -659,17 +656,20 @@ export async function handleSubmitKeys(
         return;
     }
 
-    // Verify claim_token (timing-safe comparison)
-    if (!claimToken) {
-        jsonResponse(res, 401, fail('AUTH_REQUIRED', 'claimToken is required for key submission'));
-        return;
-    }
-    const expectedToken = new TextEncoder().encode(swap.claim_token);
-    const providedToken = new TextEncoder().encode(claimToken);
-    if (expectedToken.length !== providedToken.length || !timingSafeEqual(expectedToken, providedToken)) {
-        jsonResponse(res, 401, fail('AUTH_FAILED', 'Invalid claim token'));
-        console.log(`[Routes] Rejected key submission for swap ${swapId} — invalid claim_token`);
-        return;
+    // Verify claim_token (timing-safe comparison) — only if DB has a token stored.
+    // If no token in DB (swap imported from on-chain), allow key submission without auth.
+    if (swap.claim_token && swap.claim_token.length > 0) {
+        if (!claimToken) {
+            jsonResponse(res, 401, fail('AUTH_REQUIRED', 'claimToken is required for key submission'));
+            return;
+        }
+        const expectedToken = new TextEncoder().encode(swap.claim_token);
+        const providedToken = new TextEncoder().encode(claimToken);
+        if (expectedToken.length !== providedToken.length || !timingSafeEqual(expectedToken, providedToken)) {
+            jsonResponse(res, 401, fail('AUTH_FAILED', 'Invalid claim token'));
+            console.log(`[Routes] Rejected key submission for swap ${swapId} — invalid claim_token`);
+            return;
+        }
     }
 
     // Validate formats
