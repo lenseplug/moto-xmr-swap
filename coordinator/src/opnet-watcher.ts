@@ -9,6 +9,7 @@ import { type IOnChainSwap, type ISwapRecord, type IUpdateSwapParams, SwapStatus
 import { StorageService } from './storage.js';
 import { SwapStateMachine } from './state-machine.js';
 import { ed25519PublicFromPrivate } from './crypto/index.js';
+import { withSwapLock } from './routes/swaps.js';
 
 /** Typed SwapVault contract interface for coordinator-side reads. */
 interface ISwapVaultContract extends IOP_NETContract {
@@ -70,7 +71,7 @@ const SWAP_VAULT_ABI: BitcoinInterfaceAbi = [
  * (not COMPLETED). COMPLETED is a coordinator-only terminal state that
  * requires additional processing (e.g., Alice sweeping XMR).
  */
-function mapOnChainStatus(raw: bigint): SwapStatus {
+function mapOnChainStatus(raw: bigint): SwapStatus | null {
     switch (raw) {
         case 0n:
             return SwapStatus.OPEN;
@@ -81,7 +82,8 @@ function mapOnChainStatus(raw: bigint): SwapStatus {
         case 3n:
             return SwapStatus.REFUNDED;
         default:
-            return SwapStatus.OPEN;
+            console.warn(`[OPNet Watcher] Unknown on-chain status value: ${raw} — skipping`);
+            return null;
     }
 }
 
@@ -122,6 +124,9 @@ export class OpnetWatcher {
     /** Cached contract instance to avoid recreation on every poll. */
     private cachedContract: ISwapVaultContract | null = null;
 
+    /** Tracks the highest block number observed per swap to detect reorgs. */
+    private readonly lastSeenBlock = new Map<string, bigint>();
+
     public constructor(storage: StorageService, stateMachine: SwapStateMachine) {
         this.storage = storage;
         this.stateMachine = stateMachine;
@@ -130,6 +135,17 @@ export class OpnetWatcher {
             network: networks.opnetTestnet,
             timeout: 20_000,
         });
+
+        // Refuse to start without a contract address — silent empty string would skip all polling
+        // and silently miss on-chain events, risking fund loss.
+        const isMockMode = (process.env['MONERO_MOCK'] ?? 'false').toLowerCase() === 'true';
+        if (!CONTRACT_ADDRESS && !isMockMode) {
+            console.error(
+                '[OPNet Watcher] FATAL: SWAP_CONTRACT_ADDRESS is not set. Cannot monitor on-chain state.\n' +
+                '[OPNet Watcher] Set SWAP_CONTRACT_ADDRESS in your .env file.',
+            );
+            process.exit(1);
+        }
 
         // Allow tests to seed a non-zero block height so startXmrLocking doesn't defer.
         const mockBlock = process.env['MOCK_BLOCK_HEIGHT'];
@@ -302,7 +318,7 @@ export class OpnetWatcher {
             xmrAddressLo: props.xmrAddressLo ?? 0n,
         };
 
-        this.upsertFromOnChain(onChain);
+        await this.upsertFromOnChain(onChain);
     }
 
     /**
@@ -313,13 +329,38 @@ export class OpnetWatcher {
     private static readonly COORDINATOR_ONLY_STATES: ReadonlySet<SwapStatus> = new Set([
         SwapStatus.XMR_LOCKING,
         SwapStatus.XMR_LOCKED,
+        SwapStatus.XMR_SWEEPING,
         SwapStatus.MOTO_CLAIMING,
     ]);
 
-    private upsertFromOnChain(onChain: IOnChainSwap): void {
+    private async upsertFromOnChain(onChain: IOnChainSwap): Promise<void> {
         const swapIdStr = onChain.swapId.toString();
-        const existing = this.storage.getSwap(swapIdStr);
         const onChainMappedStatus = mapOnChainStatus(onChain.status);
+
+        // Unknown on-chain status — skip processing entirely
+        if (onChainMappedStatus === null) return;
+
+        // Reorg detection: warn if block number decreases for this swap.
+        // A reorg could cause a confirmed state to be undone.
+        const prevBlock = this.lastSeenBlock.get(swapIdStr) ?? 0n;
+        if (this.currentBlockNumber > 0n && this.currentBlockNumber < prevBlock) {
+            console.warn(
+                `[OPNet Watcher] POSSIBLE REORG: block ${this.currentBlockNumber} < previous ${prevBlock} for swap ${swapIdStr}. ` +
+                `State may be stale — re-reading on-chain data.`,
+            );
+        }
+        if (this.currentBlockNumber > prevBlock) {
+            this.lastSeenBlock.set(swapIdStr, this.currentBlockNumber);
+        }
+
+        // Acquire per-swap lock to prevent race conditions with route handlers
+        await withSwapLock(swapIdStr, async () => {
+            this.doUpsertFromOnChain(onChain, swapIdStr, onChainMappedStatus);
+        });
+    }
+
+    private doUpsertFromOnChain(onChain: IOnChainSwap, swapIdStr: string, onChainMappedStatus: SwapStatus): void {
+        const existing = this.storage.getSwap(swapIdStr);
 
         if (!existing) {
             const xmrAmountStr = onChain.xmrAmount.toString();
@@ -331,6 +372,10 @@ export class OpnetWatcher {
             const xmrTotal = calculateXmrTotal(xmrAmountStr);
 
             const hashLockHex = onChain.hashLock.toString(16).padStart(64, '0');
+            if (!/^[a-f0-9]{64}$/.test(hashLockHex)) {
+                console.error(`[OPNet Watcher] Swap ${swapIdStr}: invalid hashLock format after conversion: '${hashLockHex.slice(0, 20)}...'`);
+                return;
+            }
 
             // Check for pre-registered secret backup
             const backup = this.storage.getSecretBackup(hashLockHex);
@@ -403,10 +448,6 @@ export class OpnetWatcher {
             onChain.counterparty.length > 0 &&
             onChain.counterparty !== existing.counterparty;
 
-        const updates: IUpdateSwapParams = hasNewCounterparty
-            ? { status: onChainMappedStatus, counterparty: onChain.counterparty }
-            : { status: onChainMappedStatus };
-
         // Set refund TX marker for terminal transitions so state machine guards are satisfied
         if (onChainMappedStatus === SwapStatus.REFUNDED && !existing.opnet_refund_tx) {
             this.storage.updateSwap(swapIdStr, { opnet_refund_tx: 'on-chain-confirmed' });
@@ -420,6 +461,27 @@ export class OpnetWatcher {
             }
         }
 
+        // Re-read swap after pre-setting fields, then validate guards
+        const preUpdated = this.storage.getSwap(swapIdStr);
+        if (!preUpdated) return;
+
+        // Apply counterparty if needed before guard validation
+        const validationSwap = hasNewCounterparty
+            ? { ...preUpdated, counterparty: onChain.counterparty } as typeof preUpdated
+            : preUpdated;
+
+        try {
+            this.stateMachine.validate(validationSwap, onChainMappedStatus);
+        } catch (guardErr: unknown) {
+            const msg = guardErr instanceof Error ? guardErr.message : String(guardErr);
+            console.warn(`[OPNet Watcher] Guard rejected ${prevStatus} → ${onChainMappedStatus} for swap ${swapIdStr}: ${msg}`);
+            return;
+        }
+
+        const updates: IUpdateSwapParams = hasNewCounterparty
+            ? { status: onChainMappedStatus, counterparty: onChain.counterparty }
+            : { status: onChainMappedStatus };
+
         const updated = this.storage.updateSwap(swapIdStr, updates, prevStatus);
         this.stateMachine.notifyTransition(updated, prevStatus, onChainMappedStatus);
         console.log(
@@ -430,15 +492,21 @@ export class OpnetWatcher {
         // On-chain CLAIMED means the claim TX is confirmed — the swap is done.
         if (onChainMappedStatus === SwapStatus.MOTO_CLAIMING) {
             const current = this.storage.getSwap(swapIdStr);
-            if (current && this.stateMachine.canTransition(SwapStatus.MOTO_CLAIMING, SwapStatus.COMPLETED)) {
-                const completed = this.storage.updateSwap(
-                    swapIdStr,
-                    { status: SwapStatus.COMPLETED },
-                    SwapStatus.MOTO_CLAIMING,
-                    'On-chain claim confirmed',
-                );
-                this.stateMachine.notifyTransition(completed, SwapStatus.MOTO_CLAIMING, SwapStatus.COMPLETED);
-                console.log(`[OPNet Watcher] Swap ${swapIdStr}: MOTO_CLAIMING → COMPLETED (on-chain confirmed)`);
+            if (current) {
+                try {
+                    this.stateMachine.validate(current, SwapStatus.COMPLETED);
+                    const completed = this.storage.updateSwap(
+                        swapIdStr,
+                        { status: SwapStatus.COMPLETED },
+                        SwapStatus.MOTO_CLAIMING,
+                        'On-chain claim confirmed',
+                    );
+                    this.stateMachine.notifyTransition(completed, SwapStatus.MOTO_CLAIMING, SwapStatus.COMPLETED);
+                    console.log(`[OPNet Watcher] Swap ${swapIdStr}: MOTO_CLAIMING → COMPLETED (on-chain confirmed)`);
+                } catch (guardErr: unknown) {
+                    const msg = guardErr instanceof Error ? guardErr.message : String(guardErr);
+                    console.warn(`[OPNet Watcher] Guard rejected MOTO_CLAIMING → COMPLETED for swap ${swapIdStr}: ${msg}`);
+                }
             }
         }
     }
@@ -447,29 +515,57 @@ export class OpnetWatcher {
      * Checks all active swaps against the current block to mark expired ones.
      * @param currentBlock - The current OPNet block number.
      */
+    /** Prunes lastSeenBlock entries for swaps that have reached terminal state. */
+    public pruneLastSeenBlock(): void {
+        let pruned = 0;
+        for (const swapId of this.lastSeenBlock.keys()) {
+            const swap = this.storage.getSwap(swapId);
+            if (!swap || this.stateMachine.isTerminal(swap.status) || swap.status === SwapStatus.EXPIRED) {
+                this.lastSeenBlock.delete(swapId);
+                pruned++;
+            }
+        }
+        if (pruned > 0) {
+            console.log(`[OPNet Watcher] Pruned ${pruned} lastSeenBlock entries (${this.lastSeenBlock.size} remaining)`);
+        }
+    }
+
     public checkExpirations(currentBlock: bigint): ISwapRecord[] {
+        // Periodically prune lastSeenBlock to prevent unbounded memory growth
+        this.pruneLastSeenBlock();
+
         const active = this.storage.getActiveSwaps();
         const expired: ISwapRecord[] = [];
 
         for (const swap of active) {
-            if (this.stateMachine.isTerminal(swap.status)) continue;
-            if (swap.status === SwapStatus.EXPIRED) continue;
+            try {
+                if (this.stateMachine.isTerminal(swap.status)) continue;
+                if (swap.status === SwapStatus.EXPIRED) continue;
 
-            if (BigInt(swap.refund_block) <= currentBlock) {
-                if (!this.stateMachine.canTransition(swap.status, SwapStatus.EXPIRED)) continue;
+                // Never auto-expire XMR_LOCKED or XMR_SWEEPING — doing so creates a
+                // double-spend race where the preimage is already revealed/broadcast
+                // but the coordinator would also sweep XMR back to the operator.
+                if (swap.status === SwapStatus.XMR_LOCKED || swap.status === SwapStatus.XMR_SWEEPING) continue;
 
-                const prev = swap.status;
-                const updated = this.storage.updateSwap(
-                    swap.swap_id,
-                    { status: SwapStatus.EXPIRED },
-                    prev,
-                    `Block ${currentBlock} exceeded refund block ${swap.refund_block}`,
-                );
-                this.stateMachine.notifyTransition(updated, prev, SwapStatus.EXPIRED);
-                expired.push(updated);
-                console.log(
-                    `[OPNet Watcher] Swap ${swap.swap_id} expired at block ${currentBlock}`,
-                );
+                if (BigInt(swap.refund_block) <= currentBlock) {
+                    if (!this.stateMachine.canTransition(swap.status, SwapStatus.EXPIRED)) continue;
+
+                    const prev = swap.status;
+                    const updated = this.storage.updateSwap(
+                        swap.swap_id,
+                        { status: SwapStatus.EXPIRED },
+                        prev,
+                        `Block ${currentBlock} exceeded refund block ${swap.refund_block}`,
+                    );
+                    this.stateMachine.notifyTransition(updated, prev, SwapStatus.EXPIRED);
+                    expired.push(updated);
+                    console.log(
+                        `[OPNet Watcher] Swap ${swap.swap_id} expired at block ${currentBlock}`,
+                    );
+                }
+            } catch (err: unknown) {
+                const msg = err instanceof Error ? err.message : 'Unknown error';
+                console.error(`[OPNet Watcher] checkExpirations: error processing swap ${swap.swap_id}: ${msg}`);
             }
         }
 

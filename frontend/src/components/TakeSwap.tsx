@@ -1,17 +1,20 @@
 /**
  * TakeSwap component — shows swap details and allows counterparty to take the swap.
+ * Uses BIP39 mnemonic for key derivation — zero localStorage.
  */
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useEffect } from 'react';
 import { useWalletConnect } from '@btc-vision/walletconnect';
 import { networks } from '@btc-vision/bitcoin';
 import { getSwapVaultContract, formatTokenAmount, formatXmrAmount } from '../services/opnet';
 import { joinXmrAddress } from '../services/opnet';
 import { notifySwapTaken, submitBobKeys } from '../services/coordinator';
-import { saveClaimToken, saveBobKeys, markBobKeysSubmitted } from '../utils/hashlock';
-import { generateEd25519KeyPair, signBobKeyProof } from '../utils/ed25519';
-import { uint8ArrayToHex } from '../utils/hashlock';
+import { generateSwapMnemonic, deriveBobKeys } from '../utils/mnemonic';
+import { signBobKeyProof } from '../utils/ed25519';
+import { uint8ArrayToHex, hexToUint8Array } from '../utils/hashlock';
+import { useSwapSession } from '../contexts/SwapSessionContext';
 import { useSwap, useBlockNumber } from '../hooks/useSwaps';
 import { SWAP_STATUS_LABELS, calculateXmrFee, calculateXmrTotal } from '../types/swap';
+import { MnemonicDisplay } from './MnemonicDisplay';
 import { ExplorerLinks } from './ExplorerLinks';
 import { SkeletonBlock } from './SkeletonRow';
 
@@ -23,46 +26,71 @@ interface TakeSwapProps {
     readonly onTaken: (swapId: bigint) => void;
 }
 
-/**
- * TakeSwap view — displays swap details and the "Take Swap" action.
- */
 export function TakeSwap({ swapId, onBack, onTaken }: TakeSwapProps): React.ReactElement {
     const { publicKey, address: senderAddress, walletAddress } = useWalletConnect();
+    const { setSession } = useSwapSession();
     const isConnected = publicKey !== null;
     const { swap, isLoading, error: loadError } = useSwap(swapId);
     const currentBlock = useBlockNumber();
 
-    const [step, setStep] = useState<'idle' | 'taking' | 'done' | 'error'>('idle');
+    const [step, setStep] = useState<'idle' | 'mnemonic' | 'taking' | 'done' | 'error'>('idle');
     const [statusMessage, setStatusMessage] = useState<string>('');
     const [txId, setTxId] = useState<string | null>(null);
     const [errorMsg, setErrorMsg] = useState<string | null>(null);
+    const [mnemonic, setMnemonic] = useState<string | null>(null);
 
-    const handleTake = useCallback(async (): Promise<void> => {
+    // Warn user before closing/navigating away during mnemonic step.
+    // Losing the mnemonic means losing access to swap funds.
+    useEffect(() => {
+        if (step !== 'mnemonic') return;
+        const handler = (e: BeforeUnloadEvent): void => {
+            e.preventDefault();
+        };
+        window.addEventListener('beforeunload', handler);
+        return () => window.removeEventListener('beforeunload', handler);
+    }, [step]);
+
+    // Step 1: Generate mnemonic and show it
+    const handleStartTake = useCallback((): void => {
         if (!isConnected || !walletAddress || !publicKey || !senderAddress) {
             setErrorMsg('Connect your wallet first');
             return;
         }
-
         if (!SWAP_VAULT_ADDRESS) {
             setErrorMsg('Contract address not configured');
             return;
         }
-
         if (swap === null) {
             setErrorMsg('Swap data not loaded');
             return;
         }
-
         if (swap.status !== 0n) {
             setErrorMsg('Swap is not in OPEN status');
             return;
         }
 
+        const words = generateSwapMnemonic();
+        setMnemonic(words);
+        setStep('mnemonic');
+        setErrorMsg(null);
+    }, [isConnected, walletAddress, publicKey, senderAddress, swap]);
+
+    // Step 2: User confirmed words -> proceed with on-chain tx
+    const handleMnemonicConfirmed = useCallback(async (): Promise<void> => {
+        if (!mnemonic || !senderAddress || !walletAddress) return;
+        if (!SWAP_VAULT_ADDRESS) return;
+
         setStep('taking');
         setErrorMsg(null);
-        setStatusMessage('Simulating take transaction...');
+        setStatusMessage('Deriving swap keys from mnemonic...');
 
         try {
+            // Pass hashLock to bind DLEQ proof to this specific swap (prevents cross-swap replay)
+            const swapHashLock = swap ? swap.hashLock.toString(16).padStart(64, '0') : undefined;
+            const bobKeys = await deriveBobKeys(mnemonic, swapHashLock);
+
+            setStatusMessage('Simulating take transaction...');
+
             const contract = getSwapVaultContract(SWAP_VAULT_ADDRESS, senderAddress);
 
             const sim = await contract.takeSwap(swapId);
@@ -96,57 +124,45 @@ export function TakeSwap({ swapId, onBack, onTaken }: TakeSwapProps): React.Reac
             setTxId(resultTxId);
             setStatusMessage('Notifying coordinator...');
 
-            // Notify coordinator to begin XMR locking and capture claim_token
-            const takeResult = await notifySwapTaken(swapId.toString(), resultTxId);
-            if (takeResult.claimToken) {
-                saveClaimToken(swapId.toString(), takeResult.claimToken);
-            }
+            // Notify coordinator with deterministic claimTokenHint (required, from mnemonic)
+            const takeResult = await notifySwapTaken(swapId.toString(), resultTxId, bobKeys.claimTokenHex);
+            const claimToken = takeResult.claimToken ?? bobKeys.claimTokenHex;
 
-            // Navigate to SwapStatus immediately — key submission continues async below
-            // but Bob is already on the status page (handles refresh/interruption gracefully)
+            // Set session context — clear mnemonic from memory after keys are derived
+            setSession({
+                swapId: swapId.toString(),
+                role: 'bob',
+                mnemonic: '',
+                aliceKeys: null,
+                bobKeys,
+            });
+            setMnemonic(null);
+
+            // Navigate to SwapStatus immediately
             setStep('done');
             onTaken(swapId);
 
-            setStatusMessage('Generating split-key material...');
-
-            // Generate Bob's ed25519 keys and submit with proof-of-knowledge
+            // Submit Bob's keys with proof-of-knowledge (async, continues after navigation)
+            setStatusMessage('Submitting split-key material...');
             try {
-                const bobSpendKey = generateEd25519KeyPair();
-                const bobViewKeyPair = generateEd25519KeyPair();
-
-                const bobPubHex = uint8ArrayToHex(bobSpendKey.publicKey);
-                const bobViewHex = uint8ArrayToHex(bobViewKeyPair.privateKey);
-                const bobSpendHex = uint8ArrayToHex(bobSpendKey.privateKey);
+                const bobSpendKeyBytes = hexToUint8Array(bobKeys.bobSpendKey);
+                const bobPubBytes = hexToUint8Array(bobKeys.bobEd25519PubKey);
 
                 const keyProof = await signBobKeyProof(
-                    bobSpendKey.privateKey,
-                    bobSpendKey.publicKey,
+                    bobSpendKeyBytes,
+                    bobPubBytes,
                     swapId.toString(),
                 );
                 const proofHex = uint8ArrayToHex(keyProof);
 
-                setStatusMessage('Submitting keys to coordinator...');
-
-                // Persist keys BEFORE submission so we can retry from SwapStatus
-                saveBobKeys({
-                    swapId: swapId.toString(),
-                    bobEd25519PubKey: bobPubHex,
-                    bobViewKey: bobViewHex,
-                    bobSpendKey: bobSpendHex,
+                await submitBobKeys(swapId.toString(), {
+                    bobEd25519PubKey: bobKeys.bobEd25519PubKey,
+                    bobViewKey: bobKeys.bobViewKey,
                     bobKeyProof: proofHex,
-                });
-
-                const keysOk = await submitBobKeys(swapId.toString(), {
-                    bobEd25519PubKey: bobPubHex,
-                    bobViewKey: bobViewHex,
-                    bobKeyProof: proofHex,
-                    bobSpendKey: bobSpendHex,
-                }, takeResult.claimToken ?? undefined);
-                if (keysOk) {
-                    markBobKeysSubmitted(swapId.toString());
-                } else {
-                    console.warn('Bob key submission returned non-OK — will retry from status page');
-                }
+                    bobSpendKey: bobKeys.bobSpendKey,
+                    bobSecp256k1Pub: bobKeys.bobSecp256k1Pub,
+                    bobDleqProof: bobKeys.bobDleqProof,
+                }, claimToken);
             } catch (keyErr) {
                 console.warn('Failed to submit Bob keys — will retry from status page:', keyErr);
             }
@@ -154,7 +170,7 @@ export function TakeSwap({ swapId, onBack, onTaken }: TakeSwapProps): React.Reac
             setStep('error');
             setErrorMsg(err instanceof Error ? err.message : 'Unknown error');
         }
-    }, [isConnected, walletAddress, publicKey, senderAddress, swap, swapId, onTaken]);
+    }, [mnemonic, senderAddress, walletAddress, swapId, setSession, onTaken]);
 
     const blocksLeft =
         swap !== null && currentBlock !== null && swap.refundBlock > currentBlock
@@ -195,6 +211,34 @@ export function TakeSwap({ swapId, onBack, onTaken }: TakeSwapProps): React.Reac
             </span>
         </div>
     );
+
+    // Show mnemonic display
+    if (step === 'mnemonic' && mnemonic) {
+        return (
+            <div style={{ maxWidth: '520px' }}>
+                <button
+                    className="btn btn-ghost btn-sm"
+                    onClick={() => { setStep('idle'); setMnemonic(null); }}
+                    style={{ marginBottom: '20px' }}
+                >
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                        <line x1="19" y1="12" x2="5" y2="12" />
+                        <polyline points="12 19 5 12 12 5" />
+                    </svg>
+                    Back
+                </button>
+                <div style={{ marginBottom: '20px' }}>
+                    <h2 style={{ fontSize: '1.35rem', fontWeight: 700, marginBottom: '4px' }}>
+                        Take Swap
+                    </h2>
+                    <p style={{ fontSize: '0.875rem', color: 'var(--color-text-secondary)' }}>
+                        Step 2: Save your recovery words before the take transaction is sent.
+                    </p>
+                </div>
+                <MnemonicDisplay mnemonic={mnemonic} onConfirm={() => void handleMnemonicConfirmed()} />
+            </div>
+        );
+    }
 
     return (
         <div style={{ maxWidth: '520px' }}>
@@ -387,15 +431,34 @@ export function TakeSwap({ swapId, onBack, onTaken }: TakeSwapProps): React.Reac
                             </div>
                         )}
 
-                        {step !== 'done' && swap.status === 0n && !isExpired && (
-                            <button
-                                className="btn btn-primary btn-lg"
-                                style={{ width: '100%', marginTop: '20px' }}
-                                disabled={!isConnected || step === 'taking'}
-                                onClick={() => void handleTake()}
-                            >
-                                {step === 'taking' ? (statusMessage || 'Taking Swap...') : 'Take Swap'}
-                            </button>
+                        {step !== 'done' && step !== 'mnemonic' && swap.status === 0n && !isExpired && (
+                            <>
+                                <div
+                                    style={{
+                                        padding: '12px 14px',
+                                        background: 'rgba(255, 215, 64, 0.06)',
+                                        border: '1px solid rgba(255, 215, 64, 0.15)',
+                                        borderRadius: 'var(--radius-md)',
+                                        marginTop: '16px',
+                                        fontSize: '0.78rem',
+                                        color: 'var(--color-text-secondary)',
+                                        lineHeight: 1.55,
+                                    }}
+                                >
+                                    <strong style={{ color: 'var(--color-text-warning)' }}>Before you take this swap:</strong>{' '}
+                                    You will be given <strong>12 recovery words</strong> — have pen and paper ready.
+                                    After taking the swap, you will need to <strong>deposit XMR</strong> to a shared escrow address.
+                                    The swap requires ~20 minutes for Monero confirmations.
+                                </div>
+                                <button
+                                    className="btn btn-primary btn-lg"
+                                    style={{ width: '100%', marginTop: '12px' }}
+                                    disabled={!isConnected || step === 'taking'}
+                                    onClick={handleStartTake}
+                                >
+                                    {step === 'taking' ? (statusMessage || 'Taking Swap...') : 'Take Swap'}
+                                </button>
+                            </>
                         )}
 
                         {(swap.status !== 0n || isExpired) && step !== 'done' && (

@@ -1,15 +1,22 @@
 /**
  * SwapStatus component — state machine visualization for a swap's lifecycle.
+ * Uses SwapSessionContext for keys (no localStorage).
+ * On page refresh, shows MnemonicInput for recovery.
  */
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useWalletConnect } from '@btc-vision/walletconnect';
 import { networks } from '@btc-vision/bitcoin';
 import { getSwapVaultContract, formatTokenAmount, formatXmrAmount } from '../services/opnet';
 import { calculateXmrFee, calculateXmrTotal } from '../types/swap';
-import { getCoordinatorSwapStatus, submitSwapSecret, submitBobKeys, fetchMySecret } from '../services/coordinator';
-import { getLocalSwapSecret, getClaimToken, clearLocalSwapSecret, clearClaimToken, secretHexToBigint, getBobKeys, markBobKeysSubmitted, clearBobKeys, saveLocalSwapSecret } from '../utils/hashlock';
+import { getCoordinatorSwapStatus, submitSwapSecret, submitBobKeys } from '../services/coordinator';
+import { secretHexToBigint, uint8ArrayToHex, hexToUint8Array } from '../utils/hashlock';
+import { deriveAliceKeys, deriveBobKeys } from '../utils/mnemonic';
+import { signBobKeyProof } from '../utils/ed25519';
+import { verifyDleqProof } from '../utils/dleq';
+import { useSwapSession } from '../contexts/SwapSessionContext';
 import { useSwap, useBlockNumber } from '../hooks/useSwaps';
 import { useCoordinatorWs } from '../hooks/useCoordinatorWs';
+import { MnemonicInput } from './MnemonicInput';
 import type { CoordinatorStatus } from '../types/swap';
 import { ExplorerLinks } from './ExplorerLinks';
 import { SkeletonBlock } from './SkeletonRow';
@@ -23,13 +30,14 @@ interface SwapStatusProps {
     readonly onBack: () => void;
 }
 
-type StepKey = 'created' | 'taken' | 'xmr_locking' | 'xmr_locked' | 'claimed' | 'complete';
+type StepKey = 'created' | 'taken' | 'xmr_locking' | 'xmr_locked' | 'xmr_sweeping' | 'claimed' | 'complete';
 
 const STEPS: Array<{ key: StepKey; label: string; description: string }> = [
     { key: 'created', label: 'Created', description: 'MOTO locked in vault' },
     { key: 'taken', label: 'Taken', description: 'Counterparty accepted' },
     { key: 'xmr_locking', label: 'XMR Locking', description: 'Awaiting XMR deposit' },
     { key: 'xmr_locked', label: 'XMR Locked', description: 'XMR in escrow' },
+    { key: 'xmr_sweeping', label: 'Securing XMR', description: 'Sending XMR to seller' },
     { key: 'claimed', label: 'Claimed', description: 'MOTO claimed' },
     { key: 'complete', label: 'Complete', description: 'Swap finalized' },
 ];
@@ -39,7 +47,7 @@ function getActiveDescription(step: StepKey, isAlice: boolean, xmrConfirmations?
     const descriptions: Record<StepKey, string> = {
         created: isAlice
             ? 'Your MOTO is locked on-chain. Waiting for a buyer to accept this swap.'
-            : 'Your take transaction is confirming on-chain (3–5 min).',
+            : 'Your take transaction is confirming on-chain (3-5 min).',
         taken: isAlice
             ? 'A buyer has accepted your swap. The coordinator is setting up the XMR escrow.'
             : 'Swap accepted. The coordinator is generating the XMR escrow address.',
@@ -53,6 +61,9 @@ function getActiveDescription(step: StepKey, isAlice: boolean, xmrConfirmations?
         xmr_locked: isAlice
             ? 'XMR is safely locked in escrow. Waiting for the buyer to claim MOTO.'
             : 'XMR is locked. You can now claim your MOTO.',
+        xmr_sweeping: isAlice
+            ? 'XMR is being sent to your Monero wallet. Once confirmed, the buyer can claim MOTO.'
+            : 'XMR is being secured for the seller. You\'ll be able to claim MOTO once this completes.',
         claimed: isAlice
             ? 'The buyer claimed your MOTO. XMR is being automatically sent to your wallet...'
             : 'You successfully claimed MOTO!',
@@ -67,14 +78,12 @@ function stepIndex(step: StepKey): number {
     return STEPS.findIndex((s) => s.key === step);
 }
 
-/**
- * Renders the swap state machine progress and relevant actions.
- */
 export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElement {
     const { publicKey, address: senderAddress, walletAddress } = useWalletConnect();
     const isConnected = publicKey !== null;
     const { swap, isLoading, error: loadError } = useSwap(swapId);
     const currentBlock = useBlockNumber();
+    const { session, setSession } = useSwapSession();
 
     const [coordinatorStatus, setCoordinatorStatus] = useState<CoordinatorStatus | null>(null);
     const [claimStep, setClaimStep] = useState<'idle' | 'claiming' | 'done' | 'error'>('idle');
@@ -83,171 +92,141 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
     const [actionTxId, setActionTxId] = useState<string | null>(null);
     const [actionError, setActionError] = useState<string | null>(null);
 
-    const [recoveredSecret, setRecoveredSecret] = useState<{ secret: string; aliceViewKey: string | null; aliceXmrPayout: string | null } | null>(null);
-    const recoveryAttempted = useRef(false);
+    // DLEQ verification state for counterparty's cross-curve key binding
+    const [dleqVerified, setDleqVerified] = useState<'pending' | 'valid' | 'invalid' | 'none'>('none');
+    const dleqCheckedRef = useRef<string | null>(null);
 
-    const localSecret = getLocalSwapSecret(swapId.toString());
-    // Stable reference for useEffect deps — only changes if the actual secret string changes
-    const localSecretHex = localSecret?.secret ?? recoveredSecret?.secret ?? null;
-    const localViewKey = localSecret?.aliceViewKey ?? recoveredSecret?.aliceViewKey ?? undefined;
-    const localXmrPayout = localSecret?.aliceXmrPayout ?? recoveredSecret?.aliceXmrPayout ?? undefined;
+    // Keys from session context (set by CreateSwap/TakeSwap/RecoverSwap)
+    const isSessionActive = session !== null && session.swapId === swapId.toString();
+    const aliceKeys = isSessionActive ? session.aliceKeys : null;
+    const bobKeys = isSessionActive ? session.bobKeys : null;
+    const sessionRole = isSessionActive ? session.role : null;
 
-    // If no local secret, try recovering from coordinator (authenticated by depositor address).
-    // The coordinator is the authoritative store — localStorage is just a cache.
-    const swapDepositor = swap?.depositor;
-    const swapHashLock = swap?.hashLock;
-    useEffect(() => {
-        if (localSecret || recoveryAttempted.current || !swapDepositor || !senderAddress) return;
-        // Only attempt if connected wallet matches the depositor
-        if (swapDepositor.toLowerCase() !== senderAddress.toString().toLowerCase()) return;
-        recoveryAttempted.current = true;
+    // Derived values
+    const secretHex = aliceKeys?.secret ?? null;
+    const aliceViewKey = aliceKeys?.aliceViewKey ?? undefined;
+    // hashLockHex: Alice has it from session. For Bob, derive from on-chain swap data
+    // so the WS hook can verify preimage integrity via SHA-256 check.
+    const swapHashLockHex = swap ? swap.hashLock.toString(16).padStart(64, '0') : null;
+    const hashLockHex = aliceKeys?.hashLockHex ?? swapHashLockHex;
+    const claimToken = bobKeys?.claimTokenHex ?? null;
 
-        void fetchMySecret(swapId.toString(), senderAddress.toString()).then((result) => {
-            if (result) {
-                console.log('[SwapStatus] Recovered secret from coordinator (authenticated)');
-                const hashLockHex = result.hashLock ?? swapHashLock?.toString(16).padStart(64, '0') ?? '';
-                setRecoveredSecret(result);
-                // Re-save to localStorage as cache
-                if (hashLockHex) {
-                    saveLocalSwapSecret(swapId.toString(), result.secret, hashLockHex, result.aliceViewKey ?? undefined, result.aliceXmrPayout ?? undefined);
-                }
-            }
-        });
-    }, [swapDepositor, swapHashLock, swapId, localSecret, senderAddress]);
+    const isAlice = sessionRole === 'alice';
+    const isBob = sessionRole === 'bob';
 
-    // Retrieve claim_token for authenticated WebSocket subscription
-    const claimToken = getClaimToken(swapId.toString());
+    // WebSocket for real-time preimage delivery
+    const { preimage: wsPreimage, queuePosition } = useCoordinatorWs(swapId.toString(), claimToken, hashLockHex);
 
-    // WebSocket connection for real-time preimage delivery (authenticated)
-    // Pass hashLock so received preimages are verified before acceptance
-    const { preimage: wsPreimage, queuePosition } = useCoordinatorWs(swapId.toString(), claimToken, localSecret?.hashLock ?? null);
+    // Combined preimage: prefer session secret, fall back to WebSocket preimage
+    const claimablePreimage = secretHex ?? wsPreimage;
 
-    // Combined preimage: prefer local secret, fall back to WebSocket preimage
-    const claimablePreimage = localSecret?.secret ?? wsPreimage;
-
-    // Persistently retry submitting secret to coordinator until it succeeds.
+    // Retry submitting Alice's secret to coordinator (max 30 attempts, exponential backoff)
+    const aliceSecp256k1Pub = aliceKeys?.aliceSecp256k1Pub ?? undefined;
+    const aliceDleqProof = aliceKeys?.aliceDleqProof ?? undefined;
+    const aliceRecoveryToken = aliceKeys?.recoveryToken ?? undefined;
     const secretSubmitted = useRef(false);
     useEffect(() => {
-        if (!localSecretHex) {
-
-            return;
-        }
-        if (secretSubmitted.current) {
-
-            return;
-        }
-
-
+        if (!secretHex || secretSubmitted.current || !aliceRecoveryToken) return;
 
         let cancelled = false;
-        let attemptCount = 0;
+        let attempt = 0;
+        const MAX_ATTEMPTS = 30;
+        const BASE_DELAY = 5_000;
+        const MAX_DELAY = 120_000;
 
         const trySubmit = async (): Promise<boolean> => {
-            attemptCount++;
-            const result = await submitSwapSecret(swapId.toString(), localSecretHex, localViewKey, localXmrPayout);
+            const result = await submitSwapSecret(swapId.toString(), secretHex, aliceRecoveryToken, aliceViewKey, undefined, aliceSecp256k1Pub, aliceDleqProof);
             return result.ok;
         };
 
-        const interval = setInterval(() => {
-            if (cancelled || secretSubmitted.current) {
-                clearInterval(interval);
-                return;
-            }
-            void trySubmit().then((ok) => {
-                if (ok) {
-                    secretSubmitted.current = true;
-                    clearInterval(interval);
-                }
-            });
-        }, 10_000);
+        const scheduleRetry = (): void => {
+            if (cancelled || secretSubmitted.current || attempt >= MAX_ATTEMPTS) return;
+            const delay = Math.min(BASE_DELAY * Math.pow(1.5, attempt), MAX_DELAY);
+            attempt++;
+            setTimeout(() => {
+                if (cancelled || secretSubmitted.current) return;
+                void trySubmit().then((ok) => {
+                    if (ok) {
+                        secretSubmitted.current = true;
+                    } else {
+                        scheduleRetry();
+                    }
+                });
+            }, delay);
+        };
 
-        // Try immediately
         void trySubmit().then((ok) => {
             if (ok) {
                 secretSubmitted.current = true;
-                clearInterval(interval);
+            } else {
+                scheduleRetry();
             }
         });
 
         return () => {
             cancelled = true;
-            clearInterval(interval);
         };
-    }, [localSecretHex, localViewKey, localXmrPayout, swapId]); // stable primitive deps
+    }, [secretHex, aliceViewKey, aliceSecp256k1Pub, aliceDleqProof, aliceRecoveryToken, swapId]);
 
-    // Persistently retry Bob key submission until it succeeds.
+    // Retry submitting Bob's keys to coordinator (max 30 attempts, exponential backoff)
     const bobKeysSubmittedRef = useRef(false);
     useEffect(() => {
-        if (bobKeysSubmittedRef.current) return;
-        const storedBobKeys = getBobKeys(swapId.toString());
-        if (!storedBobKeys || storedBobKeys.submitted) {
-            bobKeysSubmittedRef.current = true;
-            return;
-        }
+        if (bobKeysSubmittedRef.current || !bobKeys || !claimToken) return;
 
         let cancelled = false;
+        let attempt = 0;
+        const MAX_ATTEMPTS = 30;
+        const BASE_DELAY = 5_000;
+        const MAX_DELAY = 120_000;
+
         const trySubmit = async (): Promise<boolean> => {
             try {
+                const bobSpendKeyBytes = hexToUint8Array(bobKeys.bobSpendKey);
+                const bobPubBytes = hexToUint8Array(bobKeys.bobEd25519PubKey);
+                const keyProof = await signBobKeyProof(bobSpendKeyBytes, bobPubBytes, swapId.toString());
+                const proofHex = uint8ArrayToHex(keyProof);
+
                 return await submitBobKeys(swapId.toString(), {
-                    bobEd25519PubKey: storedBobKeys.bobEd25519PubKey,
-                    bobViewKey: storedBobKeys.bobViewKey,
-                    bobKeyProof: storedBobKeys.bobKeyProof,
-                    bobSpendKey: storedBobKeys.bobSpendKey,
-                }, claimToken ?? undefined);
+                    bobEd25519PubKey: bobKeys.bobEd25519PubKey,
+                    bobViewKey: bobKeys.bobViewKey,
+                    bobKeyProof: proofHex,
+                    bobSpendKey: bobKeys.bobSpendKey,
+                    bobSecp256k1Pub: bobKeys.bobSecp256k1Pub,
+                    bobDleqProof: bobKeys.bobDleqProof,
+                }, claimToken);
             } catch {
                 return false;
             }
         };
 
-        const interval = setInterval(() => {
-            if (cancelled || bobKeysSubmittedRef.current) {
-                clearInterval(interval);
-                return;
-            }
-            void trySubmit().then((ok) => {
-                if (ok) {
-                    markBobKeysSubmitted(swapId.toString());
-                    bobKeysSubmittedRef.current = true;
-                    clearInterval(interval);
-                }
-            });
-        }, 10_000);
+        const scheduleRetry = (): void => {
+            if (cancelled || bobKeysSubmittedRef.current || attempt >= MAX_ATTEMPTS) return;
+            const delay = Math.min(BASE_DELAY * Math.pow(1.5, attempt), MAX_DELAY);
+            attempt++;
+            setTimeout(() => {
+                if (cancelled || bobKeysSubmittedRef.current) return;
+                void trySubmit().then((ok) => {
+                    if (ok) {
+                        bobKeysSubmittedRef.current = true;
+                    } else {
+                        scheduleRetry();
+                    }
+                });
+            }, delay);
+        };
 
-        // Try immediately too
         void trySubmit().then((ok) => {
             if (ok) {
-                markBobKeysSubmitted(swapId.toString());
                 bobKeysSubmittedRef.current = true;
-                clearInterval(interval);
+            } else {
+                scheduleRetry();
             }
         });
 
         return () => {
             cancelled = true;
-            clearInterval(interval);
         };
-    }, [swapId]); // eslint-disable-line react-hooks/exhaustive-deps
-
-    // Conservative cleanup: only clear localStorage cache when swap is FULLY resolved.
-    // The coordinator is the authoritative store — localStorage is just a cache.
-    useEffect(() => {
-        if (swap === null) return;
-        const sweepDone = coordinatorStatus?.sweepStatus?.startsWith('done:');
-        const noXmrLocked = !coordinatorStatus?.xmrLockAddress && !coordinatorStatus?.sweepStatus;
-
-        if (swap.status === 2n && sweepDone) {
-            // CLAIMED + XMR sweep done → safe to clear
-            clearClaimToken(swapId.toString());
-            clearBobKeys(swapId.toString());
-            clearLocalSwapSecret(swapId.toString());
-        } else if (swap.status === 3n && (noXmrLocked || sweepDone)) {
-            // REFUNDED + no XMR was ever locked, OR refund sweep done → safe to clear
-            clearClaimToken(swapId.toString());
-            clearBobKeys(swapId.toString());
-            clearLocalSwapSecret(swapId.toString());
-        }
-        // Otherwise: keep the cache (coordinator has the authoritative copy)
-    }, [swap, swapId, coordinatorStatus?.sweepStatus, coordinatorStatus?.xmrLockAddress]);
+    }, [bobKeys, claimToken, swapId]);
 
     // Poll coordinator
     useEffect(() => {
@@ -266,13 +245,60 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
         };
     }, [swapId]);
 
-    // Determine user role: Alice created the swap (has secret), Bob took it (has claim token).
-    const isAlice = localSecret !== null;
-    const isBob = claimToken !== null && !isAlice;
+    // Verify counterparty's DLEQ proof when trustless mode is active.
+    // Bob verifies Alice's proof; Alice verifies Bob's proof.
+    // hashLockHex is in the dep array to re-verify when it becomes available
+    // (proof is context-bound to hashLock to prevent cross-swap replay).
+    useEffect(() => {
+        if (!coordinatorStatus?.trustlessMode) return;
+        // Must have hashLockHex to bind proof to this specific swap
+        if (!hashLockHex) return;
 
-    // Determine current progress step from on-chain + coordinator state.
-    // Coordinator status is authoritative for TAKEN onwards since on-chain
-    // confirmation lags by 1 block (3-5 min).
+        // Determine which counterparty proof to verify based on role
+        let edPubHex: string | undefined;
+        let secPubHex: string | undefined;
+        let proofHex: string | undefined;
+        let label: string;
+
+        if (isBob && coordinatorStatus.aliceEd25519Pub && coordinatorStatus.aliceSecp256k1Pub && coordinatorStatus.aliceDleqProof) {
+            edPubHex = coordinatorStatus.aliceEd25519Pub;
+            secPubHex = coordinatorStatus.aliceSecp256k1Pub;
+            proofHex = coordinatorStatus.aliceDleqProof;
+            label = 'Alice';
+        } else if (isAlice && coordinatorStatus.bobEd25519Pub && coordinatorStatus.bobSecp256k1Pub && coordinatorStatus.bobDleqProof) {
+            edPubHex = coordinatorStatus.bobEd25519Pub;
+            secPubHex = coordinatorStatus.bobSecp256k1Pub;
+            proofHex = coordinatorStatus.bobDleqProof;
+            label = 'Bob';
+        } else {
+            return; // Not enough data yet
+        }
+
+        // Deduplicate: only verify once per unique proof + context combo
+        const checkKey = `${edPubHex}:${proofHex}:${hashLockHex}`;
+        if (dleqCheckedRef.current === checkKey) return;
+        dleqCheckedRef.current = checkKey;
+
+        setDleqVerified('pending');
+
+        void (async () => {
+            try {
+                const edBytes = hexToUint8Array(edPubHex!);
+                const secBytes = hexToUint8Array(secPubHex!);
+                const proofBytes = hexToUint8Array(proofHex!);
+                const valid = await verifyDleqProof(edBytes, secBytes, proofBytes, hashLockHex);
+                setDleqVerified(valid ? 'valid' : 'invalid');
+                if (!valid) {
+                    console.error(`[DLEQ] ${label}'s cross-curve proof FAILED verification`);
+                }
+            } catch (err) {
+                console.error('[DLEQ] Verification error:', err);
+                setDleqVerified('invalid');
+            }
+        })();
+    }, [coordinatorStatus, isAlice, isBob, hashLockHex]);
+
+    // Determine current progress step
     const currentStep: StepKey = (() => {
         if (swap === null) return 'created';
         if (swap.status === 2n || swap.status === 3n) {
@@ -284,6 +310,7 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
                 cs === 'taken' ||
                 cs === 'xmr_locking' ||
                 cs === 'xmr_locked' ||
+                cs === 'xmr_sweeping' ||
                 cs === 'claimed' ||
                 cs === 'complete'
             ) {
@@ -291,8 +318,6 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
             }
         }
         if (swap.status === 1n) return 'taken';
-        // Bob took the swap but on-chain/coordinator hasn't confirmed yet —
-        // show 'taken' instead of misleading 'created' ("waiting for counterparty")
         if (isBob) return 'taken';
         return 'created';
     })();
@@ -308,7 +333,6 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
     const showRefundWarn = blocksLeft !== null && blocksLeft <= REFUND_WARN_BLOCKS && !isExpired;
     const canRefund = swap !== null && (swap.status === 0n || swap.status === 1n) && isExpired;
 
-    // Mutex guard to prevent double-submit on claim/refund/cancel
     const actionInProgressRef = useRef(false);
 
     const handleClaim = useCallback(async (): Promise<void> => {
@@ -318,7 +342,11 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
             return;
         }
         if (!claimablePreimage) {
-            setActionError('No secret available. Cannot claim from this device.');
+            setActionError('No secret available. Enter your 12 recovery words to claim.');
+            return;
+        }
+        if (coordinatorStatus?.trustlessMode && dleqVerified === 'invalid') {
+            setActionError('DLEQ proof verification failed — claim blocked for safety.');
             return;
         }
         if (!SWAP_VAULT_ADDRESS) {
@@ -382,7 +410,6 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
         setActionError(null);
 
         try {
-            // senderAddress from walletconnect context (already resolved)
             const contract = getSwapVaultContract(SWAP_VAULT_ADDRESS, senderAddress);
 
             const sim = await contract.refund(swapId);
@@ -465,7 +492,74 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
         }
     }, [isConnected, walletAddress, publicKey, senderAddress, swapId]);
 
-    // Depositor check for role-aware messaging
+    // Handle mnemonic recovery on page refresh
+    const [recoveryError, setRecoveryError] = useState<string | null>(null);
+    const handleMnemonicRecover = useCallback((mnemonic: string) => {
+        setRecoveryError(null);
+        void (async () => {
+            // Try Alice first
+            const alice = await deriveAliceKeys(mnemonic);
+            // Check if hashLock matches the swap
+            if (swap && swap.hashLock === alice.hashLock) {
+                setSession({
+                    swapId: swapId.toString(),
+                    role: 'alice',
+                    mnemonic: '',
+                    aliceKeys: alice,
+                    bobKeys: null,
+                });
+                return;
+            }
+
+            // Try Bob — verify derived keys match this swap
+            const bob = await deriveBobKeys(mnemonic, swapHashLockHex ?? undefined);
+
+            // Primary check: compare pubkey against coordinator's stored bob_ed25519_pub
+            if (coordinatorStatus?.bobEd25519Pub) {
+                if (bob.bobEd25519PubKey.toLowerCase() !== coordinatorStatus.bobEd25519Pub.toLowerCase()) {
+                    setRecoveryError('This mnemonic does not match this swap. Check your recovery words or try a different swap ID.');
+                    return;
+                }
+            } else {
+                // Fallback: verify claim_token maps to this swap via coordinator lookup
+                const COORDINATOR_BASE = import.meta.env.VITE_COORDINATOR_URL as string;
+                if (COORDINATOR_BASE && /^[0-9a-f]{64}$/i.test(bob.claimTokenHex)) {
+                    try {
+                        const res = await fetch(
+                            `${COORDINATOR_BASE}/api/swaps/by-claim-token/${bob.claimTokenHex}`,
+                            { signal: AbortSignal.timeout(10000) },
+                        );
+                        if (res.ok) {
+                            const body = (await res.json()) as { data?: { swap_id?: string } };
+                            const matchedId = body.data?.swap_id;
+                            if (matchedId && matchedId !== swapId.toString()) {
+                                setRecoveryError('This mnemonic belongs to a different swap. Check your recovery words or swap ID.');
+                                return;
+                            }
+                        } else if (res.status === 404) {
+                            setRecoveryError('This mnemonic does not match any known swap. Check your recovery words.');
+                            return;
+                        }
+                    } catch {
+                        // Network error — block recovery when coordinator is unreachable.
+                        // Allowing unverified recovery risks using wrong keys for the wrong swap,
+                        // which could lead to lost funds.
+                        setRecoveryError('Cannot verify mnemonic — coordinator is unreachable. Please try again when the coordinator is online.');
+                        return;
+                    }
+                }
+            }
+
+            setSession({
+                swapId: swapId.toString(),
+                role: 'bob',
+                mnemonic: '',
+                aliceKeys: null,
+                bobKeys: bob,
+            });
+        })();
+    }, [swap, swapId, setSession, coordinatorStatus]);
+
     const isDepositor = swap !== null && senderAddress !== null &&
         swap.depositor.toLowerCase() === senderAddress.toString().toLowerCase();
 
@@ -476,6 +570,77 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
     const xmrClaimPending =
         coordinatorStatus !== null &&
         coordinatorStatus.sweepStatus === 'pending';
+
+    // If no session keys and not a terminal state, show mnemonic input
+    const needsRecovery = !isSessionActive && swap !== null && swap.status < 2n;
+
+    if (needsRecovery) {
+        return (
+            <div style={{ maxWidth: '560px' }}>
+                <button
+                    className="btn btn-ghost btn-sm"
+                    onClick={onBack}
+                    style={{ marginBottom: '20px' }}
+                >
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                        <line x1="19" y1="12" x2="5" y2="12" />
+                        <polyline points="12 19 5 12 12 5" />
+                    </svg>
+                    Back
+                </button>
+
+                <div style={{ marginBottom: '20px' }}>
+                    <h2 style={{ fontSize: '1.35rem', fontWeight: 700, marginBottom: '4px' }}>
+                        Swap Status
+                    </h2>
+                    <p style={{ fontSize: '0.875rem', color: 'var(--color-text-secondary)' }}>
+                        ID:{' '}
+                        <span className="font-mono" style={{ color: 'var(--color-text-accent)' }}>
+                            {swapId.toString()}
+                        </span>
+                    </p>
+                </div>
+
+                <div className="glass-card" style={{ padding: '24px' }}>
+                    <p
+                        style={{
+                            fontSize: '0.9rem',
+                            fontWeight: 600,
+                            color: 'var(--color-text-warning)',
+                            marginBottom: '4px',
+                        }}
+                    >
+                        Session Expired
+                    </p>
+                    <p
+                        style={{
+                            fontSize: '0.82rem',
+                            color: 'var(--color-text-secondary)',
+                            marginBottom: '16px',
+                        }}
+                    >
+                        Enter your 12 recovery words to restore access to this swap.
+                    </p>
+                    <MnemonicInput onSubmit={handleMnemonicRecover} submitLabel="Restore Access" />
+                    {recoveryError && (
+                        <div
+                            style={{
+                                marginTop: '16px',
+                                padding: '12px 14px',
+                                background: 'rgba(255, 82, 82, 0.08)',
+                                border: '1px solid rgba(255, 82, 82, 0.25)',
+                                borderRadius: 'var(--radius-md)',
+                                color: 'var(--color-text-error)',
+                                fontSize: '0.875rem',
+                            }}
+                        >
+                            {recoveryError}
+                        </div>
+                    )}
+                </div>
+            </div>
+        );
+    }
 
     return (
         <div style={{ maxWidth: '560px' }}>
@@ -551,18 +716,19 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
                                 ? `XMR deposit — ${coordinatorStatus.xmrLockConfirmations}/10 confirmations`
                                 : (isAlice ? 'Awaiting XMR deposit' : 'Send XMR to the escrow address below'))}
                             {currentStep === 'xmr_locked' && ((isAlice || isDepositor) ? 'XMR locked — waiting for buyer' : 'XMR locked — claim your MOTO')}
+                            {currentStep === 'xmr_sweeping' && (isAlice ? 'Securing your XMR...' : 'XMR being secured for seller')}
                             {currentStep === 'claimed' && ((isAlice || isDepositor)
                                 ? (xmrClaimDone ? 'XMR sent to your wallet' : xmrClaimPending ? 'Sending XMR...' : 'Claim your XMR')
                                 : 'Swap complete')}
                         </p>
                         <p style={{ fontSize: '0.78rem', color: 'var(--color-text-secondary)' }}>
                             {currentStep === 'created' && (isAlice
-                                ? 'Your MOTO is locked on-chain. Waiting for someone to take your swap. OPNet blocks take 3–5 minutes.'
-                                : 'Your take transaction is confirming on-chain. OPNet blocks take 3–5 minutes — this page updates automatically.')}
+                                ? 'Your MOTO is locked on-chain. Waiting for someone to take your swap. OPNet blocks take 3-5 minutes.'
+                                : 'Your take transaction is confirming on-chain. OPNet blocks take 3-5 minutes — this page updates automatically.')}
                             {currentStep === 'taken' && (isAlice
                                 ? 'Someone accepted your swap! The coordinator is setting up the XMR escrow address. This is automatic.'
                                 : isBob && coordinatorStatus?.step === 'created'
-                                    ? 'Your take transaction is confirming on-chain. OPNet blocks take 3–5 minutes. Once confirmed, XMR escrow setup begins automatically.'
+                                    ? 'Your take transaction is confirming on-chain. OPNet blocks take 3-5 minutes. Once confirmed, XMR escrow setup begins automatically.'
                                     : 'You accepted this swap. The coordinator is generating the XMR escrow address — no action needed.')}
                             {currentStep === 'xmr_locking' && (
                                 <>
@@ -603,6 +769,9 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
                             {currentStep === 'xmr_locked' && ((isAlice || isDepositor)
                                 ? 'XMR is safely locked with 10+ confirmations. Waiting for the buyer to claim MOTO — no action needed.'
                                 : 'XMR is safely locked with 10+ confirmations. Click "Claim MOTO" to receive your tokens.')}
+                            {currentStep === 'xmr_sweeping' && (isAlice
+                                ? 'XMR is being sent to your Monero wallet. Once complete, the buyer can claim MOTO. No action needed.'
+                                : 'XMR is being secured for the seller. You\'ll be able to claim MOTO once this step completes — usually 1-2 minutes.')}
                             {currentStep === 'claimed' && ((isAlice || isDepositor)
                                 ? (xmrClaimDone
                                     ? 'XMR has been sent to your Monero wallet. It should arrive within a few minutes.'
@@ -612,6 +781,29 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
                                 : 'MOTO has been transferred to your wallet. The swap is complete.')}
                         </p>
                     </div>
+                </div>
+            )}
+
+            {/* Recovery words reminder — show during active swap states */}
+            {isSessionActive && currentStep !== 'complete' && swap !== null && swap.status < 2n && (
+                <div
+                    style={{
+                        padding: '10px 14px',
+                        background: 'rgba(255, 215, 64, 0.04)',
+                        border: '1px solid rgba(255, 215, 64, 0.12)',
+                        borderRadius: 'var(--radius-md)',
+                        marginBottom: '12px',
+                        fontSize: '0.75rem',
+                        color: 'var(--color-text-muted)',
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '8px',
+                    }}
+                >
+                    <span style={{ color: 'var(--color-text-warning)', fontWeight: 700, flexShrink: 0 }}>REMINDER</span>
+                    <span>
+                        If you close this tab, you will need your <strong style={{ color: 'var(--color-text-secondary)' }}>12 recovery words</strong> to return to this swap.
+                    </span>
                 </div>
             )}
 
@@ -634,7 +826,6 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
                                     position: 'relative',
                                 }}
                             >
-                                {/* Line connector */}
                                 {idx < STEPS.length - 1 && (
                                     <div
                                         style={{
@@ -650,7 +841,6 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
                                     />
                                 )}
 
-                                {/* Circle */}
                                 <div
                                     style={{
                                         width: '32px',
@@ -697,7 +887,6 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
                                     )}
                                 </div>
 
-                                {/* Content */}
                                 <div style={{ paddingTop: '4px', flex: 1 }}>
                                     <p
                                         style={{
@@ -868,11 +1057,45 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
                 </div>
             )}
 
+            {/* DLEQ Verification Status */}
+            {coordinatorStatus?.trustlessMode && dleqVerified === 'invalid' && (
+                <div
+                    style={{
+                        padding: '14px 16px',
+                        background: 'rgba(255, 82, 82, 0.12)',
+                        border: '2px solid rgba(255, 82, 82, 0.5)',
+                        borderRadius: 'var(--radius-md)',
+                        marginBottom: '16px',
+                        fontSize: '0.875rem',
+                        color: 'var(--color-text-error)',
+                    }}
+                >
+                    <strong>SECURITY WARNING: DLEQ proof verification failed.</strong>{' '}
+                    The counterparty&apos;s cross-curve key binding could not be verified. The lock address may not be jointly controlled.{' '}
+                    <strong>Do NOT proceed with this swap.</strong>
+                </div>
+            )}
+            {coordinatorStatus?.trustlessMode && dleqVerified === 'valid' && (
+                <div
+                    style={{
+                        padding: '10px 14px',
+                        background: 'rgba(0, 230, 118, 0.06)',
+                        border: '1px solid rgba(0, 230, 118, 0.2)',
+                        borderRadius: 'var(--radius-md)',
+                        marginBottom: '16px',
+                        fontSize: '0.8rem',
+                        color: 'var(--color-text-success)',
+                    }}
+                >
+                    Cross-curve key binding verified (DLEQ proof valid)
+                </div>
+            )}
+
             {/* XMR Lock Address */}
             {coordinatorStatus !== null &&
                 coordinatorStatus.xmrLockAddress !== undefined &&
                 /^[48][1-9A-HJ-NP-Za-km-z]{94}$/.test(coordinatorStatus.xmrLockAddress) &&
-                (coordinatorStatus.step === 'xmr_locking' || coordinatorStatus.step === 'xmr_locked') && (
+                (coordinatorStatus.step === 'xmr_locking' || coordinatorStatus.step === 'xmr_locked' || coordinatorStatus.step === 'xmr_sweeping') && (
                 <div
                     style={{
                         padding: '16px',
@@ -925,7 +1148,7 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
                 </div>
             )}
 
-            {/* Refund Warning (approaching expiry) */}
+            {/* Refund Warning */}
             {showRefundWarn && (
                 <div
                     style={{
@@ -946,7 +1169,7 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
                 </div>
             )}
 
-            {/* Expired — refund available */}
+            {/* Expired */}
             {canRefund && (
                 <div
                     style={{
@@ -1000,7 +1223,7 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
                 </div>
             )}
 
-            {/* Action area — shows state-appropriate message or claim button */}
+            {/* Claim button or waiting message */}
             {claimStep === 'claiming' ? (
                 <button className="btn btn-primary btn-lg" style={{ width: '100%', marginBottom: '12px' }} disabled>
                     Claiming...
@@ -1029,39 +1252,41 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
                         }}
                     />
                     <p style={{ fontSize: '0.875rem', color: 'var(--color-text-secondary)' }}>
-                        Claim transaction broadcast. Waiting for on-chain confirmation (1–2 blocks, ~3–10 min). The page will update automatically.
+                        Claim transaction broadcast. Waiting for on-chain confirmation (1-2 blocks, ~3-10 min). The page will update automatically.
                     </p>
                 </div>
             ) : swap !== null && swap.status < 2n && currentStep !== 'complete' && (
                 (() => {
-                    // Bob can claim once XMR is locked
                     const canClaim =
                         claimablePreimage !== null &&
-                        !localSecret &&
+                        !isAlice &&
                         coordinatorStatus !== null &&
                         (coordinatorStatus.step === 'xmr_locked' || coordinatorStatus.step === 'claimed');
+
+                    // Block claim if DLEQ verification failed in trustless mode
+                    const dleqBlocked = coordinatorStatus?.trustlessMode && dleqVerified === 'invalid';
 
                     if (canClaim) {
                         return (
                             <button
                                 className="btn btn-primary btn-lg"
                                 style={{ width: '100%', marginBottom: '12px' }}
-                                disabled={!isConnected}
+                                disabled={!isConnected || !!dleqBlocked}
                                 onClick={() => void handleClaim()}
+                                title={dleqBlocked ? 'Claim disabled — DLEQ proof verification failed' : undefined}
                             >
-                                Claim MOTO (reveal secret)
+                                {dleqBlocked ? 'Claim Blocked — DLEQ Failed' : 'Claim MOTO (reveal secret)'}
                             </button>
                         );
                     }
 
-                    // Otherwise show a waiting message appropriate to the current step and role
                     const waitingMessages: Record<string, string> = {
                         created: isAlice
                             ? 'Waiting for someone to take your swap. Your MOTO is safely locked on-chain.'
-                            : 'Connecting with seller. Your take transaction is confirming on-chain — OPNet blocks take 3–5 minutes.',
+                            : 'Connecting with seller. Your take transaction is confirming on-chain — OPNet blocks take 3-5 minutes.',
                         taken: isAlice
                             ? 'A counterparty accepted your swap! The coordinator is setting up the XMR escrow. This is automatic — no action needed.'
-                            : 'You accepted this swap. Waiting for on-chain confirmation and XMR escrow setup. OPNet blocks take 3–5 minutes.',
+                            : 'You accepted this swap. Waiting for on-chain confirmation and XMR escrow setup. OPNet blocks take 3-5 minutes.',
                         xmr_locking: (coordinatorStatus?.xmrLockConfirmations !== undefined && coordinatorStatus.xmrLockConfirmations > 0)
                             ? (isAlice
                                 ? 'XMR deposit received. Waiting for 10 confirmations. No action needed.'
@@ -1072,6 +1297,9 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
                         xmr_locked: (isAlice || isDepositor)
                             ? 'XMR is locked in escrow. Waiting for the counterparty to claim MOTO — no action needed from you.'
                             : 'XMR is locked! You can claim your MOTO once the secret is delivered.',
+                        xmr_sweeping: isAlice
+                            ? 'XMR is being sent to your Monero wallet. Once this completes, the buyer can claim MOTO.'
+                            : 'XMR is being secured for the seller. You\'ll be able to claim MOTO once the secret is delivered.',
                         claimed: (isAlice || isDepositor)
                             ? 'MOTO has been claimed. XMR is being automatically sent to your wallet...'
                             : 'You claimed MOTO! The swap is being finalized.',
@@ -1149,7 +1377,7 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
                 </div>
             )}
 
-            {/* Cancel action — OPEN swaps only, depositor only, no timelock needed */}
+            {/* Cancel */}
             {swap !== null && swap.status === 0n && isDepositor && cancelStep === 'idle' && !isExpired && (
                 <button
                     className="btn btn-ghost btn-lg"
@@ -1184,7 +1412,7 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
                 </div>
             )}
 
-            {/* Refund action */}
+            {/* Refund */}
             {canRefund && refundStep === 'idle' && (
                 <button
                     className="btn btn-ghost btn-lg"

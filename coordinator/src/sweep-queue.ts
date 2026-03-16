@@ -4,6 +4,10 @@
  * wallet-rpc is single-threaded (one wallet open at a time). This queue
  * ensures sweeps run one at a time while providing position visibility
  * to callers via onUpdate callbacks.
+ *
+ * Uses an async mutex (promise chain) instead of a boolean flag to prevent
+ * the race condition where two processNext() invocations could overlap if
+ * enqueue() fires between `processing = false` and the recursive call.
  */
 
 /** A pending sweep job. */
@@ -15,6 +19,8 @@ export interface SweepJob {
         readonly lockAddress: string;
         readonly aliceAmountPiconero: bigint;
         readonly aliceAddress?: string;
+        /** XMR lock tx hash — used to compute deposit-based restore_height for faster wallet scan. */
+        readonly lockTxId?: string;
     };
 }
 
@@ -34,7 +40,9 @@ const MAX_QUEUE_SIZE = 100;
 
 export class SweepQueue {
     private readonly queue: SweepJob[] = [];
-    private processing = false;
+    /** Promise chain acting as an async mutex — ensures only one processNext runs at a time. */
+    private processingChain: Promise<void> = Promise.resolve();
+    private _isProcessing = false;
     private readonly executor: SweepExecutor;
     private readonly onUpdate: QueueUpdateCallback;
 
@@ -43,20 +51,22 @@ export class SweepQueue {
         this.onUpdate = onUpdate;
     }
 
-    /** Enqueue a sweep job. No-op if swapId is already queued. Rejects if queue is full. */
-    public enqueue(job: SweepJob): void {
+    /** Enqueue a sweep job. Returns true if enqueued (or already queued), false if queue full. */
+    public enqueue(job: SweepJob): boolean {
         if (this.queue.some((j) => j.swapId === job.swapId)) {
             console.log(`[SweepQueue] ${job.swapId} already queued — skipping`);
-            return;
+            return true; // already queued, considered success
         }
         if (this.queue.length >= MAX_QUEUE_SIZE) {
-            console.warn(`[SweepQueue] Queue full (${MAX_QUEUE_SIZE}) — rejecting ${job.swapId}`);
-            return;
+            console.error(`[SweepQueue] Queue full (${MAX_QUEUE_SIZE}) — rejecting ${job.swapId}`);
+            return false;
         }
         this.queue.push(job);
         console.log(`[SweepQueue] Enqueued ${job.swapId} (queue length: ${this.queue.length})`);
         this.broadcastPositions();
-        void this.processNext();
+        // Chain the next processing step onto the mutex — prevents concurrent processNext()
+        this.processingChain = this.processingChain.then(() => this.processNext());
+        return true;
     }
 
     /** Returns the 1-based position for a swapId, or null if not queued. */
@@ -80,10 +90,15 @@ export class SweepQueue {
         return this.queue.length;
     }
 
-    private async processNext(): Promise<void> {
-        if (this.processing || this.queue.length === 0) return;
+    /** Whether a sweep is currently being processed. */
+    public get isProcessing(): boolean {
+        return this._isProcessing;
+    }
 
-        this.processing = true;
+    private async processNext(): Promise<void> {
+        if (this._isProcessing || this.queue.length === 0) return;
+
+        this._isProcessing = true;
         const job = this.queue[0]!;
 
         console.log(`[SweepQueue] Processing ${job.swapId} (${this.queue.length} in queue)`);
@@ -97,13 +112,11 @@ export class SweepQueue {
 
         // Remove the completed job (always — even on failure)
         this.queue.shift();
-        this.processing = false;
+        this._isProcessing = false;
 
         console.log(`[SweepQueue] Finished ${job.swapId} (${this.queue.length} remaining)`);
         this.broadcastPositions();
-
-        // Process next job if any
-        void this.processNext();
+        // No recursive call needed — enqueue() already chains processNext() on the mutex.
     }
 
     private broadcastPositions(): void {

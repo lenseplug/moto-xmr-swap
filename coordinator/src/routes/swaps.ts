@@ -20,9 +20,34 @@ import {
 import { StorageService } from '../storage.js';
 import { SwapStateMachine } from '../state-machine.js';
 import { SwapWebSocketServer } from '../websocket.js';
-import { randomBytes, timingSafeEqual } from 'node:crypto';
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { getFeeAddress, setFeeAddress, verifyPreimage, validateMoneroAddress } from '../monero-module.js';
-import { ed25519PublicFromPrivate, verifyBobKeyProof } from '../crypto/index.js';
+import { ed25519PublicFromPrivate, verifyBobKeyProof, verifyCrossCurveDleq, validateViewKeyScalar } from '../crypto/index.js';
+
+/**
+ * Constant-time token comparison that does NOT leak token length via early-return.
+ * Hashes both values before comparing — always compares 32-byte digests regardless of input length.
+ */
+function safeTokenCompare(expected: string, provided: string): boolean {
+    const hashExpected = createHash('sha256').update(expected).digest();
+    const hashProvided = createHash('sha256').update(provided).digest();
+    return timingSafeEqual(hashExpected, hashProvided);
+}
+
+/** Returns true if DLEQ proofs are mandatory (env-driven enforcement toggle). */
+function isDleqRequired(): boolean {
+    if (process.env['REQUIRE_DLEQ'] === 'true') return true;
+    const after = process.env['DLEQ_REQUIRED_AFTER'];
+    if (after) {
+        const date = new Date(after);
+        if (Number.isNaN(date.getTime())) {
+            console.error(`[DLEQ] DLEQ_REQUIRED_AFTER is an invalid date: "${after}" — treating as REQUIRED for safety`);
+            return true;
+        }
+        if (new Date() >= date) return true;
+    }
+    return false;
+}
 
 // ---------------------------------------------------------------------------
 // Per-swap operation lock to prevent TOCTOU races
@@ -34,7 +59,7 @@ const swapOperationLocks = new Map<string, Promise<void>>();
  * Serializes concurrent operations on the same swap.
  * Prevents TOCTOU race conditions where two requests check state simultaneously.
  */
-async function withSwapLock<T>(swapId: string, fn: () => Promise<T>): Promise<T> {
+export async function withSwapLock<T>(swapId: string, fn: () => Promise<T>): Promise<T> {
     const prev = swapOperationLocks.get(swapId) ?? Promise.resolve();
     let releaseLock!: () => void;
     const lockPromise = new Promise<void>((resolve) => { releaseLock = resolve; });
@@ -52,6 +77,99 @@ async function withSwapLock<T>(swapId: string, fn: () => Promise<T>): Promise<T>
     }
 }
 
+// ---------------------------------------------------------------------------
+// IP-based rate limiter (in-memory, no external deps)
+// ---------------------------------------------------------------------------
+
+interface IRateLimitBucket {
+    count: number;
+    resetAt: number;
+}
+
+/** Per-endpoint rate limiter. */
+class RateLimiter {
+    private readonly buckets = new Map<string, IRateLimitBucket>();
+    private readonly maxRequests: number;
+    private readonly windowMs: number;
+    private sweepTimer: NodeJS.Timeout;
+
+    constructor(maxRequests: number, windowMs: number) {
+        this.maxRequests = maxRequests;
+        this.windowMs = windowMs;
+        // Periodically sweep expired buckets to prevent memory leak
+        this.sweepTimer = setInterval(() => {
+            const now = Date.now();
+            for (const [key, bucket] of this.buckets) {
+                if (now >= bucket.resetAt) this.buckets.delete(key);
+            }
+        }, windowMs * 2);
+        this.sweepTimer.unref(); // Don't block process exit
+    }
+
+    /** Returns true if the request is allowed, false if rate-limited. */
+    check(ip: string): boolean {
+        if (RATE_LIMIT_DISABLED) return true;
+        const now = Date.now();
+        const bucket = this.buckets.get(ip);
+        if (!bucket || now >= bucket.resetAt) {
+            this.buckets.set(ip, { count: 1, resetAt: now + this.windowMs });
+            return true;
+        }
+        bucket.count++;
+        return bucket.count <= this.maxRequests;
+    }
+}
+
+/** When true, all per-endpoint rate limiting is disabled (test/dev mode).
+ * The production safety check in index.ts calls process.exit(1) before this
+ * code runs, but we duplicate the check here for defense-in-depth. */
+const RATE_LIMIT_DISABLED = (() => {
+    const disabled = (process.env['RATE_LIMIT_DISABLED'] ?? 'false').toLowerCase() === 'true';
+    if (disabled) {
+        const isProduction = process.env['NODE_ENV'] === 'production' ||
+            (process.env['REQUIRE_TLS'] ?? 'false').toLowerCase() === 'true';
+        if (isProduction) return false; // Never disable in production
+    }
+    return disabled;
+})();
+
+/** Rate limiters for sensitive endpoints. */
+const secretSubmitLimiter = new RateLimiter(10, 60_000);    // 10 req/min per IP
+const keySubmitLimiter = new RateLimiter(10, 60_000);       // 10 req/min per IP
+export const claimXmrLimiter = new RateLimiter(5, 60_000);  // 5 req/min per IP
+const createSwapLimiter = new RateLimiter(5, 60_000);       // 5 req/min per IP
+const takeSwapLimiter = new RateLimiter(5, 60_000);         // 5 req/min per IP
+const recoverSecretLimiter = new RateLimiter(5, 60_000);    // 5 req/min per IP
+const backupSecretLimiter = new RateLimiter(5, 60_000);     // 5 req/min per IP
+
+/** Whether to trust X-Forwarded-For header (only behind a known reverse proxy). */
+const TRUST_PROXY = (process.env['TRUST_PROXY'] ?? 'false').toLowerCase() === 'true';
+
+/** Whether mock mode is enabled (cached at module load, not read per-request). */
+const IS_MOCK_MODE = (process.env['MONERO_MOCK'] ?? 'false').toLowerCase() === 'true';
+
+/**
+ * Extracts client IP from request (X-Forwarded-For only trusted when TRUST_PROXY=true).
+ * Uses the RIGHTMOST entry — that's the one set by the trusted reverse proxy.
+ * Leftmost is attacker-controlled and trivially spoofable via X-Forwarded-For header.
+ */
+export function getClientIp(req: IncomingMessage): string {
+    if (TRUST_PROXY) {
+        const forwarded = req.headers['x-forwarded-for'];
+        if (typeof forwarded === 'string') {
+            const parts = forwarded.split(',').map((s) => s.trim()).filter((s) => s.length > 0);
+            const rightmost = parts[parts.length - 1];
+            return rightmost ?? 'unknown';
+        }
+    }
+    return req.socket.remoteAddress ?? 'unknown';
+}
+
+/** Sends a 429 Too Many Requests response. */
+function tooManyRequests(res: ServerResponse): void {
+    jsonResponse(res, 429, fail('RATE_LIMITED', 'Too many requests — try again later', true));
+}
+
 /** Returns a structured success response. */
 function success<T>(data: T): IApiResponse<T> {
     return { success: true, data, error: null };
@@ -65,8 +183,13 @@ function fail(code: string, message: string, retryable = false): IApiResponse<ne
 
 const MAX_BODY_BYTES = 65536;
 
-/** Reads and parses the request body as JSON. Enforces a maximum body size. */
+/** Reads and parses the request body as JSON. Enforces Content-Type and maximum body size. */
 async function readBody(req: IncomingMessage): Promise<unknown> {
+    // Require Content-Type: application/json to prevent CSRF via text/plain forms
+    const ct = req.headers['content-type'] ?? '';
+    if (!ct.includes('application/json')) {
+        return Promise.reject(new Error('Content-Type must be application/json'));
+    }
     return new Promise((resolve, reject) => {
         let raw = '';
         let bytesRead = 0;
@@ -127,13 +250,33 @@ function parsePagination(url: URL): IPaginationParams {
  * Strips sensitive fields (preimage) from a swap record before sending to clients.
  * The preimage is ONLY delivered via WebSocket, never via HTTP.
  */
-function sanitizeSwapForApi(swap: ISwapRecord): Omit<ISwapRecord, 'preimage' | 'claim_token' | 'alice_view_key' | 'bob_view_key' | 'bob_spend_key'> & { preimage: null; claim_token: null; alice_view_key: null; bob_view_key: null; bob_spend_key: null } {
-    return { ...swap, preimage: null, claim_token: null, alice_view_key: null, bob_view_key: null, bob_spend_key: null };
+function sanitizeSwapForApi(swap: ISwapRecord): Record<string, unknown> {
+    return {
+        ...swap,
+        preimage: null,
+        claim_token: null,
+        alice_view_key: null,
+        bob_view_key: null,
+        bob_spend_key: null,
+        recovery_token: null,
+        // Strip Alice's XMR payout address from public API — it links her Bitcoin identity
+        // to her Monero address, breaking cross-chain privacy. Only exposed via authenticated
+        // endpoints (my-secret, admin).
+        alice_xmr_payout: null,
+        // DLEQ proofs and secp256k1 pubkeys are zero-knowledge proofs, NOT secrets.
+        // They MUST be exposed so the counterparty can verify cross-curve key binding.
+        // alice_dleq_proof, bob_dleq_proof, alice_secp256k1_pub, bob_secp256k1_pub: kept as-is
+    };
 }
 
-/** Handler: GET /api/health */
-export function handleHealth(_req: IncomingMessage, res: ServerResponse): void {
-    jsonResponse(res, 200, success({ status: 'ok', timestamp: new Date().toISOString() }));
+/** Handler: GET /api/health — accepts optional wallet health checker. */
+export function handleHealth(_req: IncomingMessage, res: ServerResponse, walletHealthCheck?: () => boolean): void {
+    const walletHealthy = walletHealthCheck ? walletHealthCheck() : true;
+    jsonResponse(res, 200, success({
+        status: walletHealthy ? 'ok' : 'degraded',
+        timestamp: new Date().toISOString(),
+        walletHealthy,
+    }));
 }
 
 /** Handler: GET /api/swaps */
@@ -147,6 +290,44 @@ export function handleListSwaps(
     const swaps = storage.listSwaps(page, limit);
     const sanitized = swaps.map(sanitizeSwapForApi);
     jsonResponse(res, 200, success({ swaps: sanitized, page, limit }));
+}
+
+/** Handler: GET /api/swaps/by-hashlock/:hashLockHex */
+export function handleGetSwapByHashLock(
+    _req: IncomingMessage,
+    res: ServerResponse,
+    storage: StorageService,
+    hashLockHex: string,
+): void {
+    if (!/^[0-9a-f]{64}$/i.test(hashLockHex)) {
+        jsonResponse(res, 400, fail('VALIDATION', 'hashLockHex must be exactly 64 hex characters'));
+        return;
+    }
+    const swap = storage.getSwapByHashLock(hashLockHex.toLowerCase());
+    if (!swap) {
+        jsonResponse(res, 404, fail('NOT_FOUND', 'No swap found with this hash lock'));
+        return;
+    }
+    jsonResponse(res, 200, success({ swap_id: swap.swap_id }));
+}
+
+/** Handler: GET /api/swaps/by-claim-token/:claimTokenHex */
+export function handleGetSwapByClaimToken(
+    _req: IncomingMessage,
+    res: ServerResponse,
+    storage: StorageService,
+    claimTokenHex: string,
+): void {
+    if (!/^[0-9a-f]{64}$/i.test(claimTokenHex)) {
+        jsonResponse(res, 400, fail('VALIDATION', 'claimTokenHex must be exactly 64 hex characters'));
+        return;
+    }
+    const swap = storage.getSwapByClaimToken(claimTokenHex.toLowerCase());
+    if (!swap) {
+        jsonResponse(res, 404, fail('NOT_FOUND', 'No swap found with this claim token'));
+        return;
+    }
+    jsonResponse(res, 200, success({ swap_id: swap.swap_id }));
 }
 
 /** Handler: GET /api/swaps/:id */
@@ -186,6 +367,7 @@ export async function handleTakeSwap(
     stateMachine: SwapStateMachine,
     wsServer: SwapWebSocketServer,
 ): Promise<void> {
+    if (!takeSwapLimiter.check(getClientIp(req))) { tooManyRequests(res); return; }
     // Per-swap lock prevents TOCTOU race: two concurrent take requests
     // can no longer both pass the claim_token check simultaneously.
     return withSwapLock(swapId, async () => {
@@ -247,19 +429,47 @@ export async function handleTakeSwap(
             return;
         }
 
-        // Generate a one-time claim_token for authenticated WebSocket subscription
-        const claimToken = randomBytes(32).toString('hex');
+        // Require claimTokenHint: deterministically derived from Bob's mnemonic via HKDF.
+        // This is 256-bit entropy — an attacker cannot guess it without the mnemonic.
+        // Always required — no random fallback. This ensures Bob can recover the swap.
+        const hint = typeof (body as unknown as Record<string, unknown>)['claimTokenHint'] === 'string'
+            ? ((body as unknown as Record<string, unknown>)['claimTokenHint'] as string).trim().toLowerCase()
+            : null;
+        if (!hint || !/^[0-9a-f]{64}$/.test(hint)) {
+            jsonResponse(res, 400, fail('VALIDATION', 'claimTokenHint (64 hex chars, from mnemonic) is required'));
+            return;
+        }
+        const claimToken = hint;
         const currentSwap = freshSwap ?? swap;
         const wasOpen = currentSwap.status === SwapStatus.OPEN;
 
         // If swap is OPEN, transition to TAKEN immediately so Bob can submit keys
         // without waiting for the OPNet watcher to detect the on-chain take.
         if (wasOpen) {
+            const counterparty = body.opnetTxId.trim().replace(/[^0-9a-fA-F]/g, '').slice(0, 64);
+            // Validate counterparty is a proper 64-char hex transaction ID.
+            if (counterparty.length !== 64) {
+                jsonResponse(res, 400, fail('VALIDATION', 'opnetTxId must be a valid 64-character hex transaction hash'));
+                return;
+            }
+            // Validate transition BEFORE writing, using a synthetic swap with updated fields.
+            // This avoids a non-atomic two-step write that could leave claim_token set
+            // but status still OPEN on crash (permanently blocking future take attempts).
+            const syntheticSwap = { ...currentSwap, counterparty, claim_token: claimToken } as ISwapRecord;
+            try {
+                stateMachine.validate(syntheticSwap, SwapStatus.TAKEN);
+            } catch (err: unknown) {
+                const msg = err instanceof Error ? err.message : 'Invalid transition';
+                jsonResponse(res, 409, fail('INVALID_TRANSITION', msg));
+                return;
+            }
+            // Atomic write: claim_token + counterparty + status in a single SQL UPDATE.
+            // Uses fromState=OPEN for optimistic concurrency — no partial state on crash.
             storage.updateSwap(swapId, {
                 claim_token: claimToken,
+                counterparty,
                 status: SwapStatus.TAKEN,
-                counterparty: body.opnetTxId.trim().replace(/[^0-9a-fA-F]/g, '').slice(0, 64),
-            });
+            } as IUpdateSwapParams, SwapStatus.OPEN, 'Swap taken');
         } else {
             storage.updateSwap(swapId, { claim_token: claimToken });
         }
@@ -272,9 +482,11 @@ export async function handleTakeSwap(
             wsServer.broadcastSwapUpdate(updatedSwap);
         }
 
+        // Return sanitized values only — never reflect raw user input
+        const sanitizedTxId = body.opnetTxId.trim().replace(/[^0-9a-fA-F]/g, '').slice(0, 64);
         jsonResponse(res, 200, success({
             swap: sanitizeSwapForApi(updatedSwap ?? currentSwap),
-            opnetTxId: body.opnetTxId.trim(),
+            opnetTxId: sanitizedTxId,
             claim_token: claimToken,
         }));
     });
@@ -293,12 +505,30 @@ export async function handleSubmitSecret(
     storage: StorageService,
     swapId: string,
 ): Promise<void> {
+    if (!secretSubmitLimiter.check(getClientIp(req))) { tooManyRequests(res); return; }
     // Per-swap lock prevents concurrent preimage submissions from both
     // passing the null check before either stores.
     return withSwapLock(swapId, async () => {
         const swap = storage.getSwap(swapId);
         if (!swap) {
             jsonResponse(res, 404, fail('NOT_FOUND', `Swap ${swapId} not found`));
+            return;
+        }
+
+        // Auth: require recovery_token (issued at swap creation, known only to Alice).
+        // This prevents an attacker who intercepts the preimage from setting alice_xmr_payout.
+        const recoveryTokenHeader = req.headers['x-recovery-token'];
+        if (typeof recoveryTokenHeader !== 'string' || !recoveryTokenHeader) {
+            jsonResponse(res, 401, fail('AUTH_REQUIRED', 'X-Recovery-Token header is required'));
+            return;
+        }
+        if (!swap.recovery_token || swap.recovery_token.length === 0) {
+            jsonResponse(res, 403, fail('NO_TOKEN', 'No recovery token set for this swap'));
+            return;
+        }
+        if (!safeTokenCompare(swap.recovery_token, recoveryTokenHeader)) {
+            jsonResponse(res, 403, fail('FORBIDDEN', 'Invalid recovery token'));
+            console.log(`[Routes] Rejected secret submission for swap ${swapId} — invalid recovery_token`);
             return;
         }
 
@@ -322,6 +552,8 @@ export async function handleSubmitSecret(
         let secret: string;
         let aliceViewKey: string | undefined;
         let aliceXmrPayout: string | undefined;
+        let aliceSecp256k1Pub: string | undefined;
+        let aliceDleqProof: string | undefined;
         try {
             const parsed = await readBody(req);
             if (
@@ -346,6 +578,12 @@ export async function handleSubmitSecret(
                     return;
                 }
             }
+            if (typeof candidate['aliceSecp256k1Pub'] === 'string') {
+                aliceSecp256k1Pub = candidate['aliceSecp256k1Pub'].trim().toLowerCase();
+            }
+            if (typeof candidate['aliceDleqProof'] === 'string') {
+                aliceDleqProof = candidate['aliceDleqProof'].trim().toLowerCase();
+            }
         } catch (err: unknown) {
             const msg = err instanceof Error ? err.message : 'Invalid request';
             jsonResponse(res, 400, fail('INVALID_BODY', msg));
@@ -362,6 +600,17 @@ export async function handleSubmitSecret(
             return;
         }
 
+        // Validate Alice's view key produces a non-degenerate ed25519 point.
+        // A malicious Alice could submit a view key that, when combined with Bob's,
+        // makes the shared address unscannable (coordinator misses XMR deposit).
+        if (aliceViewKey !== undefined) {
+            const viewKeyErr = validateViewKeyScalar(hexToBytes(aliceViewKey));
+            if (viewKeyErr !== null) {
+                jsonResponse(res, 400, fail('VALIDATION', `Invalid aliceViewKey: ${viewKeyErr}`));
+                return;
+            }
+        }
+
         if (!verifyPreimage(secret, swap.hash_lock)) {
             jsonResponse(
                 res,
@@ -374,7 +623,15 @@ export async function handleSubmitSecret(
         // Re-check preimage under lock (defense-in-depth)
         const freshSwap = storage.getSwap(swapId);
         if (freshSwap && freshSwap.preimage !== null && freshSwap.preimage.length > 0) {
-            if (freshSwap.preimage === secret) {
+            const storedBuf = Buffer.from(freshSwap.preimage, 'utf-8');
+            const secretBuf = Buffer.from(secret, 'utf-8');
+            if (storedBuf.length === secretBuf.length && timingSafeEqual(storedBuf, secretBuf)) {
+                // Preimage matches — but still enforce payout address lock before returning
+                if (aliceXmrPayout && freshSwap.alice_xmr_payout && freshSwap.alice_xmr_payout.length > 0
+                    && freshSwap.alice_xmr_payout !== aliceXmrPayout) {
+                    jsonResponse(res, 409, fail('PAYOUT_LOCKED', 'Alice XMR payout address already set and cannot be changed'));
+                    return;
+                }
                 jsonResponse(res, 200, success({ stored: true, trustless: freshSwap.trustless_mode === 1 }));
                 return;
             }
@@ -392,6 +649,31 @@ export async function handleSubmitSecret(
             updateParams['alice_ed25519_pub'] = alicePubHex;
             updateParams['alice_view_key'] = aliceViewKey;
             console.log(`[Routes] Split-key mode enabled for swap ${swapId}`);
+
+            // Cross-curve DLEQ proof verification (if provided)
+            if (aliceSecp256k1Pub && aliceDleqProof) {
+                if (!/^[0-9a-f]{66}$/.test(aliceSecp256k1Pub)) {
+                    jsonResponse(res, 400, fail('VALIDATION', 'aliceSecp256k1Pub must be exactly 66 hex characters (33 bytes compressed)'));
+                    return;
+                }
+                if (!/^[0-9a-f]{192}$/.test(aliceDleqProof)) {
+                    jsonResponse(res, 400, fail('VALIDATION', 'aliceDleqProof must be exactly 192 hex characters (96 bytes)'));
+                    return;
+                }
+                const edPubBytes = hexToBytes(alicePubHex);
+                const secPubBytes = hexToBytes(aliceSecp256k1Pub);
+                const proofBytes = hexToBytes(aliceDleqProof);
+                if (!verifyCrossCurveDleq(edPubBytes, secPubBytes, proofBytes, swap.hash_lock)) {
+                    jsonResponse(res, 400, fail('DLEQ_INVALID', 'Alice cross-curve DLEQ proof verification failed'));
+                    return;
+                }
+                updateParams['alice_secp256k1_pub'] = aliceSecp256k1Pub;
+                updateParams['alice_dleq_proof'] = aliceDleqProof;
+                console.log(`[Routes] Alice DLEQ proof verified for swap ${swapId}`);
+            } else if (isDleqRequired()) {
+                jsonResponse(res, 400, fail('DLEQ_REQUIRED', 'DLEQ proof is required — provide aliceSecp256k1Pub and aliceDleqProof'));
+                return;
+            }
         }
 
         if (aliceXmrPayout) {
@@ -414,11 +696,16 @@ export async function handleSubmitSecret(
 }
 
 /** Handler: POST /api/swaps (create a new swap record — coordinator internal use) */
+/** Minimum number of blocks a swap HTLC must have until refund (prevents too-tight timelocks). */
+const MIN_HTLC_BLOCKS_REMAINING = 100;
+
 export async function handleCreateSwap(
     req: IncomingMessage,
     res: ServerResponse,
     storage: StorageService,
+    currentBlock?: bigint,
 ): Promise<void> {
+    if (!createSwapLimiter.check(getClientIp(req))) { tooManyRequests(res); return; }
     let body: ICreateSwapParams;
     try {
         const parsed = await readBody(req);
@@ -480,10 +767,29 @@ export async function handleCreateSwap(
             jsonResponse(res, 400, fail('VALIDATION', `xmr_amount below minimum (${MIN_XMR_AMOUNT_PICONERO} piconero = 0.025 XMR)`));
             return;
         }
+        // Reject amounts that would overflow Number.MAX_SAFE_INTEGER at sweep time
+        // (wallet-rpc JSON-RPC uses JSON integers which lose precision above 2^53-1)
+        const MAX_XMR_AMOUNT_PICONERO = BigInt(Number.MAX_SAFE_INTEGER); // ~9,007 XMR
+        if (xmrParsed > MAX_XMR_AMOUNT_PICONERO) {
+            jsonResponse(res, 400, fail('VALIDATION', `xmr_amount exceeds maximum safe amount (~9,007 XMR)`));
+            return;
+        }
         // Validate refund_block is positive
         if (refundBlock <= 0) {
             jsonResponse(res, 400, fail('VALIDATION', 'refund_block must be a positive number'));
             return;
+        }
+        // Ensure HTLC timelock is far enough in the future for the swap to complete
+        if (currentBlock && currentBlock > 0n) {
+            const blocksRemaining = BigInt(refundBlock) - currentBlock;
+            if (blocksRemaining < BigInt(MIN_HTLC_BLOCKS_REMAINING)) {
+                jsonResponse(res, 400, fail(
+                    'VALIDATION',
+                    `refund_block is too close to current block (${blocksRemaining} blocks remaining, need ≥${MIN_HTLC_BLOCKS_REMAINING}). ` +
+                    `The swap would likely expire before XMR can be locked and confirmed.`,
+                ));
+                return;
+            }
         }
 
         // Optional: Alice's XMR payout address (where she receives XMR after completion)
@@ -528,7 +834,16 @@ export async function handleCreateSwap(
 
     try {
         const created = storage.createSwap(body);
-        jsonResponse(res, 201, success<ISwapRecord>({ ...created }));
+
+        // Use deterministic recovery_token from backup if available (Alice derived it from mnemonic).
+        // Fall back to random token for backward compatibility (e.g., admin-created swaps).
+        const backup = storage.getSecretBackup(body.hash_lock);
+        const recoveryToken = (backup?.recoveryToken && /^[0-9a-f]{64}$/.test(backup.recoveryToken))
+            ? backup.recoveryToken
+            : randomBytes(32).toString('hex');
+        storage.updateSwap(body.swap_id, { recovery_token: recoveryToken });
+        const withToken = storage.getSwap(body.swap_id);
+        jsonResponse(res, 201, success({ ...sanitizeSwapForApi(withToken ?? created), recovery_token: recoveryToken }));
     } catch (err: unknown) {
         const message = err instanceof Error ? err.message : 'Storage error';
         jsonResponse(res, 500, fail('STORAGE_ERROR', message, true));
@@ -589,6 +904,7 @@ export async function handleSubmitKeys(
     storage: StorageService,
     swapId: string,
 ): Promise<void> {
+    if (!keySubmitLimiter.check(getClientIp(req))) { tooManyRequests(res); return; }
     // Per-swap lock prevents concurrent key submissions from racing
     return withSwapLock(swapId, async () => {
     const swap = storage.getSwap(swapId);
@@ -607,11 +923,12 @@ export async function handleSubmitKeys(
         return;
     }
 
-    // Only accept keys when swap is TAKEN or later pre-XMR states
+    // Only accept keys when swap is TAKEN or later pre-claim states
     const ACCEPT_KEYS_STATES = new Set([
         SwapStatus.TAKEN,
         SwapStatus.XMR_LOCKING,
         SwapStatus.XMR_LOCKED,
+        SwapStatus.XMR_SWEEPING,
     ]);
     if (!ACCEPT_KEYS_STATES.has(swap.status)) {
         jsonResponse(res, 409, fail('INVALID_STATE', `Swap is in state ${swap.status} — cannot accept keys`));
@@ -629,6 +946,8 @@ export async function handleSubmitKeys(
     let bobKeyProof: string;
     let bobSpendKey: string | undefined;
     let claimToken: string | undefined;
+    let bobSecp256k1Pub: string | undefined;
+    let bobDleqProof: string | undefined;
     try {
         const parsed = await readBody(req);
         const candidate = parsed as Record<string, unknown>;
@@ -650,26 +969,35 @@ export async function handleSubmitKeys(
         if (typeof candidate['claimToken'] === 'string') {
             claimToken = candidate['claimToken'];
         }
+        if (typeof candidate['bobSecp256k1Pub'] === 'string') {
+            bobSecp256k1Pub = candidate['bobSecp256k1Pub'].trim().toLowerCase();
+        }
+        if (typeof candidate['bobDleqProof'] === 'string') {
+            bobDleqProof = candidate['bobDleqProof'].trim().toLowerCase();
+        }
     } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : 'Invalid request';
         jsonResponse(res, 400, fail('INVALID_BODY', msg));
         return;
     }
 
-    // Verify claim_token (timing-safe comparison) — only if DB has a token stored.
-    // If no token in DB (swap imported from on-chain), allow key submission without auth.
-    if (swap.claim_token && swap.claim_token.length > 0) {
-        if (!claimToken) {
-            jsonResponse(res, 401, fail('AUTH_REQUIRED', 'claimToken is required for key submission'));
-            return;
-        }
-        const expectedToken = new TextEncoder().encode(swap.claim_token);
-        const providedToken = new TextEncoder().encode(claimToken);
-        if (expectedToken.length !== providedToken.length || !timingSafeEqual(expectedToken, providedToken)) {
-            jsonResponse(res, 401, fail('AUTH_FAILED', 'Invalid claim token'));
-            console.log(`[Routes] Rejected key submission for swap ${swapId} — invalid claim_token`);
-            return;
-        }
+    // Always require claim_token — no bypass even after DB wipe
+    if (!claimToken) {
+        jsonResponse(res, 401, fail('AUTH_REQUIRED', 'claimToken is required for key submission'));
+        return;
+    }
+    if (!/^[0-9a-f]{64}$/.test(claimToken)) {
+        jsonResponse(res, 400, fail('VALIDATION', 'claimToken must be exactly 64 hex characters'));
+        return;
+    }
+    if (!swap.claim_token || swap.claim_token.length === 0) {
+        jsonResponse(res, 403, fail('NO_TOKEN', 'Swap has no claim token — Bob must call /take first to get a claim token'));
+        return;
+    }
+    if (!safeTokenCompare(swap.claim_token, claimToken)) {
+        jsonResponse(res, 401, fail('AUTH_FAILED', 'Invalid claim token'));
+        console.log(`[Routes] Rejected key submission for swap ${swapId} — invalid claim_token`);
+        return;
     }
 
     // Validate formats
@@ -680,6 +1008,16 @@ export async function handleSubmitKeys(
     if (!/^[0-9a-f]{64}$/.test(bobViewKey)) {
         jsonResponse(res, 400, fail('VALIDATION', 'bobViewKey must be exactly 64 hex characters'));
         return;
+    }
+    // Validate Bob's view key produces a non-degenerate ed25519 point.
+    // A malicious Bob could submit a view key that, when combined with Alice's,
+    // makes the shared address unscannable or predictable.
+    {
+        const viewKeyErr = validateViewKeyScalar(hexToBytes(bobViewKey));
+        if (viewKeyErr !== null) {
+            jsonResponse(res, 400, fail('VALIDATION', `Invalid bobViewKey: ${viewKeyErr}`));
+            return;
+        }
     }
     // Key proof must be exactly 128 hex chars (64 bytes: R || s)
     if (!/^[0-9a-f]{128}$/.test(bobKeyProof)) {
@@ -692,6 +1030,15 @@ export async function handleSubmitKeys(
         jsonResponse(res, 400, fail('VALIDATION', 'bobSpendKey must be exactly 64 hex characters'));
         return;
     }
+    // Validate DLEQ-related fields early (before combined check) to reject malformed inputs
+    if (bobSecp256k1Pub !== undefined && !/^[0-9a-f]{66}$/.test(bobSecp256k1Pub)) {
+        jsonResponse(res, 400, fail('VALIDATION', 'bobSecp256k1Pub must be exactly 66 hex characters (33 bytes compressed)'));
+        return;
+    }
+    if (bobDleqProof !== undefined && !/^[0-9a-f]{192}$/.test(bobDleqProof)) {
+        jsonResponse(res, 400, fail('VALIDATION', 'bobDleqProof must be exactly 192 hex characters (96 bytes)'));
+        return;
+    }
 
     // Verify Bob's proof-of-knowledge: proves he knows the private key behind bobPub
     const proofBytes = hexToBytes(bobKeyProof);
@@ -701,13 +1048,46 @@ export async function handleSubmitKeys(
         return;
     }
 
-    // Store Bob's key material (proof stored in bob_dleq_proof column for backward compat)
-    storage.updateSwap(swapId, {
+    // Verify bobSpendKey matches bobPub (if provided).
+    // Without this check, a griefing attacker could submit an arbitrary spend key,
+    // causing the coordinator to reconstruct the wrong combined key and permanently lock XMR.
+    if (bobSpendKey !== undefined) {
+        const spendKeyBytes = hexToBytes(bobSpendKey);
+        const derivedPub = ed25519PublicFromPrivate(spendKeyBytes);
+        const derivedPubHex = bytesToHex(derivedPub);
+        if (derivedPubHex !== bobPub) {
+            jsonResponse(res, 400, fail('SPEND_KEY_MISMATCH', 'bobSpendKey does not correspond to bobEd25519PubKey — derived public key does not match'));
+            return;
+        }
+    }
+
+    // Cross-curve DLEQ proof verification (if provided)
+    const updateFields: Record<string, string | number | null> = {
         bob_ed25519_pub: bobPub,
         bob_view_key: bobViewKey,
-        bob_dleq_proof: bobKeyProof,
-        ...(bobSpendKey !== undefined ? { bob_spend_key: bobSpendKey } : {}),
-    });
+    };
+    if (bobSpendKey !== undefined) {
+        updateFields['bob_spend_key'] = bobSpendKey;
+    }
+
+    if (bobSecp256k1Pub && bobDleqProof) {
+        // Hex format already validated above (lines 940-947)
+        const bobEdPubBytes = hexToBytes(bobPub);
+        const bobSecPubBytes = hexToBytes(bobSecp256k1Pub);
+        const dleqProofBytes = hexToBytes(bobDleqProof);
+        if (!verifyCrossCurveDleq(bobEdPubBytes, bobSecPubBytes, dleqProofBytes, swap.hash_lock)) {
+            jsonResponse(res, 400, fail('DLEQ_INVALID', 'Bob cross-curve DLEQ proof verification failed'));
+            return;
+        }
+        updateFields['bob_secp256k1_pub'] = bobSecp256k1Pub;
+        updateFields['bob_dleq_proof'] = bobDleqProof;
+        console.log(`[Routes] Bob DLEQ proof verified and stored for swap ${swapId}`);
+    } else if (isDleqRequired()) {
+        jsonResponse(res, 400, fail('DLEQ_REQUIRED', 'DLEQ proof is required — provide bobSecp256k1Pub and bobDleqProof'));
+        return;
+    }
+
+    storage.updateSwap(swapId, updateFields as import('../types.js').IUpdateSwapParams);
     console.log(`[Routes] Bob's keys verified and stored for split-key swap ${swapId}`);
 
     jsonResponse(res, 200, success({ stored: true }));
@@ -729,13 +1109,13 @@ export async function handleAdminUpdateSwap(
     wsServer: SwapWebSocketServer,
     swapId: string,
 ): Promise<void> {
-    // Gate: only available when MONERO_MOCK=true
-    const isMock = (process.env['MONERO_MOCK'] ?? 'false').toLowerCase() === 'true';
-    if (!isMock) {
+    // Gate: only available when MONERO_MOCK=true (cached at module load, not per-request)
+    if (!IS_MOCK_MODE) {
         jsonResponse(res, 403, fail('FORBIDDEN', 'Admin state endpoint is only available in mock mode'));
         return;
     }
 
+    return withSwapLock(swapId, async () => {
     const swap = storage.getSwap(swapId);
     if (!swap) {
         jsonResponse(res, 404, fail('NOT_FOUND', `Swap ${swapId} not found`));
@@ -764,7 +1144,9 @@ export async function handleAdminUpdateSwap(
         'xmr_subaddr_index', 'preimage', 'claim_token',
         'trustless_mode', 'alice_ed25519_pub', 'alice_view_key',
         'bob_ed25519_pub', 'bob_view_key', 'bob_spend_key',
-        'bob_dleq_proof', 'alice_xmr_payout', 'sweep_status',
+        'bob_dleq_proof', 'alice_secp256k1_pub', 'alice_dleq_proof',
+        'bob_secp256k1_pub', 'alice_xmr_payout', 'sweep_status',
+        'xmr_sweep_tx', 'xmr_sweep_confirmations', 'recovery_token',
     ];
 
     for (const field of allowedFields) {
@@ -788,7 +1170,18 @@ export async function handleAdminUpdateSwap(
         // Apply non-status fields first (guards may need them)
         const preFields: Record<string, string | number | null | undefined> = { ...updateParams };
         delete preFields['status'];
-        if (Object.keys(preFields).length > 0) {
+        const preFieldKeys = Object.keys(preFields);
+
+        // Save original values for rollback on validation failure
+        let originalValues: Record<string, string | number | null | undefined> | null = null;
+        if (preFieldKeys.length > 0) {
+            const beforeSwap = storage.getSwap(swapId);
+            if (beforeSwap) {
+                originalValues = {};
+                for (const key of preFieldKeys) {
+                    originalValues[key] = (beforeSwap as unknown as Record<string, unknown>)[key] as string | number | null | undefined;
+                }
+            }
             storage.updateSwap(swapId, preFields as IUpdateSwapParams);
         }
 
@@ -802,6 +1195,10 @@ export async function handleAdminUpdateSwap(
         try {
             stateMachine.validate(freshSwap, newStatus as SwapStatus);
         } catch (err: unknown) {
+            // Roll back pre-applied fields on validation failure
+            if (originalValues && preFieldKeys.length > 0) {
+                storage.updateSwap(swapId, originalValues as unknown as IUpdateSwapParams);
+            }
             const msg = err instanceof Error ? err.message : 'Invalid transition';
             jsonResponse(res, 409, fail('INVALID_TRANSITION', msg));
             return;
@@ -831,6 +1228,7 @@ export async function handleAdminUpdateSwap(
     const updated = storage.updateSwap(swapId, updateParams as IUpdateSwapParams);
     wsServer.broadcastSwapUpdate(updated);
     jsonResponse(res, 200, success({ swap: sanitizeSwapForApi(updated) }));
+    }); // end withSwapLock
 }
 
 // ---------------------------------------------------------------------------
@@ -864,10 +1262,13 @@ export async function handleBackupSecret(
     res: ServerResponse,
     storage: StorageService,
 ): Promise<void> {
+    if (!backupSecretLimiter.check(getClientIp(req))) { tooManyRequests(res); return; }
+
     let hashLock: string;
     let secret: string;
     let aliceViewKey: string | undefined;
     let aliceXmrPayout: string | undefined;
+    let recoveryToken: string | undefined;
 
     try {
         const parsed = await readBody(req);
@@ -883,6 +1284,9 @@ export async function handleBackupSecret(
         }
         if (typeof candidate['aliceXmrPayout'] === 'string' && candidate['aliceXmrPayout'].length > 0) {
             aliceXmrPayout = candidate['aliceXmrPayout'].trim();
+        }
+        if (typeof candidate['recoveryToken'] === 'string') {
+            recoveryToken = candidate['recoveryToken'].trim().toLowerCase();
         }
     } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : 'Invalid request';
@@ -902,6 +1306,10 @@ export async function handleBackupSecret(
         jsonResponse(res, 400, fail('VALIDATION', 'aliceViewKey must be exactly 64 hex characters'));
         return;
     }
+    if (recoveryToken !== undefined && !/^[0-9a-f]{64}$/.test(recoveryToken)) {
+        jsonResponse(res, 400, fail('VALIDATION', 'recoveryToken must be exactly 64 hex characters'));
+        return;
+    }
     if (aliceXmrPayout !== undefined) {
         const addrErr = validateMoneroAddress(aliceXmrPayout);
         if (addrErr !== null) {
@@ -915,14 +1323,14 @@ export async function handleBackupSecret(
         return;
     }
 
-    storage.backupSecret(hashLock, secret, aliceViewKey ?? null, aliceXmrPayout ?? null);
+    storage.backupSecret(hashLock, secret, aliceViewKey ?? null, aliceXmrPayout ?? null, recoveryToken ?? null);
     jsonResponse(res, 200, success({ backed_up: true }));
 }
 
 /**
  * Handler: GET /api/swaps/:id/my-secret
  * Alice recovers her preimage + view key from the coordinator.
- * Auth: X-Depositor header must match swap.depositor.
+ * Auth: X-Recovery-Token header must match swap.recovery_token (issued at swap creation).
  */
 export function handleGetMySecret(
     req: IncomingMessage,
@@ -930,6 +1338,7 @@ export function handleGetMySecret(
     storage: StorageService,
     swapId: string,
 ): void {
+    if (!recoverSecretLimiter.check(getClientIp(req))) { tooManyRequests(res); return; }
     const swap = storage.getSwap(swapId);
     if (!swap) {
         jsonResponse(res, 404, fail('NOT_FOUND', 'Swap not found'));
@@ -940,9 +1349,18 @@ export function handleGetMySecret(
         return;
     }
 
-    const depositor = req.headers['x-depositor'];
-    if (typeof depositor !== 'string' || depositor.toLowerCase() !== swap.depositor.toLowerCase()) {
-        jsonResponse(res, 403, fail('FORBIDDEN', 'Not the depositor'));
+    // Auth: require recovery_token (issued at swap creation, known only to Alice)
+    const token = req.headers['x-recovery-token'];
+    if (typeof token !== 'string' || !token) {
+        jsonResponse(res, 401, fail('AUTH_REQUIRED', 'X-Recovery-Token header is required'));
+        return;
+    }
+    if (!swap.recovery_token || swap.recovery_token.length === 0) {
+        jsonResponse(res, 403, fail('NO_TOKEN', 'No recovery token set for this swap'));
+        return;
+    }
+    if (!safeTokenCompare(swap.recovery_token, token)) {
+        jsonResponse(res, 403, fail('FORBIDDEN', 'Invalid recovery token'));
         return;
     }
 
@@ -957,7 +1375,7 @@ export function handleGetMySecret(
 /**
  * Handler: GET /api/swaps/:id/my-keys
  * Bob recovers his key material from the coordinator.
- * Auth: X-Counterparty header must match swap.counterparty.
+ * Auth: X-Claim-Token header must match swap.claim_token (issued at take time).
  */
 export function handleGetMyKeys(
     req: IncomingMessage,
@@ -965,22 +1383,34 @@ export function handleGetMyKeys(
     storage: StorageService,
     swapId: string,
 ): void {
+    if (!recoverSecretLimiter.check(getClientIp(req))) { tooManyRequests(res); return; }
     const swap = storage.getSwap(swapId);
     if (!swap) {
         jsonResponse(res, 404, fail('NOT_FOUND', 'Swap not found'));
         return;
     }
 
-    const counterparty = req.headers['x-counterparty'];
-    if (typeof counterparty !== 'string' || counterparty.toLowerCase() !== (swap.counterparty ?? '').toLowerCase()) {
-        jsonResponse(res, 403, fail('FORBIDDEN', 'Not the counterparty'));
+    // Auth: require claim_token (issued to Bob at take time)
+    const token = req.headers['x-claim-token'];
+    if (typeof token !== 'string' || !token) {
+        jsonResponse(res, 401, fail('AUTH_REQUIRED', 'X-Claim-Token header is required'));
+        return;
+    }
+    if (!swap.claim_token || swap.claim_token.length === 0) {
+        jsonResponse(res, 403, fail('NO_TOKEN', 'No claim token set for this swap'));
+        return;
+    }
+    if (!safeTokenCompare(swap.claim_token, token)) {
+        jsonResponse(res, 403, fail('FORBIDDEN', 'Invalid claim token'));
         return;
     }
 
+    // bob_spend_key intentionally NOT returned — coordinator holds it for sweep.
+    // Exposing it would let anyone with the claim_token reconstruct the combined
+    // spend key and potentially front-run the coordinator's sweep.
     jsonResponse(res, 200, success({
         bobEd25519Pub: swap.bob_ed25519_pub,
         bobViewKey: swap.bob_view_key,
-        bobSpendKey: swap.bob_spend_key,
     }));
 }
 

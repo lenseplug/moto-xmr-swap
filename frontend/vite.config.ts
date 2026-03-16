@@ -82,6 +82,7 @@ export default defineConfig({
                 'node:worker_threads',
             ],
         },
+        sourcemap: false,
         target: 'esnext',
         modulePreload: false,
         cssCodeSplit: false,

@@ -1,20 +1,22 @@
 /**
  * CreateSwap form component — allows users to create a new MOTO/XMR atomic swap.
+ * Uses BIP39 mnemonic for key derivation — zero localStorage.
  */
-import React, { useState, useCallback, useRef } from 'react';
+import React, { useState, useCallback, useRef, useEffect } from 'react';
 import { useWalletConnect } from '@btc-vision/walletconnect';
 import { networks } from '@btc-vision/bitcoin';
 import { getSwapVaultContract, getMotoContract, parseMotoAmount, parseXmrAmount, splitXmrAddress, getProvider } from '../services/opnet';
-import { generateTrustlessSecret, saveLocalSwapSecret, clearLocalSwapSecret, updateLocalSwapSecretId, hashSecret } from '../utils/hashlock';
-import { submitSwapSecret, resolveSwapIdByHashLock } from '../services/coordinator';
+import { hashSecret } from '../utils/hashlock';
+import { generateSwapMnemonic, deriveAliceKeys } from '../utils/mnemonic';
+import { submitSwapSecret, resolveSwapIdByHashLock, backupSecret } from '../services/coordinator';
+import { useSwapSession } from '../contexts/SwapSessionContext';
+import { MnemonicDisplay } from './MnemonicDisplay';
 import { PrivacyBanner } from './PrivacyBanner';
 import { ExplorerLinks } from './ExplorerLinks';
 
 const SWAP_VAULT_ADDRESS = import.meta.env.VITE_SWAP_VAULT_ADDRESS;
 const MOTO_TOKEN_ADDRESS = import.meta.env.VITE_MOTO_TOKEN_ADDRESS;
 const BLOCKS_PER_HOUR = 6;
-// Coordinator requires at least 50 blocks remaining when locking XMR.
-// TODO(mainnet): Review and adjust for mainnet block times
 const DEFAULT_TIMEOUT_BLOCKS = 80;
 
 interface CreateSwapProps {
@@ -33,11 +35,9 @@ interface TxResult {
     swapId: bigint;
 }
 
-/**
- * Create swap form with allowance check and hash-lock generation.
- */
 export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactElement {
     const { publicKey, address: senderAddress, walletAddress } = useWalletConnect();
+    const { setSession } = useSwapSession();
 
     const isConnected = publicKey !== null;
 
@@ -49,20 +49,32 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
     });
 
     const [step, setStep] = useState<
-        'idle' | 'checking_allowance' | 'approving' | 'creating' | 'done' | 'error'
+        'idle' | 'checking_allowance' | 'approving' | 'mnemonic' | 'creating' | 'done' | 'error'
     >('idle');
 
     const [statusMessage, setStatusMessage] = useState<string>('');
     const [txResult, setTxResult] = useState<TxResult | null>(null);
     const [formError, setFormError] = useState<string | null>(null);
+    const [mnemonic, setMnemonic] = useState<string | null>(null);
 
-    // Cancellation support — aborting before the wallet prompt is shown
+    // Warn user before closing/navigating away during mnemonic step.
+    // Losing the mnemonic means losing access to swap funds.
+    useEffect(() => {
+        if (step !== 'mnemonic') return;
+        const handler = (e: BeforeUnloadEvent): void => {
+            e.preventDefault();
+        };
+        window.addEventListener('beforeunload', handler);
+        return () => window.removeEventListener('beforeunload', handler);
+    }, [step]);
+
     const cancelledRef = useRef(false);
 
     const handleCancel = useCallback((): void => {
         cancelledRef.current = true;
         setStep('idle');
         setStatusMessage('');
+        setMnemonic(null);
         setFormError('Swap creation cancelled.');
     }, []);
 
@@ -92,6 +104,7 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
         return null;
     }, [form]);
 
+    // Step 1: Validate + check allowance + approve if needed, then show mnemonic
     const handleSubmit = useCallback(async (): Promise<void> => {
         if (!isConnected || !walletAddress || !publicKey || !senderAddress) {
             setFormError('Please connect your wallet first');
@@ -109,18 +122,15 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
             return;
         }
         const motoAmount = parseMotoAmount(form.motoAmount);
-        const xmrAmount = parseXmrAmount(form.xmrAmount);
-        const timeoutBlocks = BigInt(parseInt(form.timeoutBlocks, 10));
 
         setFormError(null);
         cancelledRef.current = false;
 
         try {
-            // Step 1: Check existing allowance
+            // Check existing allowance
             setStep('checking_allowance');
             setStatusMessage('Checking MOTO allowance...');
 
-            // Initialise both contracts first so we can resolve the vault's Address.
             const swapContract = getSwapVaultContract(SWAP_VAULT_ADDRESS, senderAddress);
             const vaultAddress = await swapContract.contractAddress;
 
@@ -132,12 +142,10 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
 
             const currentAllowance = allowanceResult.properties.remaining;
 
-            // Step 2: Approve if needed — use a large blanket approval so we only do this once
             if (currentAllowance < motoAmount) {
                 setStep('approving');
                 setStatusMessage('Approving MOTO for SwapVault...');
 
-                // Use increaseAllowance with exact deficit to prevent accumulation over repeated create/cancel cycles
                 const deficit = motoAmount - currentAllowance;
                 const approveSim = await motoContract.increaseAllowance(vaultAddress, deficit);
                 if ('error' in approveSim) {
@@ -158,10 +166,9 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
                     throw new Error(`Allowance transaction failed: ${String(approveObj['error'])}`);
                 }
 
-                // Wait for the approval to be confirmed on-chain by polling allowance
                 setStatusMessage('Approving MOTO — waiting for block confirmation...');
-                const maxWaitMs = 10 * 60 * 1000; // 10 minutes max
-                const pollMs = 5_000; // check every 5s
+                const maxWaitMs = 10 * 60 * 1000;
+                const pollMs = 5_000;
                 const startTime = Date.now();
                 let confirmed = false;
 
@@ -185,43 +192,71 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
                 }
             }
 
-            // Step 3: Generate ed25519 split keys + hash-lock
-            setStep('creating');
-            setStatusMessage('Generating swap keys...');
+            // Generate mnemonic and show it
+            const words = generateSwapMnemonic();
+            setMnemonic(words);
+            setStep('mnemonic');
+        } catch (err) {
+            setStep('error');
+            setStatusMessage(err instanceof Error ? err.message : 'Unknown error occurred');
+        }
+    }, [isConnected, walletAddress, publicKey, senderAddress, form, validateForm]);
 
-            const { secret, hashLock, hashLockHex, aliceViewKey } = await generateTrustlessSecret();
+    // Step 2: User confirmed they wrote down words -> proceed with on-chain tx
+    const handleMnemonicConfirmed = useCallback(async (): Promise<void> => {
+        if (!mnemonic || !senderAddress || !walletAddress) return;
+        if (!SWAP_VAULT_ADDRESS) return;
 
-            // Verify secret matches hashLock locally (defensive assertion)
-            const verifyHash = await hashSecret(secret);
-            if (verifyHash !== hashLock) {
-                throw new Error('BUG: SHA-256(secret) does not match hashLock — key generation failed');
+        const motoAmount = parseMotoAmount(form.motoAmount);
+        const xmrAmount = parseXmrAmount(form.xmrAmount);
+        const timeoutBlocks = BigInt(parseInt(form.timeoutBlocks, 10));
+
+        setStep('creating');
+        setStatusMessage('Deriving swap keys from mnemonic...');
+
+        try {
+            const aliceKeys = await deriveAliceKeys(mnemonic);
+
+            // Verify secret matches hashLock
+            const verifyHash = await hashSecret(aliceKeys.secret);
+            if (verifyHash !== aliceKeys.hashLock) {
+                throw new Error('BUG: SHA-256(secret) does not match hashLock — key derivation failed');
             }
 
-            // Step 4: Encode XMR address
             const xmrHex = form.xmrAddress.trim();
             const { hi: xmrAddressHi, lo: xmrAddressLo } = splitXmrAddress(xmrHex);
 
-            // Step 5: Get current block for refundBlock
+            // Pre-register secret + recovery_token with coordinator before on-chain tx.
+            // This ensures the recovery_token is applied when the OPNet watcher creates the swap.
+            setStatusMessage('Backing up swap secret with coordinator...');
+            const backupResult = await backupSecret(
+                aliceKeys.hashLockHex,
+                aliceKeys.secret,
+                aliceKeys.recoveryToken,
+                aliceKeys.aliceViewKey,
+                xmrHex,
+            );
+            if (!backupResult.ok) {
+                console.warn('[CreateSwap] Secret backup failed (non-fatal):', backupResult.error);
+            }
+
             const provider = getProvider();
             const currentBlockRaw: unknown = await provider.getBlockNumber();
             const currentBlock =
                 typeof currentBlockRaw === 'bigint'
                     ? currentBlockRaw
                     : BigInt(currentBlockRaw as number);
-            // Add a 20-block safety buffer to account for blocks that may elapse
-            // between the block number fetch and the transaction being mined.
             const refundBlock = currentBlock + timeoutBlocks + 20n;
 
-            // Step 6: Simulate createSwap with retry (allowance may need a block to confirm)
-            // OPNet simulations can throw OR return error objects, so we handle both.
             setStatusMessage('Simulating swap creation...');
 
+            const swapContract = getSwapVaultContract(SWAP_VAULT_ADDRESS, senderAddress);
             let createSim: Awaited<ReturnType<typeof swapContract.createSwap>> | null = null;
-            const maxRetries = 36; // up to ~3 minutes of retries
+            const maxRetries = 36;
             for (let attempt = 1; attempt <= maxRetries; attempt++) {
                 try {
                     const simResult = await swapContract.createSwap(
-                        hashLock,
+                        aliceKeys.hashLock,
                         refundBlock,
                         motoAmount,
                         xmrAmount,
@@ -232,7 +267,6 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
                     if ('error' in simResult) {
                         const errMsg = String(simResult.error);
                         if (errMsg.includes('llowance') && attempt < maxRetries) {
-                            // Allowance not confirmed yet — keep waiting
                             throw new Error(errMsg);
                         }
                         throw new Error(`Swap simulation failed: ${errMsg}`);
@@ -243,7 +277,6 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
                 } catch (simErr: unknown) {
                     const errMsg = simErr instanceof Error ? simErr.message : String(simErr);
 
-                    // Retry on allowance errors (case-insensitive partial match)
                     if (errMsg.toLowerCase().includes('allowance') && attempt < maxRetries) {
                         setStep('approving');
                         setStatusMessage(`Approving MOTO — waiting for block confirmation (${attempt}/${maxRetries})...`);
@@ -251,7 +284,6 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
                         continue;
                     }
 
-                    // Non-allowance error or last retry — give up
                     throw new Error(`Swap simulation failed: ${errMsg}`);
                 }
             }
@@ -260,18 +292,13 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
                 throw new Error('Swap simulation failed: allowance not confirmed after retries. Try again in a few minutes.');
             }
 
-            // Extract swapId from simulation BEFORE sending transaction
             let swapId = 0n;
-
-            // Try the simulation return value first (most reliable)
             if (createSim.properties && typeof createSim.properties === 'object') {
                 const props = createSim.properties as Record<string, unknown>;
                 if (typeof props['swapId'] === 'bigint') {
                     swapId = props['swapId'];
                 }
             }
-
-            // Fallback: try events
             if (swapId === 0n) {
                 const events = createSim.events ?? [];
                 if (events.length > 0) {
@@ -286,15 +313,9 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
                 }
             }
 
-
-            // Save secret to localStorage as CACHE (not authoritative).
-            const aliceXmrPayout = form.xmrAddress.trim();
-            saveLocalSwapSecret(swapId.toString(), secret, hashLockHex, aliceViewKey, aliceXmrPayout);
-
-            // Check for cancellation before requesting wallet signature
             if (cancelledRef.current) return;
 
-            // Step 7: Send transaction
+            setStep('creating');
             setStatusMessage('Waiting for wallet signature...');
 
             const createReceipt = await createSim.sendTransaction({
@@ -308,8 +329,6 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
             const receiptObj = createReceipt as unknown as Record<string, unknown>;
 
             if ('error' in receiptObj) {
-                // Clean up saved secret if tx failed
-                clearLocalSwapSecret(swapId.toString());
                 throw new Error(`Swap transaction failed: ${String(receiptObj['error'])}`);
             }
 
@@ -320,36 +339,40 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
                       ? receiptObj['txid']
                       : 'pending';
 
-            // Step 8: Resolve the ACTUAL on-chain swap ID via coordinator.
-            // The simulation swap ID may differ if another swap was mined between
-            // simulation and confirmation (race condition).
+            // Resolve actual on-chain swap ID
             setStatusMessage('Verifying swap ID on-chain...');
             let resolvedSwapId = swapId;
             for (let attempt = 0; attempt < 36; attempt++) {
                 if (cancelledRef.current) break;
-                const actualId = await resolveSwapIdByHashLock(hashLockHex);
+                const actualId = await resolveSwapIdByHashLock(aliceKeys.hashLockHex);
                 if (actualId !== null) {
                     const actualBigInt = BigInt(actualId);
                     if (actualBigInt !== swapId) {
                         console.warn(`[CreateSwap] Swap ID corrected: simulated=${swapId}, actual=${actualId}`);
-                        updateLocalSwapSecretId(swapId.toString(), actualId);
                         resolvedSwapId = actualBigInt;
                     }
                     break;
                 }
-                // Coordinator hasn't detected the swap yet — wait and retry
                 if (attempt < 35) {
                     await new Promise<void>((r) => setTimeout(r, 5_000));
                 }
             }
 
-            // BLOCKING: Submit secret to coordinator. Do NOT show success until confirmed.
-            // The coordinator is the authoritative store — localStorage is just a cache.
+            // Submit secret to coordinator
+            const aliceXmrPayout = form.xmrAddress.trim();
             setStatusMessage('Securing swap secret with coordinator (required)...');
             let secretSubmitted = false;
             for (let attempt = 0; attempt < 60; attempt++) {
                 if (cancelledRef.current) break;
-                const result = await submitSwapSecret(resolvedSwapId.toString(), secret, aliceViewKey, aliceXmrPayout);
+                const result = await submitSwapSecret(
+                    resolvedSwapId.toString(),
+                    aliceKeys.secret,
+                    aliceKeys.recoveryToken,
+                    aliceKeys.aliceViewKey,
+                    aliceXmrPayout,
+                    aliceKeys.aliceSecp256k1Pub,
+                    aliceKeys.aliceDleqProof,
+                );
                 if (result.ok) {
                     secretSubmitted = true;
                     break;
@@ -360,15 +383,23 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
             }
 
             if (!secretSubmitted) {
-                // CRITICAL: Do NOT show success. Secret is only in localStorage (cache).
                 setFormError(
                     'Your swap was created on-chain but the coordinator could not store your secret. ' +
-                    'Your secret is saved locally. DO NOT clear browser data. ' +
-                    'Navigate to your swap to retry automatically.',
+                    'Keep your 12 recovery words safe. Navigate to "Recover" tab to retry.',
                 );
                 setStep('idle');
                 return;
             }
+
+            // Set session context — clear mnemonic from memory after keys are derived
+            setSession({
+                swapId: resolvedSwapId.toString(),
+                role: 'alice',
+                mnemonic: '',
+                aliceKeys,
+                bobKeys: null,
+            });
+            setMnemonic(null);
 
             setTxResult({ txId, swapId: resolvedSwapId });
             setStep('done');
@@ -377,15 +408,7 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
             setStep('error');
             setStatusMessage(err instanceof Error ? err.message : 'Unknown error occurred');
         }
-    }, [
-        isConnected,
-        walletAddress,
-        publicKey,
-        senderAddress,
-        form,
-        validateForm,
-        onSwapCreated,
-    ]);
+    }, [mnemonic, senderAddress, walletAddress, form, setSession, onSwapCreated]);
 
     const estimatedHours = Math.round(parseInt(form.timeoutBlocks || '0', 10) / BLOCKS_PER_HOUR);
 
@@ -401,6 +424,23 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
         textTransform: 'uppercase',
     };
 
+    // Show mnemonic display when words are generated
+    if (step === 'mnemonic' && mnemonic) {
+        return (
+            <div style={{ maxWidth: '560px' }}>
+                <div style={{ marginBottom: '24px' }}>
+                    <h2 style={{ fontSize: '1.35rem', fontWeight: 700, marginBottom: '6px' }}>
+                        Create Swap
+                    </h2>
+                    <p style={{ fontSize: '0.875rem', color: 'var(--color-text-secondary)' }}>
+                        Step 2: Save your recovery words before the swap is created on-chain.
+                    </p>
+                </div>
+                <MnemonicDisplay mnemonic={mnemonic} onConfirm={() => void handleMnemonicConfirmed()} />
+            </div>
+        );
+    }
+
     return (
         <div style={{ maxWidth: '560px' }}>
             <div style={{ marginBottom: '24px' }}>
@@ -414,7 +454,7 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
                     Create Swap
                 </h2>
                 <p style={{ fontSize: '0.875rem', color: 'var(--color-text-secondary)' }}>
-                    Offer MOTO tokens in exchange for Monero. Split ed25519 keys are generated locally.
+                    Offer MOTO tokens in exchange for Monero. You will be given 12 recovery words — have pen and paper ready.
                 </p>
             </div>
 
@@ -519,7 +559,7 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
                         <input
                             id="timeout-blocks"
                             type="number"
-                            min="10"
+                            min="60"
                             max="10000"
                             className="input-field tabular-nums"
                             value={form.timeoutBlocks}
@@ -626,18 +666,19 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
                             <p
                                 style={{
                                     fontSize: '0.75rem',
-                                    color: 'var(--color-text-muted)',
+                                    color: 'var(--color-text-warning)',
                                     marginTop: '6px',
+                                    fontWeight: 600,
                                 }}
                             >
-                                Swap keys saved to browser storage. Safe to refresh — do not clear browser data until the swap completes.
+                                Your 12 recovery words are the ONLY way to recover this swap. Keep them safe.
                             </p>
                             <ExplorerLinks txId={txResult.txId} address={walletAddress ?? undefined} />
                         </div>
                     )}
 
                     {/* Submit */}
-                    {step !== 'done' && (
+                    {step !== 'done' && step !== 'mnemonic' && (
                         <button
                             className="btn btn-primary btn-lg"
                             disabled={!isConnected || isProcessing}
@@ -659,6 +700,7 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
                             onClick={() => {
                                 setStep('idle');
                                 setTxResult(null);
+                                setMnemonic(null);
                                 setForm({
                                     motoAmount: '',
                                     xmrAmount: '',

@@ -12,10 +12,15 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createServer } from 'node:net';
 import { createHash, randomBytes } from 'node:crypto';
+import { unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { WebSocket } from 'ws';
 import { ed25519 } from '@noble/curves/ed25519.js';
+import {
+    generateEd25519KeyPair,
+    computeSharedMoneroAddress,
+} from '../src/crypto/index.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -24,7 +29,9 @@ import { ed25519 } from '@noble/curves/ed25519.js';
 /** Default admin key used throughout tests. */
 export const ADMIN_API_KEY = 'test-admin-key-that-is-at-least-32-chars-long';
 
-/** Root directory of the coordinator project (parent of dist/). */
+/** Root directory of the coordinator project.
+ * When built with tsconfig.test.json (rootDir="."), this file compiles to
+ * dist/tests/helpers.js — so we need to go up 2 levels (dist/tests → dist → coordinator). */
 const COORDINATOR_ROOT = join(import.meta.dirname, '..', '..');
 
 /**
@@ -141,6 +148,8 @@ export class CoordinatorProcess {
             MOCK_BLOCK_HEIGHT: '1000',
             RATE_LIMIT_DISABLED: 'true',
             CORS_ORIGIN: 'http://localhost:5173,http://localhost:5174,http://test',
+            MONERO_NETWORK: 'stagenet',
+            XMR_FEE_ADDRESS: '',
             DB_BACKUP_INTERVAL_MS: '0',
             ...this._envOverrides,
         };
@@ -231,6 +240,8 @@ export class CoordinatorProcess {
     /** Kill and re-start the coordinator, preserving the same DB path for persistence testing. */
     async restart(): Promise<void> {
         await this.kill();
+        // Clean up lock file in case SIGKILL prevented graceful shutdown
+        try { unlinkSync(`${this._dbPath}.lock`); } catch { /* may not exist */ }
         // Pick a fresh port since the old one may be in TIME_WAIT
         this._port = 0;
         await this.start();
@@ -256,6 +267,11 @@ export interface IApiResult<T = unknown> {
  * Uses the global fetch API (Node 18+).
  */
 export class SwapApiClient {
+    /** Auto-captured recovery tokens from createSwap responses (swapId → token). */
+    private readonly recoveryTokens = new Map<string, string>();
+    /** Auto-captured claim tokens from takeSwap responses (swapId → token). */
+    private readonly claimTokens = new Map<string, string>();
+
     constructor(
         private readonly baseUrl: string,
         private readonly apiKey: string = ADMIN_API_KEY,
@@ -270,7 +286,8 @@ export class SwapApiClient {
 
     // -- Swap CRUD --
 
-    /** POST /api/swaps -- create a new swap. Requires admin auth. */
+    /** POST /api/swaps -- create a new swap. Requires admin auth.
+     * Auto-captures recovery_token from 201 responses for use by submitSecret(). */
     async createSwap(params: {
         swap_id: string;
         hash_lock: string;
@@ -281,7 +298,31 @@ export class SwapApiClient {
         opnet_create_tx?: string;
         alice_xmr_payout?: string;
     }): Promise<IApiResult> {
-        return this.request('POST', '/api/swaps', params, true);
+        const result = await this.request('POST', '/api/swaps', params, true);
+        // Auto-capture recovery_token so submitSecret can use it transparently
+        if (result.status === 201) {
+            const data = result.body.data as Record<string, unknown> | null;
+            const token = data?.['recovery_token'] as string | undefined;
+            if (token) this.recoveryTokens.set(params.swap_id, token);
+        }
+        return result;
+    }
+
+    /** Create swap and extract recovery_token from the response. */
+    async createSwapWithToken(params: {
+        swap_id: string;
+        hash_lock: string;
+        refund_block: number;
+        moto_amount: string;
+        xmr_amount: string;
+        depositor: string;
+        opnet_create_tx?: string;
+        alice_xmr_payout?: string;
+    }): Promise<{ result: IApiResult; recoveryToken: string }> {
+        const result = await this.createSwap(params);
+        const data = result.body.data as Record<string, unknown> | null;
+        const recoveryToken = (data?.['recovery_token'] as string) ?? '';
+        return { result, recoveryToken };
     }
 
     /** GET /api/swaps -- paginated list. */
@@ -296,19 +337,36 @@ export class SwapApiClient {
 
     // -- Swap actions --
 
-    /** POST /api/swaps/:id/take -- returns { claim_token }. */
-    async takeSwap(swapId: string, opnetTxId: string): Promise<IApiResult> {
-        return this.request('POST', `/api/swaps/${encodeURIComponent(swapId)}/take`, { opnetTxId });
+    /** POST /api/swaps/:id/take -- returns { claim_token }.
+     * Auto-generates claimTokenHint if not provided, and captures the claim_token. */
+    async takeSwap(swapId: string, opnetTxId: string, claimTokenHint?: string): Promise<IApiResult> {
+        const body: Record<string, string> = { opnetTxId };
+        const hint = claimTokenHint ?? randomBytes(32).toString('hex');
+        body['claimTokenHint'] = hint;
+        const result = await this.request('POST', `/api/swaps/${encodeURIComponent(swapId)}/take`, body);
+        // Auto-capture claim_token for use by submitKeys
+        if (result.status === 200) {
+            const data = result.body.data as Record<string, unknown> | null;
+            const token = (data?.['claim_token'] as string) ?? hint;
+            this.claimTokens.set(swapId, token);
+        }
+        return result;
     }
 
-    /** POST /api/swaps/:id/secret -- validates SHA-256(secret) == hash_lock. */
-    async submitSecret(swapId: string, secret: string, aliceViewKey?: string): Promise<IApiResult> {
+    /** POST /api/swaps/:id/secret -- validates SHA-256(secret) == hash_lock.
+     * Auto-uses recovery_token captured from createSwap if not explicitly provided. */
+    async submitSecret(swapId: string, secret: string, aliceViewKey?: string, recoveryToken?: string, aliceXmrPayout?: string): Promise<IApiResult> {
         const body: Record<string, string> = { secret };
         if (aliceViewKey !== undefined) body['aliceViewKey'] = aliceViewKey;
-        return this.request('POST', `/api/swaps/${encodeURIComponent(swapId)}/secret`, body);
+        if (aliceXmrPayout !== undefined) body['aliceXmrPayout'] = aliceXmrPayout;
+        const extraHeaders: Record<string, string> = {};
+        const token = recoveryToken ?? this.recoveryTokens.get(swapId);
+        if (token) extraHeaders['X-Recovery-Token'] = token;
+        return this.request('POST', `/api/swaps/${encodeURIComponent(swapId)}/secret`, body, false, extraHeaders);
     }
 
-    /** POST /api/swaps/:id/keys -- submit Bob's Ed25519 key material + Schnorr proof. */
+    /** POST /api/swaps/:id/keys -- submit Bob's Ed25519 key material + Schnorr proof.
+     * Auto-uses claim_token captured from takeSwap if not explicitly provided. */
     async submitKeys(
         swapId: string,
         keys: {
@@ -316,9 +374,49 @@ export class SwapApiClient {
             bobViewKey: string;
             bobKeyProof: string;
             bobSpendKey?: string;
+            claimToken?: string;
         },
     ): Promise<IApiResult> {
-        return this.request('POST', `/api/swaps/${encodeURIComponent(swapId)}/keys`, keys);
+        const body = { ...keys };
+        if (!body.claimToken) {
+            const captured = this.claimTokens.get(swapId);
+            if (captured) body.claimToken = captured;
+        }
+        return this.request('POST', `/api/swaps/${encodeURIComponent(swapId)}/keys`, body);
+    }
+
+    /** GET /api/swaps/:id/my-secret -- recover Alice's secret with recovery token. */
+    async getMySecret(swapId: string, recoveryToken: string): Promise<IApiResult> {
+        return this.request('GET', `/api/swaps/${encodeURIComponent(swapId)}/my-secret`, undefined, false, { 'X-Recovery-Token': recoveryToken });
+    }
+
+    /** GET /api/swaps/:id/my-keys -- recover Bob's keys with claim token. */
+    async getMyKeys(swapId: string, claimToken: string): Promise<IApiResult> {
+        return this.request('GET', `/api/swaps/${encodeURIComponent(swapId)}/my-keys`, undefined, false, { 'X-Claim-Token': claimToken });
+    }
+
+    /** POST /api/swaps/:id/claim-xmr -- Alice triggers XMR sweep. Requires admin auth. */
+    async claimXmr(swapId: string): Promise<IApiResult> {
+        return this.request('POST', `/api/swaps/${encodeURIComponent(swapId)}/claim-xmr`, {}, true);
+    }
+
+    // -- Secret backup --
+
+    /** POST /api/secrets/backup -- pre-register a secret before swap exists on-chain. Requires admin auth. */
+    async backupSecret(body: Record<string, string>): Promise<IApiResult> {
+        return this.request('POST', '/api/secrets/backup', body, true);
+    }
+
+    // -- Lookup endpoints --
+
+    /** GET /api/swaps/by-hashlock/:hex */
+    async getSwapByHashLock(hashLockHex: string): Promise<IApiResult> {
+        return this.request('GET', `/api/swaps/by-hashlock/${encodeURIComponent(hashLockHex)}`);
+    }
+
+    /** GET /api/swaps/by-claim-token/:hex */
+    async getSwapByClaimToken(claimTokenHex: string): Promise<IApiResult> {
+        return this.request('GET', `/api/swaps/by-claim-token/${encodeURIComponent(claimTokenHex)}`);
     }
 
     // -- Admin --
@@ -354,11 +452,13 @@ export class SwapApiClient {
         path: string,
         body?: unknown,
         admin = false,
+        extraHeaders?: Record<string, string>,
     ): Promise<IApiResult> {
         const url = `${this.baseUrl}${path}`;
         const headers: Record<string, string> = {
             'Content-Type': 'application/json',
             Accept: 'application/json',
+            ...extraHeaders,
         };
         if (admin) {
             headers['Authorization'] = `Bearer ${this.apiKey}`;
@@ -404,7 +504,7 @@ export interface IWsMessage {
 /**
  * WebSocket client wrapper for testing coordinator WS broadcasts.
  *
- * On connect, the coordinator sends an `active_swaps` message.
+ * On connect, the coordinator sends a `connected` acknowledgement message.
  * After subscribing with a valid claim_token, the client receives
  * `swap_update` and `preimage_ready` messages.
  */
@@ -547,16 +647,21 @@ export function generateBobKeyMaterial(swapId: string): {
     bobKeyProof: string;
     bobSpendKey: string;
 } {
-    // Generate Ed25519 keypair
+    // Generate Ed25519 keypair using Monero-style derivation (scalar * G, NOT standard ed25519)
+    // The coordinator's ed25519PublicFromPrivate uses this same approach.
     const privKey = ed25519.utils.randomSecretKey();
-    const pubKeyBytes = ed25519.getPublicKey(privKey);
+    const privScalar = bytesToScalar(privKey) % ED25519_ORDER;
+    const pubKeyPoint = ed25519.Point.BASE.multiply(privScalar === 0n ? 1n : privScalar);
+    const pubKeyBytes = pubKeyPoint.toBytes();
     const bobPubKey = Buffer.from(pubKeyBytes).toString('hex');
 
-    // Generate a separate view key
+    // Generate a separate view key (also Monero-style)
     const viewPriv = ed25519.utils.randomSecretKey();
-    const bobViewKey = Buffer.from(ed25519.getPublicKey(viewPriv)).toString('hex');
+    const viewScalar = bytesToScalar(viewPriv) % ED25519_ORDER;
+    const viewPubPoint = ed25519.Point.BASE.multiply(viewScalar === 0n ? 1n : viewScalar);
+    const bobViewKey = Buffer.from(viewPubPoint.toBytes()).toString('hex');
 
-    // Spend key (for split-key mode)
+    // Spend key (for split-key mode) — raw bytes, coordinator interprets as scalar
     const bobSpendKey = Buffer.from(privKey).toString('hex');
 
     // --- Schnorr proof ---
@@ -580,16 +685,35 @@ export function generateBobKeyMaterial(swapId: string): {
         .digest();
     const eBig = bytesToScalar(eHash);
 
-    // Private scalar -- Ed25519 "clamped" from SHA-512(seed)
-    const privScalar = getEd25519PrivateScalar(privKey);
+    // Private scalar — Monero-style: raw bytes as scalar (same as coordinator uses)
+    const schnorrPrivScalar = bytesToScalar(privKey) % ED25519_ORDER;
 
     // s = (k + e * priv) mod l
-    const sBig = mod(kBig + eBig * privScalar, ED25519_ORDER);
+    const sBig = mod(kBig + eBig * schnorrPrivScalar, ED25519_ORDER);
     const sBytes = scalarToBytes(sBig);
 
     const bobKeyProof = Buffer.from(rBytes).toString('hex') + Buffer.from(sBytes).toString('hex');
 
     return { bobPubKey, bobViewKey, bobKeyProof, bobSpendKey };
+}
+
+// ---------------------------------------------------------------------------
+// Monero address generator (for tests)
+// ---------------------------------------------------------------------------
+
+/**
+ * Generates a valid Monero stagenet address using real Ed25519 keys.
+ * The address passes all validation checks including Keccak-256 checksum.
+ */
+export function generateValidStagenetAddress(): string {
+    const kp1 = generateEd25519KeyPair();
+    const kp2 = generateEd25519KeyPair();
+    const result = computeSharedMoneroAddress(
+        kp1.publicKey, kp2.publicKey,
+        kp1.privateKey, kp2.privateKey,
+        'stagenet',
+    );
+    return result.address;
 }
 
 // ---------------------------------------------------------------------------

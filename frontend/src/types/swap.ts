@@ -71,6 +71,7 @@ export interface CoordinatorStatus {
         | 'taken'
         | 'xmr_locking'
         | 'xmr_locked'
+        | 'xmr_sweeping'
         | 'claimed'
         | 'complete'
         | 'refunded'
@@ -84,6 +85,10 @@ export interface CoordinatorStatus {
     readonly trustlessMode?: boolean;
     readonly aliceEd25519Pub?: string;
     readonly bobEd25519Pub?: string;
+    readonly aliceSecp256k1Pub?: string;
+    readonly aliceDleqProof?: string;
+    readonly bobSecp256k1Pub?: string;
+    readonly bobDleqProof?: string;
     readonly sweepStatus?: string;
     readonly depositor?: string;
     readonly updatedAt: number;
@@ -111,20 +116,6 @@ export function calculateXmrTotal(xmrAmount: bigint): bigint {
 }
 
 /**
- * Secret stored locally for a swap the user created.
- */
-export interface LocalSwapSecret {
-    readonly swapId: string;
-    readonly secret: string;
-    readonly hashLock: string;
-    readonly createdAt: number;
-    /** Alice's ed25519 private view key for split-key mode. */
-    readonly aliceViewKey?: string;
-    /** Alice's XMR payout address (where she receives XMR after completion). */
-    readonly aliceXmrPayout?: string;
-}
-
-/**
  * Bob's key material for coordinator-mediated atomic swap.
  */
 export interface BobKeyMaterial {
@@ -132,6 +123,8 @@ export interface BobKeyMaterial {
     readonly bobViewKey: string;
     readonly bobKeyProof: string;
     readonly bobSpendKey: string;
+    readonly bobSecp256k1Pub?: string;
+    readonly bobDleqProof?: string;
 }
 
 /**

@@ -60,7 +60,7 @@ export function Docs(): React.ReactElement {
                     About MOTO-XMR Swap
                 </h2>
                 <p style={{ fontSize: '0.875rem', color: 'var(--color-text-secondary)' }}>
-                    Cross-chain swaps between MOTO and Monero, secured by hash-time locked contracts.
+                    Cross-chain swaps between MOTO and Monero, secured by on-chain HTLCs and split-key cryptography.
                 </p>
             </div>
 
@@ -104,7 +104,7 @@ export function Docs(): React.ReactElement {
                         </span>
                         <span style={{ color: 'var(--color-text-muted)', fontSize: '1.2rem' }}>&rarr;</span>
                     </div>
-                    <p style={{ fontSize: '0.65rem', color: 'var(--color-text-muted)' }}>HTLC + Split Keys</p>
+                    <p style={{ fontSize: '0.65rem', color: 'var(--color-text-muted)' }}>HTLC + Split Keys + DLEQ</p>
                 </div>
 
                 <div style={{ textAlign: 'center' }}>
@@ -123,14 +123,14 @@ export function Docs(): React.ReactElement {
             {/* Swap Flow */}
             <div className="glass-card" style={{ padding: '24px', marginBottom: '20px' }}>
                 <h3 style={{ fontSize: '1.05rem', fontWeight: 700, marginBottom: '20px', color: 'var(--color-text-primary)' }}>
-                    Swap Flow
+                    How It Works
                 </h3>
 
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '0' }}>
                     <Step
                         num={1}
                         title="Create a Swap"
-                        desc="The seller locks MOTO tokens in the on-chain HTLC vault contract and specifies the XMR amount they want. A cryptographic secret and ed25519 key pair are generated locally in the browser."
+                        desc="The seller locks MOTO tokens in the on-chain HTLC vault contract and specifies the XMR amount. A cryptographic secret (preimage), ed25519 key pair, and cross-curve DLEQ proof are generated locally in the browser. Keys never leave your device."
                         accent="#c456ff"
                         bg="rgba(196, 86, 255, 0.1)"
                     />
@@ -138,7 +138,7 @@ export function Docs(): React.ReactElement {
                     <Step
                         num={2}
                         title="Buyer Takes the Swap"
-                        desc="A counterparty accepts the offer from the order book. They generate their own ed25519 key pair and submit it to the coordinator. Both parties' keys combine to create a shared Monero escrow address."
+                        desc="A counterparty accepts the offer. They generate their own ed25519 key pair and DLEQ proof locally. Both parties' public keys are combined to create a shared Monero escrow address that neither party can spend from alone."
                         accent="#f26822"
                         bg="rgba(242, 104, 34, 0.1)"
                     />
@@ -146,58 +146,69 @@ export function Docs(): React.ReactElement {
                     <Step
                         num={3}
                         title="XMR Escrow"
-                        desc="The coordinator deposits XMR into the shared escrow address. The transaction is monitored on the Monero network and requires 10 confirmations before proceeding."
+                        desc="XMR is deposited into the shared split-key escrow address. The deposit is monitored on the Monero network and requires 10 confirmations (~20 minutes) before the swap can proceed. Both parties can verify the DLEQ proofs to confirm the escrow address is valid."
                         accent="#f26822"
                         bg="rgba(242, 104, 34, 0.1)"
                     />
                     <Connector />
                     <Step
                         num={4}
-                        title="Claim MOTO"
-                        desc="Once XMR is confirmed locked, the buyer claims the MOTO tokens by revealing the secret preimage on-chain. This proves they know the hash-lock secret without exposing it beforehand."
-                        accent="#c456ff"
-                        bg="rgba(196, 86, 255, 0.1)"
+                        title="Sweep-Before-Claim"
+                        desc="Once XMR is confirmed, the coordinator sweeps the XMR to the seller's wallet BEFORE the secret is revealed. This ensures the seller has their Monero before the buyer can claim MOTO — eliminating the race window between preimage revelation and XMR delivery."
+                        accent="#00e676"
+                        bg="rgba(0, 230, 118, 0.1)"
                     />
                     <Connector />
                     <Step
                         num={5}
-                        title="XMR Sweep"
-                        desc="The coordinator automatically sweeps the XMR from escrow to the seller's Monero wallet. A 0.87% fee is collected from the XMR amount."
-                        accent="#00e676"
-                        bg="rgba(0, 230, 118, 0.1)"
+                        title="Claim MOTO"
+                        desc="After XMR is secured, the preimage is broadcast to the buyer. They claim MOTO tokens by revealing the preimage on-chain, completing the swap. A 0.87% fee is collected from the XMR amount."
+                        accent="#c456ff"
+                        bg="rgba(196, 86, 255, 0.1)"
                     />
                 </div>
             </div>
 
-            {/* Trust Model */}
+            {/* Security Model */}
             <div className="glass-card" style={{ padding: '24px', marginBottom: '20px' }}>
                 <h3 style={{ fontSize: '1.05rem', fontWeight: 700, marginBottom: '16px', color: 'var(--color-text-primary)' }}>
-                    Trust Model
+                    Security Model
                 </h3>
-                <p style={{ fontSize: '0.85rem', color: 'var(--color-text-secondary)', lineHeight: 1.6, marginBottom: '16px' }}>
-                    This is a <strong style={{ color: 'var(--color-text-primary)' }}>coordinator-mediated</strong> swap, not a fully trustless atomic swap. Here&apos;s what that means:
-                </p>
 
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
                     <div style={{ padding: '12px 14px', background: 'rgba(0, 230, 118, 0.06)', border: '1px solid rgba(0, 230, 118, 0.15)', borderRadius: 'var(--radius-md)' }}>
                         <p style={{ fontSize: '0.82rem', fontWeight: 600, color: '#00e676', marginBottom: '4px' }}>
-                            What IS secured on-chain
+                            Non-custodial (MOTO side)
                         </p>
                         <ul style={{ fontSize: '0.8rem', color: 'var(--color-text-secondary)', paddingLeft: '16px', lineHeight: 1.6 }}>
                             <li>MOTO tokens are locked in a hash-time locked contract (HTLC) on Bitcoin L1 via OPNet</li>
-                            <li>The seller can always refund their MOTO after the timelock expires</li>
-                            <li>The buyer can only claim MOTO by revealing the correct preimage</li>
+                            <li>The seller can always refund their MOTO after the timelock expires — no one can prevent this</li>
+                            <li>The buyer can only claim MOTO by revealing the correct preimage on-chain</li>
+                            <li>The coordinator cannot steal or freeze locked MOTO tokens</li>
+                        </ul>
+                    </div>
+
+                    <div style={{ padding: '12px 14px', background: 'rgba(100, 181, 246, 0.06)', border: '1px solid rgba(100, 181, 246, 0.15)', borderRadius: 'var(--radius-md)' }}>
+                        <p style={{ fontSize: '0.82rem', fontWeight: 600, color: '#64b5f6', marginBottom: '4px' }}>
+                            Split-key escrow (XMR side)
+                        </p>
+                        <ul style={{ fontSize: '0.8rem', color: 'var(--color-text-secondary)', paddingLeft: '16px', lineHeight: 1.6 }}>
+                            <li>The XMR escrow address is a shared Monero address derived from both parties&apos; keys — neither can spend alone</li>
+                            <li>Cross-curve DLEQ proofs verify that each party&apos;s keys are mathematically valid — your browser checks this independently</li>
+                            <li>Sweep-before-claim: XMR is sent to the seller <em>before</em> the preimage goes public, preventing front-running</li>
+                            <li>All key generation happens locally in your browser using cryptographically secure randomness</li>
                         </ul>
                     </div>
 
                     <div style={{ padding: '12px 14px', background: 'rgba(255, 215, 64, 0.06)', border: '1px solid rgba(255, 215, 64, 0.15)', borderRadius: 'var(--radius-md)' }}>
                         <p style={{ fontSize: '0.82rem', fontWeight: 600, color: 'var(--color-text-warning)', marginBottom: '4px' }}>
-                            What requires trust in the coordinator
+                            Coordinator role
                         </p>
                         <ul style={{ fontSize: '0.8rem', color: 'var(--color-text-secondary)', paddingLeft: '16px', lineHeight: 1.6 }}>
-                            <li>The coordinator holds both ed25519 key shares and manages the XMR escrow</li>
-                            <li>XMR deposits and sweeps are handled by the coordinator&apos;s wallet</li>
-                            <li>The coordinator must be online and honest for the XMR side to complete</li>
+                            <li>The coordinator facilitates the swap by combining key shares and executing the XMR sweep</li>
+                            <li>It must be online and responsive for swaps to complete on the XMR side</li>
+                            <li>The coordinator cannot steal MOTO (on-chain HTLC) but is trusted with the XMR sweep execution</li>
+                            <li>Sensitive data (preimages, view keys) is encrypted at rest and scrubbed after swap completion</li>
                         </ul>
                     </div>
                 </div>
@@ -215,7 +226,9 @@ export function Docs(): React.ReactElement {
                         ['Confirmations', '10 Monero confirmations required (~20 min)'],
                         ['Timelock', 'Configurable, default ~13 hours (80 blocks)'],
                         ['Refunds', 'Seller can reclaim MOTO after timelock expiry'],
-                        ['Privacy', 'No KYC. Monero addresses are not stored long-term.'],
+                        ['Privacy', 'No KYC. Fresh Monero escrow addresses per swap. Keys scrubbed after completion.'],
+                        ['Recovery', 'Mnemonic backup allows swap recovery if browser data is lost'],
+                        ['Verification', 'DLEQ proofs are verified client-side — your browser independently confirms key validity'],
                     ].map(([label, value]) => (
                         <div key={label} style={{ display: 'flex', gap: '12px', fontSize: '0.85rem' }}>
                             <span style={{ color: 'var(--color-text-muted)', minWidth: '120px', flexShrink: 0, fontWeight: 600 }}>

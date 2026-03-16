@@ -13,6 +13,7 @@ import { type ISwapRecord, type IWsMessage, type IWsPreimageReady, type IWsClien
 import { StorageService } from './storage.js';
 
 const ALLOWED_ORIGIN = process.env['CORS_ORIGIN'] ?? 'http://localhost:5173';
+const TRUST_PROXY = (process.env['TRUST_PROXY'] ?? 'false').toLowerCase() === 'true';
 
 /** Max WebSocket message size (bytes). Subscribe messages are ~200 bytes. */
 const WS_MAX_PAYLOAD = 4096;
@@ -33,6 +34,13 @@ const PENDING_PREIMAGE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 /** Max number of pending preimage entries to prevent unbounded memory growth. */
 const MAX_PENDING_PREIMAGES = 200;
 
+/** Max WebSocket connections per IP address (relaxed in test mode). */
+const WS_MAX_CONNECTIONS_PER_IP =
+    (process.env['RATE_LIMIT_DISABLED'] ?? 'false').toLowerCase() === 'true' ? 100 : 10;
+
+/** Global maximum WebSocket connections. */
+const WS_MAX_CONNECTIONS_GLOBAL = 500;
+
 interface IPendingPreimage {
     readonly preimage: string;
     readonly storedAt: number;
@@ -42,6 +50,28 @@ interface IPendingPreimage {
 interface IWsRateState {
     msgCount: number;
     windowStart: number;
+}
+
+/**
+ * Scans a JSON string for nesting depth without parsing.
+ * Counts brace/bracket nesting; ignores characters inside quoted strings.
+ * Returns the maximum depth found (0 for flat values, 1 for `{...}`).
+ */
+function jsonNestingDepth(text: string): number {
+    let depth = 0;
+    let maxDepth = 0;
+    let inString = false;
+    let escaped = false;
+    for (let i = 0; i < text.length; i++) {
+        const ch = text[i];
+        if (escaped) { escaped = false; continue; }
+        if (ch === '\\' && inString) { escaped = true; continue; }
+        if (ch === '"') { inString = !inString; continue; }
+        if (inString) continue;
+        if (ch === '{' || ch === '[') { depth++; if (depth > maxDepth) maxDepth = depth; }
+        else if (ch === '}' || ch === ']') { depth--; }
+    }
+    return maxDepth;
 }
 
 /** Manages WebSocket connections and state-change broadcasts. */
@@ -63,6 +93,12 @@ export class SwapWebSocketServer {
 
     /** Tracks which (swapId, client) pairs are authenticated for preimage delivery. */
     private readonly authenticatedSubs = new Map<string, Set<WebSocket>>();
+
+    /** Per-IP connection count tracking for DoS prevention. */
+    private readonly ipConnectionCounts = new Map<string, number>();
+
+    /** Maps WebSocket → IP for cleanup on disconnect. */
+    private readonly clientIps = new WeakMap<WebSocket, string>();
 
     /** Ping interval timer. */
     private readonly pingTimer: NodeJS.Timeout;
@@ -106,19 +142,45 @@ export class SwapWebSocketServer {
             this.sweepExpiredPreimages();
         }, 60 * 60 * 1000); // Every hour
 
+        // Restore persisted pending preimages from DB (survives crash + in-memory eviction)
+        const saved = storage.loadPendingPreimages();
+        for (const { swapId, preimage } of saved) {
+            this.pendingPreimages.set(swapId, { preimage, storedAt: Date.now() });
+        }
+        if (saved.length > 0) {
+            console.log(`[WebSocket] Restored ${saved.length} pending preimage(s) from DB`);
+        }
+
         console.log('[WebSocket] Server attached to HTTP server');
     }
 
     /**
-     * Broadcasts a swap state update to all connected clients.
-     * General swap updates are public — they contain no secrets.
+     * Sends a swap state update ONLY to clients subscribed to this specific swap.
+     * Prevents anonymous observers from passively monitoring all coordinator activity.
      * @param swap - The updated swap record.
      */
     public broadcastSwapUpdate(swap: ISwapRecord): void {
         // Sanitize: strip secrets from public broadcast
-        const sanitized = { ...swap, preimage: null, claim_token: null, alice_view_key: null, bob_view_key: null, bob_spend_key: null };
+        const sanitized = { ...swap, preimage: null, claim_token: null, alice_view_key: null, bob_view_key: null, bob_spend_key: null, recovery_token: null, alice_xmr_payout: null };
         const message: IWsMessage = { type: 'swap_update', data: sanitized };
-        this.broadcast(message);
+        this.sendToSwapSubscribers(swap.swap_id, message);
+    }
+
+    /** Sends a message only to clients subscribed to a specific swap. */
+    private sendToSwapSubscribers(swapId: string, message: IWsMessage): void {
+        const subs = this.subscriptions.get(swapId);
+        if (!subs || subs.size === 0) return;
+        const json = JSON.stringify(message);
+        let sent = 0;
+        for (const client of subs) {
+            if (client.readyState === WebSocket.OPEN) {
+                client.send(json);
+                sent++;
+            }
+        }
+        if (sent > 0) {
+            console.log(`[WebSocket] Sent ${message.type} to ${sent} subscriber(s) for swap ${swapId}`);
+        }
     }
 
     /**
@@ -130,16 +192,19 @@ export class SwapWebSocketServer {
      * @param preimage - The hex-encoded preimage.
      */
     public broadcastPreimageReady(swapId: string, preimage: string): void {
-        // Cap the queue to prevent unbounded memory growth
+        // Cap the in-memory queue to prevent unbounded memory growth.
+        // Eviction from memory is safe because preimages are backed up to DB.
         if (this.pendingPreimages.size >= MAX_PENDING_PREIMAGES) {
-            // Remove oldest entry (Map preserves insertion order)
             const oldestKey = this.pendingPreimages.keys().next().value;
             if (oldestKey !== undefined) {
                 this.pendingPreimages.delete(oldestKey);
+                // DB backup remains — will be loaded on restart or late subscribe
             }
         }
         // Always queue the preimage so late subscribers can receive it
         this.pendingPreimages.set(swapId, { preimage, storedAt: Date.now() });
+        // Persist to DB — survives process crash and in-memory eviction
+        this.storage.savePendingPreimage(swapId, preimage);
 
         const payload: IWsPreimageReady = { swapId, preimage };
         const message: IWsMessage = { type: 'preimage_ready', data: payload };
@@ -163,18 +228,22 @@ export class SwapWebSocketServer {
     }
 
     /**
-     * Broadcasts sweep queue position updates to all connected clients.
+     * Sends sweep queue position updates to subscribers of each queued swap.
+     * Only delivers positions relevant to each client's subscribed swaps.
      * @param positions - Current queue positions for all queued sweeps.
      */
     public broadcastQueueUpdate(positions: ReadonlyArray<{ readonly swapId: string; readonly position: number; readonly total: number }>): void {
-        const data: IWsQueueUpdate = { queue: positions };
-        const message: IWsMessage = { type: 'queue_update', data };
-        this.broadcast(message);
+        for (const pos of positions) {
+            const data: IWsQueueUpdate = { queue: [pos] };
+            const message: IWsMessage = { type: 'queue_update', data };
+            this.sendToSwapSubscribers(pos.swapId, message);
+        }
     }
 
     /** Removes a queued preimage (e.g., after swap completes or expires). */
     public clearPendingPreimage(swapId: string): void {
         this.pendingPreimages.delete(swapId);
+        this.storage.deletePendingPreimage(swapId);
     }
 
     /** Returns the count of currently connected clients. */
@@ -190,8 +259,27 @@ export class SwapWebSocketServer {
     }
 
     private handleConnection(ws: WebSocket, req: IncomingMessage): void {
+        // Enforce global connection cap
+        if (this.wss.clients.size > WS_MAX_CONNECTIONS_GLOBAL) {
+            ws.close(1013, 'Server at capacity');
+            return;
+        }
+
+        // Enforce per-IP connection limit (proxy-aware)
+        const ip = TRUST_PROXY
+            ? (req.headers['x-forwarded-for']?.toString().split(',')[0]?.trim() ?? req.socket.remoteAddress ?? 'unknown')
+            : (req.socket.remoteAddress ?? 'unknown');
+        const currentIpCount = this.ipConnectionCounts.get(ip) ?? 0;
+        if (currentIpCount >= WS_MAX_CONNECTIONS_PER_IP) {
+            ws.close(1013, 'Too many connections from this IP');
+            console.warn(`[WebSocket] Rejected connection from ${ip} — per-IP limit (${WS_MAX_CONNECTIONS_PER_IP}) reached`);
+            return;
+        }
+        this.ipConnectionCounts.set(ip, currentIpCount + 1);
+        this.clientIps.set(ws, ip);
+
         const origin = req.headers['origin'] ?? 'unknown';
-        console.log(`[WebSocket] Client connected from ${origin}`);
+        console.log(`[WebSocket] Client connected from ${origin} (${ip}, ${this.wss.clients.size} total)`);
 
         // Mark alive for ping/pong keepalive
         const tagged = ws as WebSocket & { isAlive?: boolean };
@@ -200,10 +288,9 @@ export class SwapWebSocketServer {
             tagged.isAlive = true;
         });
 
-        const activeSwaps = this.storage.getActiveSwaps();
-        // Sanitize: strip secrets from public broadcast
-        const sanitized = activeSwaps.map((s) => ({ ...s, preimage: null, claim_token: null, alice_view_key: null, bob_view_key: null }));
-        const initMsg: IWsMessage = { type: 'active_swaps', data: sanitized };
+        // Send connection acknowledgement (no swap data until client subscribes).
+        // Previously sent all active swaps to every anonymous connection — removed for privacy.
+        const initMsg: IWsMessage = { type: 'connected', data: { message: 'Subscribe to a swap to receive updates' } };
         this.sendToClient(ws, initMsg);
 
         ws.on('message', (raw: Buffer | string) => {
@@ -212,6 +299,16 @@ export class SwapWebSocketServer {
 
         ws.on('close', () => {
             this.removeClientFromAllSubscriptions(ws);
+            // Decrement per-IP counter
+            const clientIp = this.clientIps.get(ws);
+            if (clientIp) {
+                const count = this.ipConnectionCounts.get(clientIp) ?? 1;
+                if (count <= 1) {
+                    this.ipConnectionCounts.delete(clientIp);
+                } else {
+                    this.ipConnectionCounts.set(clientIp, count - 1);
+                }
+            }
             console.log(`[WebSocket] Client disconnected (${this.wss.clients.size} remaining)`);
         });
 
@@ -233,18 +330,19 @@ export class SwapWebSocketServer {
         return state.msgCount <= WS_MSG_RATE_LIMIT;
     }
 
-    /** Removes expired entries from pendingPreimages. */
+    /** Removes expired entries from pendingPreimages (both memory and DB). */
     private sweepExpiredPreimages(): void {
         const now = Date.now();
         let swept = 0;
         for (const [swapId, entry] of this.pendingPreimages) {
             if (now - entry.storedAt > PENDING_PREIMAGE_TTL_MS) {
                 this.pendingPreimages.delete(swapId);
+                this.storage.deletePendingPreimage(swapId);
                 swept++;
             }
         }
         if (swept > 0) {
-            console.log(`[WebSocket] Swept ${swept} expired pending preimage(s)`);
+            console.log(`[WebSocket] Swept ${swept} expired pending preimage(s) from memory + DB`);
         }
     }
 
@@ -257,6 +355,14 @@ export class SwapWebSocketServer {
 
         try {
             const text = typeof raw === 'string' ? raw : raw.toString('utf-8');
+
+            // Reject deeply nested JSON to prevent CPU/memory spikes from crafted payloads.
+            // Subscribe messages have depth ≤2, so 5 is generous.
+            if (jsonNestingDepth(text) > 5) {
+                this.sendToClient(ws, { type: 'error', data: 'Message too deeply nested' });
+                return;
+            }
+
             const msg = JSON.parse(text) as IWsClientMessage;
 
             if (msg.type === 'subscribe' && typeof msg.swapId === 'string') {
@@ -319,11 +425,22 @@ export class SwapWebSocketServer {
 
                 console.log(`[WebSocket] Client subscribed to swap ${msg.swapId} (${isAuthenticated ? 'authenticated' : 'public-only'})`);
 
-                // Deliver queued preimage ONLY to authenticated subscribers
+                // Deliver queued preimage ONLY to authenticated subscribers.
+                // Check in-memory map first, then fall back to DB (handles eviction + restart).
                 if (isAuthenticated) {
-                    const pending = this.pendingPreimages.get(msg.swapId);
-                    if (pending) {
-                        const payload: IWsPreimageReady = { swapId: msg.swapId, preimage: pending.preimage };
+                    let pendingPreimage = this.pendingPreimages.get(msg.swapId)?.preimage ?? null;
+                    if (!pendingPreimage) {
+                        // In-memory map may have evicted — check DB for this specific swap
+                        // (single-row query avoids loading/decrypting ALL pending preimages)
+                        const dbPreimage = this.storage.loadPendingPreimage(msg.swapId);
+                        if (dbPreimage) {
+                            pendingPreimage = dbPreimage;
+                            // Re-populate in-memory cache
+                            this.pendingPreimages.set(msg.swapId, { preimage: dbPreimage, storedAt: Date.now() });
+                        }
+                    }
+                    if (pendingPreimage) {
+                        const payload: IWsPreimageReady = { swapId: msg.swapId, preimage: pendingPreimage };
                         const preimageMsg: IWsMessage = { type: 'preimage_ready', data: payload };
                         this.sendToClient(ws, preimageMsg);
                         console.log(`[WebSocket] Delivered queued preimage to late authenticated subscriber for swap ${msg.swapId}`);
@@ -348,20 +465,6 @@ export class SwapWebSocketServer {
             if (authSubs.size === 0) {
                 this.authenticatedSubs.delete(swapId);
             }
-        }
-    }
-
-    private broadcast(message: IWsMessage): void {
-        const json = JSON.stringify(message);
-        let sent = 0;
-        this.wss.clients.forEach((client) => {
-            if (client.readyState === WebSocket.OPEN) {
-                client.send(json);
-                sent++;
-            }
-        });
-        if (sent > 0) {
-            console.log(`[WebSocket] Broadcast to ${sent} client(s): ${message.type}`);
         }
     }
 

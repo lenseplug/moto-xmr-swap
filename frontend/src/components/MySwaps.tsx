@@ -1,10 +1,9 @@
 /**
  * MySwaps — shows swaps the current user is involved in.
- * Reads all local secrets and shows their status.
+ * Uses wallet address matching only (no localStorage).
  */
 import React, { useState, useEffect } from 'react';
 import { useWalletConnect } from '@btc-vision/walletconnect';
-import { loadLocalSwapSecrets, getBobKeys } from '../utils/hashlock';
 import { formatTokenAmount, formatXmrAmount } from '../services/opnet';
 import { useSwaps } from '../hooks/useSwaps';
 import { getAllCoordinatorStatuses } from '../services/coordinator';
@@ -16,18 +15,11 @@ interface MySwapsProps {
     readonly onViewStatus: (swapId: bigint) => void;
 }
 
-/**
- * Shows active swaps the user created (from localStorage) and swaps they've taken.
- */
 export function MySwaps({ onViewStatus }: MySwapsProps): React.ReactElement {
     const { publicKey, address: senderAddress } = useWalletConnect();
     const isConnected = publicKey !== null;
     const { swaps, isLoading } = useSwaps();
 
-    const localSecrets = loadLocalSwapSecrets();
-    const localSwapIds = new Set(localSecrets.map((s) => s.swapId));
-
-    // Fetch coordinator statuses — used for pending claims AND wallet-based swap matching
     const myAddress = senderAddress?.toString().toLowerCase() ?? '';
     const [allCoordinatorStatuses, setAllCoordinatorStatuses] = useState<CoordinatorStatus[]>([]);
     const [pendingClaimStatuses, setPendingClaimStatuses] = useState<CoordinatorStatus[]>([]);
@@ -46,20 +38,18 @@ export function MySwaps({ onViewStatus }: MySwapsProps): React.ReactElement {
             setPendingClaimStatuses(pending);
         });
         return () => { mounted = false; };
-    }, [swaps.length, myAddress]); // re-check when swap list or wallet changes
+    }, [swaps.length, myAddress]);
 
-    // Swaps the user created — match by local secret OR on-chain depositor address
+    // Swaps the user created — match by on-chain depositor address
     const myCreatedSwaps = swaps.filter((s) => {
-        if (localSwapIds.has(s.swapId.toString())) return true;
         if (myAddress && s.depositor.toLowerCase() === myAddress) return true;
         return false;
     });
 
-    // Swaps where the user is the taker (Bob) — match by Bob keys in sessionStorage OR on-chain counterparty address
+    // Swaps where the user is the taker (Bob) — match by on-chain counterparty address
     const myTakenSwaps = swaps.filter((s) => {
         const id = s.swapId.toString();
-        if (myCreatedSwaps.some((c) => c.swapId.toString() === id)) return false; // skip own swaps
-        if (getBobKeys(id) !== null) return true;
+        if (myCreatedSwaps.some((c) => c.swapId.toString() === id)) return false;
         if (myAddress && s.counterparty.toLowerCase() === myAddress) return true;
         return false;
     });
@@ -183,7 +173,7 @@ export function MySwaps({ onViewStatus }: MySwapsProps): React.ReactElement {
                     My Swaps
                 </h2>
                 <p style={{ fontSize: '0.875rem', color: 'var(--color-text-secondary)' }}>
-                    Swaps you have created or participated in.
+                    Swaps you have created or participated in. You will need your <strong>12 recovery words</strong> to interact with active swaps.
                 </p>
             </div>
 
@@ -206,7 +196,6 @@ export function MySwaps({ onViewStatus }: MySwapsProps): React.ReactElement {
             {renderTable('Created by You', myCreatedSwaps, 'No swaps created by this wallet.')}
             {renderTable('Taken by You', myTakenSwaps, 'No swaps taken by this wallet.')}
 
-            {/* Coordinator-tracked swaps matching wallet (includes completed/refunded not in on-chain active list) */}
             {myAddress && allCoordinatorStatuses.filter(
                 (cs) => cs.depositor?.toLowerCase() === myAddress &&
                     !myCreatedSwaps.some((s) => s.swapId.toString() === cs.swapId),
@@ -254,7 +243,6 @@ export function MySwaps({ onViewStatus }: MySwapsProps): React.ReactElement {
                 </div>
             )}
 
-            {/* Completed swaps awaiting XMR claim */}
             {pendingClaimStatuses.length > 0 && (
                 <div>
                     <h3

@@ -5,6 +5,9 @@
 /** Swap fee in basis points (0.87% = 87 bps). Paid by the taker on the XMR side. */
 export const FEE_BPS = 87;
 
+/** Maximum allowed fee in basis points (5% = 500 bps). Sanity check at startup. */
+export const MAX_FEE_BPS = 500;
+
 /** Basis-point denominator. */
 const BPS_DENOMINATOR = 10_000n;
 
@@ -64,6 +67,7 @@ export enum SwapStatus {
     TAKEN = 'TAKEN',
     XMR_LOCKING = 'XMR_LOCKING',
     XMR_LOCKED = 'XMR_LOCKED',
+    XMR_SWEEPING = 'XMR_SWEEPING',
     MOTO_CLAIMING = 'MOTO_CLAIMING',
     COMPLETED = 'COMPLETED',
     EXPIRED = 'EXPIRED',
@@ -123,10 +127,24 @@ export interface ISwapRecord {
     readonly bob_spend_key: string | null;
     /** Bob's DLEQ proof (hex). */
     readonly bob_dleq_proof: string | null;
+    /** Alice's secp256k1 compressed public key (hex, 66 chars). */
+    readonly alice_secp256k1_pub: string | null;
+    /** Alice's cross-curve DLEQ proof (hex, 192 chars). */
+    readonly alice_dleq_proof: string | null;
+    /** Bob's secp256k1 compressed public key (hex, 66 chars). */
+    readonly bob_secp256k1_pub: string | null;
     /** Alice's XMR payout address (where her XMR portion is sent after completion). */
     readonly alice_xmr_payout: string | null;
+    /** XMR sweep transaction hash (pre-claim sweep to Alice). */
+    readonly xmr_sweep_tx: string | null;
+    /** XMR sweep transaction confirmations. */
+    readonly xmr_sweep_confirmations: number;
     /** Sweep status: null = not attempted, 'pending' = queued, 'done' = swept, 'failed:reason' = error. */
     readonly sweep_status: string | null;
+    /** Monero blockchain height when the XMR deposit was first detected. Used for sweep restore_height. */
+    readonly xmr_deposit_height: number | null;
+    /** Recovery token issued to Alice at swap creation — used to authenticate secret recovery. */
+    readonly recovery_token: string | null;
     readonly created_at: string;
     readonly updated_at: string;
 }
@@ -164,9 +182,16 @@ export interface IUpdateSwapParams {
     readonly bob_ed25519_pub?: string;
     readonly bob_view_key?: string | null;
     readonly bob_spend_key?: string | null;
-    readonly bob_dleq_proof?: string;
-    readonly alice_xmr_payout?: string;
+    readonly bob_dleq_proof?: string | null;
+    readonly alice_secp256k1_pub?: string | null;
+    readonly alice_dleq_proof?: string | null;
+    readonly bob_secp256k1_pub?: string | null;
+    readonly alice_xmr_payout?: string | null;
+    readonly xmr_sweep_tx?: string | null;
+    readonly xmr_sweep_confirmations?: number;
     readonly sweep_status?: string | null;
+    readonly xmr_deposit_height?: number | null;
+    readonly recovery_token?: string | null;
 }
 
 /** A state history entry. */
@@ -225,8 +250,8 @@ export interface IWsQueueUpdate {
 
 /** WebSocket message shape. */
 export interface IWsMessage {
-    readonly type: 'swap_update' | 'active_swaps' | 'error' | 'preimage_ready' | 'queue_update';
-    readonly data: ISwapRecord | ISwapRecord[] | string | IWsPreimageReady | IWsQueueUpdate;
+    readonly type: 'swap_update' | 'active_swaps' | 'connected' | 'error' | 'preimage_ready' | 'queue_update';
+    readonly data: ISwapRecord | ISwapRecord[] | string | IWsPreimageReady | IWsQueueUpdate | { readonly message: string };
 }
 
 /** Structured API response wrapper. */
@@ -252,4 +277,6 @@ export interface IPaginationParams {
 /** Request body for POST /api/swaps/:id/take */
 export interface ITakeSwapBody {
     readonly opnetTxId: string;
+    /** Deterministic claim token derived from Bob's mnemonic via HKDF (required, 64 hex chars). */
+    readonly claimTokenHint: string;
 }

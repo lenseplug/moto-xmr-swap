@@ -12,8 +12,8 @@
 import { ed25519 } from '@noble/curves/ed25519.js';
 import { sha256 } from '@noble/hashes/sha2.js';
 
-/** Ed25519 curve order (l). */
-const ED25519_ORDER = 2n ** 252n + 27742317777372353535851937790883648493n;
+/** Ed25519 curve order (l). Exported for shared use across crypto modules. */
+export const ED25519_ORDER = 2n ** 252n + 27742317777372353535851937790883648493n;
 
 /**
  * Generates a random ed25519 key pair suitable for Monero key splitting.
@@ -27,8 +27,13 @@ export function generateEd25519KeyPair(): {
     readonly privateKey: Uint8Array;
     readonly publicKey: Uint8Array;
 } {
-    const raw = crypto.getRandomValues(new Uint8Array(32));
-    const scalar = bytesToScalar(raw) % ED25519_ORDER;
+    // Retry if scalar is zero after reduction (probability ~2^-252, but must be defended).
+    let scalar: bigint;
+    do {
+        const raw = crypto.getRandomValues(new Uint8Array(32));
+        scalar = bytesToScalar(raw) % ED25519_ORDER;
+    } while (scalar === 0n);
+
     const privateKey = scalarToBytes(scalar);
     const publicKey = scalarMultBase(scalar);
     return { privateKey, publicKey };
@@ -54,7 +59,7 @@ function scalarMultBase(scalar: bigint): Uint8Array {
 /**
  * Converts a 32-byte little-endian Uint8Array to a BigInt scalar.
  */
-function bytesToScalar(bytes: Uint8Array): bigint {
+export function bytesToScalar(bytes: Uint8Array): bigint {
     let result = 0n;
     for (let i = bytes.length - 1; i >= 0; i--) {
         const byte = bytes[i];
@@ -68,7 +73,7 @@ function bytesToScalar(bytes: Uint8Array): bigint {
 /**
  * Converts a BigInt scalar to a 32-byte little-endian Uint8Array.
  */
-function scalarToBytes(scalar: bigint): Uint8Array {
+export function scalarToBytes(scalar: bigint): Uint8Array {
     const bytes = new Uint8Array(32);
     let remaining = scalar;
     for (let i = 0; i < 32; i++) {
@@ -104,9 +109,12 @@ export async function signBobKeyProof(
     const challengeData = new TextEncoder().encode('bob-key-proof:' + swapId);
     const challenge = sha256(challengeData);
 
-    // 2. Generate random nonce k
-    const kRaw = crypto.getRandomValues(new Uint8Array(32));
-    const k = bytesToScalar(kRaw) % ED25519_ORDER;
+    // 2. Generate random nonce k (reject zero)
+    let k: bigint;
+    do {
+        const kRaw = crypto.getRandomValues(new Uint8Array(32));
+        k = bytesToScalar(kRaw) % ED25519_ORDER;
+    } while (k === 0n);
 
     // 3. Compute R = k * G
     const R = ed25519.Point.BASE.multiply(k);

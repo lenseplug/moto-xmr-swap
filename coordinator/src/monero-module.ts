@@ -8,6 +8,7 @@ import { type IPreimageResult, SwapStatus, FEE_BPS } from './types.js';
 import type { StorageService } from './storage.js';
 import type { SwapStateMachine } from './state-machine.js';
 import type { SwapWebSocketServer } from './websocket.js';
+import { verifyMoneroAddressChecksum, generateEd25519KeyPair, computeSharedMoneroAddress } from './crypto/index.js';
 
 const XMR_REQUIRED_CONFIRMATIONS = 10;
 
@@ -47,6 +48,25 @@ const MONERO_ADDR_TYPES: ReadonlyArray<IAddrType> = [
  * @param address - The Monero address string.
  * @returns null if valid, error string if invalid.
  */
+/** Maps MONERO_NETWORK env var to valid address prefixes. */
+const NETWORK_PREFIXES: Record<string, ReadonlySet<string>> = {
+    mainnet: new Set(['4', '8']),
+    stagenet: new Set(['5', '7']),
+    testnet: new Set(['9', 'A', 'B']),
+};
+
+/**
+ * Safely converts a BigInt piconero amount to Number for wallet-rpc JSON.
+ * Throws if the value exceeds Number.MAX_SAFE_INTEGER (~9,007 XMR).
+ * Wallet-rpc accepts amounts as JSON integers, which are safe up to 2^53-1.
+ */
+function safeAmountToNumber(amount: bigint, context: string): number {
+    if (amount > BigInt(Number.MAX_SAFE_INTEGER)) {
+        throw new Error(`${context}: amount ${amount} exceeds Number.MAX_SAFE_INTEGER — cannot safely convert for wallet-rpc`);
+    }
+    return Number(amount);
+}
+
 export function validateMoneroAddress(address: string): string | null {
     if (address.length === 0) {
         return 'Address must not be empty';
@@ -72,6 +92,20 @@ export function validateMoneroAddress(address: string): string | null {
 
     if (!validPrefix) {
         return `Invalid address prefix '${firstChar}' for length ${address.length}`;
+    }
+
+    // Enforce network match: reject addresses that don't match MONERO_NETWORK.
+    // Prevents mainnet XMR from being sent to stagenet addresses (or vice versa).
+    const network = process.env['MONERO_NETWORK'] ?? 'stagenet';
+    const allowedPrefixes = NETWORK_PREFIXES[network];
+    if (allowedPrefixes && firstChar && !allowedPrefixes.has(firstChar)) {
+        return `Address prefix '${firstChar}' does not match configured network '${network}' (expected: ${[...allowedPrefixes].join('/')})`;
+    }
+
+    // Verify Keccak-256 checksum (prevents typos that pass charset + length checks)
+    const checksumErr = verifyMoneroAddressChecksum(address);
+    if (checksumErr !== null) {
+        return checksumErr;
     }
 
     return null;
@@ -136,8 +170,16 @@ function hexToUint8Array(hex: string): Uint8Array {
 }
 
 // ---------------------------------------------------------------------------
-// notifyXmrConfirmed — internal orchestration (unchanged)
+// notifyXmrConfirmed — internal orchestration
 // ---------------------------------------------------------------------------
+
+/** Tracks swaps that have already been confirmed to prevent duplicate transitions. */
+const xmrConfirmedSwaps = new Set<string>();
+
+/** Clears the confirmed flag for a swap (call on terminal state). */
+export function clearXmrConfirmed(swapId: string): void {
+    xmrConfirmedSwaps.delete(swapId);
+}
 
 export function notifyXmrConfirmed(
     swapId: string,
@@ -145,7 +187,14 @@ export function notifyXmrConfirmed(
     storage: StorageService,
     stateMachine: SwapStateMachine,
     wsServer: SwapWebSocketServer,
+    currentBlockGetter?: () => bigint,
 ): void {
+    if (xmrConfirmedSwaps.has(swapId)) {
+        console.log(`[Monero] notifyXmrConfirmed: swap ${swapId} already confirmed — skipping duplicate`);
+        return;
+    }
+    xmrConfirmedSwaps.add(swapId);
+
     const swap = storage.getSwap(swapId);
     if (!swap) {
         console.error(`[Monero] notifyXmrConfirmed: swap ${swapId} not found`);
@@ -192,19 +241,72 @@ export function notifyXmrConfirmed(
             `XMR lock confirmed with ${confirmations} confirmations`,
         );
         stateMachine.notifyTransition(updated, SwapStatus.XMR_LOCKING, SwapStatus.XMR_LOCKED);
+        // Critical money-movement state — persist immediately to survive crash
+        storage.persistNow();
 
-        wsServer.broadcastPreimageReady(swapId, swap.preimage);
+        // SAFETY: Check HTLC margin before proceeding.
+        // Need enough time for sweep (~2 min) + Bob's MOTO claim (~5 min).
+        const MIN_BLOCKS_FOR_CLAIM = 50n;
+        const currentBlock = currentBlockGetter ? currentBlockGetter() : 0n;
+        if (currentBlock === 0n) {
+            console.warn(
+                `[Monero] notifyXmrConfirmed: swap ${swapId} — current block unknown (watcher not synced). ` +
+                `Deferring preimage/sweep until block height is available.`,
+            );
+            xmrConfirmedSwaps.delete(swapId);
+            return;
+        }
+        const blocksRemaining = BigInt(swap.refund_block) - currentBlock;
+        if (blocksRemaining < MIN_BLOCKS_FOR_CLAIM) {
+            console.error(
+                `[Monero] notifyXmrConfirmed: swap ${swapId} — HTLC margin too tight ` +
+                `(${blocksRemaining} blocks remaining, need ≥${MIN_BLOCKS_FOR_CLAIM}). ` +
+                `Deferring to protect Bob.`,
+            );
+            return;
+        }
 
-        const feeAddr = xmrFeeAddress.length > 0
-            ? `${xmrFeeAddress.slice(0, 12)}...`
-            : '(not configured)';
-        console.log(
-            `[Monero] Swap ${swapId} transitioned to XMR_LOCKED; preimage broadcast via WebSocket` +
-            ` (fee: ${FEE_BPS}bps — Alice gets ${swap.xmr_amount}, platform keeps ${swap.xmr_fee} → ${feeAddr})`,
-        );
+        if (updated.trustless_mode === 1) {
+            // Sweep-before-claim: sweep XMR to Alice FIRST, then broadcast preimage.
+            // This ensures Alice has her XMR before the preimage goes public on-chain.
+            const sweepingSwap = storage.updateSwap(swapId, { sweep_status: 'pending' });
+            stateMachine.validate(sweepingSwap, SwapStatus.XMR_SWEEPING);
+            const sweeping = storage.updateSwap(
+                swapId,
+                { status: SwapStatus.XMR_SWEEPING },
+                SwapStatus.XMR_LOCKED,
+                'XMR confirmed — initiating sweep-before-claim',
+            );
+            stateMachine.notifyTransition(sweeping, SwapStatus.XMR_LOCKED, SwapStatus.XMR_SWEEPING);
+            // Critical: persist XMR_SWEEPING immediately so we don't lose it on crash
+            storage.persistNow();
+
+            const feeAddr = xmrFeeAddress.length > 0
+                ? `${xmrFeeAddress.slice(0, 12)}...`
+                : '(not configured)';
+            console.log(
+                `[Monero] Swap ${swapId} transitioned to XMR_SWEEPING; sweeping XMR to Alice before preimage broadcast` +
+                ` (fee: ${FEE_BPS}bps — Alice gets ${swap.xmr_amount}, platform keeps ${swap.xmr_fee} → ${feeAddr})`,
+            );
+        } else {
+            // Non-trustless: legacy path — broadcast preimage immediately
+            wsServer.broadcastPreimageReady(swapId, swap.preimage);
+
+            const feeAddr = xmrFeeAddress.length > 0
+                ? `${xmrFeeAddress.slice(0, 12)}...`
+                : '(not configured)';
+            console.log(
+                `[Monero] Swap ${swapId} transitioned to XMR_LOCKED; preimage broadcast via WebSocket` +
+                ` (fee: ${FEE_BPS}bps — Alice gets ${swap.xmr_amount}, platform keeps ${swap.xmr_fee} → ${feeAddr})`,
+            );
+        }
     } catch (err: unknown) {
         const message = err instanceof Error ? err.message : 'Unknown error';
         console.error(`[Monero] notifyXmrConfirmed failed for swap ${swapId}: ${message}`);
+        // Clear from xmrConfirmedSwaps so the swap can be retried on the next monitoring poll.
+        // Without this, a failed transition (e.g., optimistic concurrency conflict) permanently
+        // prevents the swap from reaching XMR_LOCKED state.
+        xmrConfirmedSwaps.delete(swapId);
     }
 }
 
@@ -297,6 +399,8 @@ export interface IMoneroService {
         lockAddress: string,
         aliceAmountPiconero: bigint,
         aliceAddress?: string,
+        lockTxId?: string,
+        onTxBroadcast?: (txId: string) => void,
     ): Promise<ISweepResult>;
 
     /**
@@ -304,6 +408,12 @@ export interface IMoneroService {
      * for expired swaps where XMR needs recovery).
      */
     getOperatorAddress(): Promise<string | null>;
+
+    /**
+     * Ensures the main coordinator wallet is open in wallet-rpc.
+     * Call on startup/recovery to fix stale state after crash during sweep.
+     */
+    ensureMainWalletOpen(): Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -332,18 +442,19 @@ export class MockMoneroService implements IMoneroService {
 
     public createLockAddress(swapId: string): Promise<ILockAddressResult> {
         this.counter++;
-        // Generate a valid Monero Base58 address (stagenet, 95 chars, prefix '5')
-        const base58Chars = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
-        const rndBytes = randomBytes(94);
-        let body = '';
-        for (let i = 0; i < 94; i++) {
-            body += base58Chars[(rndBytes[i] as number) % base58Chars.length];
-        }
-        const fakeAddr = '5' + body; // 95 chars total
-        console.log(
-            `[MockMonero] createLockAddress(${swapId}) → ${fakeAddr.slice(0, 12)}...${fakeAddr.slice(-6)}`,
+        // Generate a valid Monero address with correct Keccak-256 checksum
+        const moneroNetwork = (process.env['MONERO_NETWORK'] ?? 'stagenet') as 'mainnet' | 'stagenet';
+        const kp1 = generateEd25519KeyPair();
+        const kp2 = generateEd25519KeyPair();
+        const shared = computeSharedMoneroAddress(
+            kp1.publicKey, kp2.publicKey,
+            kp1.privateKey, kp2.privateKey,
+            moneroNetwork,
         );
-        return Promise.resolve({ address: fakeAddr, subaddrIndex: this.counter });
+        console.log(
+            `[MockMonero] createLockAddress(${swapId}) → ${shared.address.slice(0, 12)}...${shared.address.slice(-6)}`,
+        );
+        return Promise.resolve({ address: shared.address, subaddrIndex: this.counter });
     }
 
     public startMonitoring(
@@ -430,6 +541,8 @@ export class MockMoneroService implements IMoneroService {
         _lockAddress: string,
         aliceAmountPiconero: bigint,
         aliceAddress?: string,
+        _lockTxId?: string,
+        onTxBroadcast?: (txId: string) => void,
     ): Promise<ISweepResult> {
         this._sweepActive = true;
         try {
@@ -437,6 +550,7 @@ export class MockMoneroService implements IMoneroService {
             console.log(
                 `[MockMonero] sweepToFeeWallet(${swapId}): alice=${aliceAmountPiconero} piconero → ${aliceAddress ?? 'fee wallet'} (fakeTx: ${fakeTxId.slice(0, 16)}...)`,
             );
+            if (onTxBroadcast) onTxBroadcast(fakeTxId);
             // Artificial delay for queue testing
             if (XMR_MOCK_SWEEP_DELAY_MS > 0) {
                 await new Promise((r) => setTimeout(r, XMR_MOCK_SWEEP_DELAY_MS));
@@ -455,6 +569,10 @@ export class MockMoneroService implements IMoneroService {
 
     public async getOperatorAddress(): Promise<string | null> {
         return 'mock_operator_address_for_testing';
+    }
+
+    public async ensureMainWalletOpen(): Promise<void> {
+        console.log('[MockMonero] ensureMainWalletOpen: mock — no-op');
     }
 }
 
@@ -482,11 +600,22 @@ interface IGetTransfersResponse {
     };
 }
 
+/** Whether the main wallet is in a known unhealthy state (e.g., not open after error). */
+let walletUnhealthy = false;
+let walletRecoveryTimer: NodeJS.Timeout | null = null;
+
+/** Returns true if the main wallet is in a healthy state. */
+export function isWalletHealthy(): boolean {
+    return !walletUnhealthy;
+}
+
 export class RealMoneroService implements IMoneroService {
     private readonly rpcUrl: string;
     private readonly rpcUser: string;
     private readonly rpcPass: string;
     private readonly daemonUrl: string;
+    private readonly walletName: string;
+    private readonly walletPass: string;
     private readonly pollTimers = new Map<string, NodeJS.Timeout>();
 
     /** Maps swapId → subaddress index for filtering incoming transfers. */
@@ -521,6 +650,11 @@ export class RealMoneroService implements IMoneroService {
         this.rpcUser = process.env['XMR_WALLET_RPC_USER'] ?? '';
         this.rpcPass = process.env['XMR_WALLET_RPC_PASS'] ?? '';
         this.daemonUrl = process.env['XMR_DAEMON_URL'] ?? 'http://node.monerodevs.org:18089';
+        // Cache wallet credentials in private fields, then scrub from process.env
+        // to reduce exposure surface (same pattern as ENCRYPTION_KEY in encryption.ts).
+        this.walletName = process.env['XMR_WALLET_NAME'] ?? 'coordinator';
+        this.walletPass = process.env['XMR_WALLET_PASS'] ?? '';
+        delete process.env['XMR_WALLET_PASS'];
         console.log(`[RealMonero] Configured RPC URL: ${this.rpcUrl}`);
         console.log(`[RealMonero] Configured daemon URL: ${this.daemonUrl}`);
 
@@ -531,6 +665,21 @@ export class RealMoneroService implements IMoneroService {
                 throw new Error(
                     `SECURITY: RPC credentials configured but URL uses plaintext HTTP to remote host ${urlHost}. ` +
                     `Use HTTPS (https://) or connect via localhost/SSH tunnel to prevent credential exposure.`,
+                );
+            }
+        }
+
+        // Block plaintext daemon connection to remote hosts on mainnet.
+        // An MITM on the daemon connection could feed fake confirmation counts.
+        const network = process.env['MONERO_NETWORK'] ?? 'stagenet';
+        if (network === 'mainnet' && this.daemonUrl.startsWith('http://')) {
+            const daemonHost = new URL(this.daemonUrl).hostname;
+            if (daemonHost !== 'localhost' && daemonHost !== '127.0.0.1' && daemonHost !== '::1') {
+                throw new Error(
+                    `SECURITY: Mainnet daemon URL uses plaintext HTTP to remote host ${daemonHost}. ` +
+                    `An MITM could fake confirmation counts, enabling fund theft. ` +
+                    `Use HTTPS, Tor (.onion), or an SSH tunnel. ` +
+                    `To override (NOT recommended): set XMR_ALLOW_PLAINTEXT_DAEMON=true.`,
                 );
             }
         }
@@ -671,14 +820,19 @@ export class RealMoneroService implements IMoneroService {
         // Once a txid is found, switches to fast daemon-based monitoring.
         const pollBySplitKeyWallet = (() => {
             const walletName = `monitor-${swapId}`;
-            const mainWallet = process.env['XMR_WALLET_NAME'] ?? 'motoxmr-mainnet';
-            const mainPassword = process.env['XMR_WALLET_PASS'] ?? process.env['XMR_WALLET_PASSWORD'] ?? '';
+            const mainWallet = this.walletName;
+            const mainPassword = this.walletPass;
             let walletCreated = false;
             let pollInFlight = false;
 
             return async (info: { viewKeyHex: string; restoreHeight?: number }): Promise<void> => {
                 // Skip if another poll for this swap is in progress
                 if (pollInFlight) return;
+                // Skip polling when wallet is unhealthy — recovery timer will handle restoration
+                if (walletUnhealthy) {
+                    console.warn(`[RealMonero] Skipping split-key poll for ${swapId} — wallet unhealthy, recovery in progress`);
+                    return;
+                }
                 pollInFlight = true;
 
                 // Acquire global wallet-rpc lock to prevent interleaving with other polls/sweeps
@@ -787,6 +941,28 @@ export class RealMoneroService implements IMoneroService {
                         await this.rpcCall('open_wallet', { filename: mainWallet, password: mainPassword });
                     } catch {
                         console.error(`[RealMonero] CRITICAL: Failed to restore main wallet after split-key poll error`);
+                        walletUnhealthy = true;
+                        // Start periodic recovery: try to re-open main wallet every 30s
+                        // MUST acquire wallet-rpc lock to prevent interleaving with other operations
+                        if (!walletRecoveryTimer) {
+                            walletRecoveryTimer = setInterval(async () => {
+                                const recoveryRelease = await this.acquireWalletRpcLock();
+                                try {
+                                    await this.rpcCall('close_wallet', {}).catch(() => {});
+                                    await this.rpcCall('open_wallet', { filename: mainWallet, password: mainPassword });
+                                    console.log(`[RealMonero] Wallet recovery succeeded — main wallet restored`);
+                                    walletUnhealthy = false;
+                                    if (walletRecoveryTimer) {
+                                        clearInterval(walletRecoveryTimer);
+                                        walletRecoveryTimer = null;
+                                    }
+                                } catch {
+                                    console.error(`[RealMonero] Wallet recovery attempt failed — retrying in 30s`);
+                                } finally {
+                                    recoveryRelease();
+                                }
+                            }, 30_000);
+                        }
                     }
                 } finally {
                     pollInFlight = false;
@@ -891,29 +1067,33 @@ export class RealMoneroService implements IMoneroService {
             return `monero-wallet-rpc unreachable: ${msg}`;
         }
 
-        // Always check if a wallet is open, and open one if needed
-        const walletName = process.env['XMR_WALLET_NAME'] ?? '';
-        let walletOpen = false;
+        // Always ensure the MAIN wallet is open (not a stale sweep wallet from a crash)
+        let needsOpen = true;
         try {
             await this.rpcCall('get_balance', { account_index: 0 });
-            console.log(`[RealMonero] healthCheck: wallet already open`);
-            walletOpen = true;
+            // A wallet is open — but it might be a stale sweep wallet.
+            // Close it and re-open the main wallet to be safe.
+            // We can't check which wallet is open (wallet-rpc has no "get_wallet_name" RPC).
+            console.log(`[RealMonero] healthCheck: a wallet is already open — closing to ensure main wallet`);
+            try {
+                await this.rpcCall('close_wallet', {});
+            } catch { /* ignore close errors */ }
+            needsOpen = true;
         } catch {
             console.log(`[RealMonero] healthCheck: no wallet open`);
         }
 
-        if (!walletOpen) {
-            if (!walletName) {
+        if (needsOpen) {
+            if (!this.walletName) {
                 return 'No wallet open and XMR_WALLET_NAME not set — cannot auto-open';
             }
-            const walletPass = process.env['XMR_WALLET_PASS'] ?? '';
-            console.log(`[RealMonero] healthCheck: opening wallet '${walletName}'...`);
+            console.log(`[RealMonero] healthCheck: opening main wallet '${this.walletName}'...`);
             try {
-                await this.rpcCall('open_wallet', { filename: walletName, password: walletPass });
-                console.log(`[RealMonero] healthCheck: opened wallet '${walletName}'`);
+                await this.rpcCall('open_wallet', { filename: this.walletName, password: this.walletPass });
+                console.log(`[RealMonero] healthCheck: opened main wallet '${this.walletName}'`);
             } catch (err: unknown) {
                 const msg = err instanceof Error ? err.message : 'Unknown error';
-                return `Failed to open wallet '${walletName}': ${msg}`;
+                return `Failed to open wallet '${this.walletName}': ${msg}`;
             }
         }
 
@@ -962,7 +1142,7 @@ export class RealMoneroService implements IMoneroService {
             const transferResp = await this.rpcCall<{
                 result: { tx_hash: string; fee: number };
             }>('transfer', {
-                destinations: [{ amount: Number(amountPiconero), address }],
+                destinations: [{ amount: safeAmountToNumber(amountPiconero, 'transferToLockAddress'), address }],
                 account_index: 0,
                 priority: 1, // Normal priority
                 do_not_relay: false,
@@ -1007,12 +1187,14 @@ export class RealMoneroService implements IMoneroService {
         lockAddress: string,
         aliceAmountPiconero: bigint,
         aliceAddress?: string,
+        lockTxId?: string,
+        onTxBroadcast?: (txId: string) => void,
     ): Promise<ISweepResult> {
         // Acquire global wallet-rpc lock (prevents interleaving with split-key polls)
         const releaseLock = await this.acquireWalletRpcLock();
         this._sweepActive = true;
         try {
-            return await this.doSweep(swapId, spendKeyHex, viewKeyHex, lockAddress, aliceAmountPiconero, aliceAddress);
+            return await this.doSweep(swapId, spendKeyHex, viewKeyHex, lockAddress, aliceAmountPiconero, aliceAddress, lockTxId, onTxBroadcast);
         } finally {
             this._sweepActive = false;
             releaseLock();
@@ -1026,9 +1208,22 @@ export class RealMoneroService implements IMoneroService {
         lockAddress: string,
         aliceAmountPiconero: bigint,
         aliceAddress?: string,
+        lockTxId?: string,
+        onTxBroadcast?: (txId: string) => void,
     ): Promise<ISweepResult> {
+        // Pre-sweep health check: verify wallet-rpc is responsive before committing
+        try {
+            await this.rpcCall<{ result: { version: number } }>('get_version', {});
+        } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : 'Unknown error';
+            return {
+                ok: false, txId: null, feeAmount: '0', aliceAmount: '0',
+                error: `wallet-rpc unreachable before sweep — aborting to prevent orphaned state: ${msg}`,
+            };
+        }
+
         const walletName = `sweep-${swapId}-${Date.now()}`;
-        const sweepWalletPass = process.env['XMR_WALLET_PASS'] ?? '';
+        const sweepWalletPass = this.walletPass;
         const feeAddr = xmrFeeAddress;
 
         if (feeAddr.length === 0 && !aliceAddress) {
@@ -1041,22 +1236,72 @@ export class RealMoneroService implements IMoneroService {
             };
         }
 
+        // Validate sweep destination addresses before sending any funds
+        if (aliceAddress) {
+            const aliceAddrErr = validateMoneroAddress(aliceAddress);
+            if (aliceAddrErr !== null) {
+                return {
+                    ok: false, txId: null, feeAmount: '0', aliceAmount: '0',
+                    error: `Invalid Alice XMR address in sweep path: ${aliceAddrErr}`,
+                };
+            }
+        }
+        if (feeAddr.length > 0) {
+            const feeAddrErr = validateMoneroAddress(feeAddr);
+            if (feeAddrErr !== null) {
+                return {
+                    ok: false, txId: null, feeAmount: '0', aliceAmount: '0',
+                    error: `Invalid fee address in sweep path: ${feeAddrErr}`,
+                };
+            }
+        }
+
         try {
             // 1. Import the reconstructed key pair into a temporary wallet.
             // Use a recent restore height to avoid scanning the entire blockchain.
             // Monero mainnet produces ~720 blocks/day. We go back 1500 blocks (~2 days) for safety.
+            // Compute restore_height: use deposit block height if available, else fall back to currentHeight - 1500.
+            // Using the deposit height is more precise (scans only from deposit, not 2 days back)
+            // and ensures we don't miss the deposit if the swap was created long ago.
             let restoreHeight = 0;
             try {
-                const infoResp = await fetch(`${this.daemonUrl}/json_rpc`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ jsonrpc: '2.0', id: '0', method: 'get_info' }),
-                    signal: AbortSignal.timeout(10_000),
-                });
-                const infoData = await infoResp.json() as { result?: { height?: number } };
-                const currentHeight = infoData.result?.height ?? 0;
-                if (currentHeight > 1500) {
-                    restoreHeight = currentHeight - 1500;
+                // First, try to get the deposit block height from the stored lock tx
+                if (lockTxId && lockTxId.length === 64) {
+                    try {
+                        const txResp = await fetch(`${this.daemonUrl}/get_transactions`, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ txs_hashes: [lockTxId] }),
+                            signal: AbortSignal.timeout(15_000),
+                        });
+                        if (txResp.ok) {
+                            const txData = await txResp.json() as {
+                                txs?: Array<{ block_height?: number }>;
+                                status?: string;
+                            };
+                            const depositHeight = txData.txs?.[0]?.block_height ?? 0;
+                            if (depositHeight > 100) {
+                                restoreHeight = depositHeight - 100;
+                                console.log(`[RealMonero] sweep(${swapId}): using deposit-based restore_height ${restoreHeight} (deposit at block ${depositHeight})`);
+                            }
+                        }
+                    } catch {
+                        console.warn(`[RealMonero] sweep(${swapId}): could not query deposit tx for restore_height`);
+                    }
+                }
+                // Fallback: use currentHeight - 1500 (~2 days back)
+                if (restoreHeight === 0) {
+                    const infoResp = await fetch(`${this.daemonUrl}/json_rpc`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ jsonrpc: '2.0', id: '0', method: 'get_info' }),
+                        signal: AbortSignal.timeout(10_000),
+                    });
+                    const infoData = await infoResp.json() as { result?: { height?: number } };
+                    const currentHeight = infoData.result?.height ?? 0;
+                    if (currentHeight > 1500) {
+                        restoreHeight = currentHeight - 1500;
+                    }
                 }
             } catch {
                 console.warn(`[RealMonero] sweep(${swapId}): could not get daemon height for restore_height, using 0`);
@@ -1073,7 +1318,10 @@ export class RealMoneroService implements IMoneroService {
                 autosave_current: false,
             });
 
-            // 2. Open the wallet and refresh to find our balance
+            // 2. Open the wallet and refresh to find our balance.
+            // NOTE: generate_from_keys already opens the wallet, but explicit open_wallet
+            // is kept as a defensive measure — if wallet-rpc internals change, this ensures
+            // the wallet is active before refresh. The call is a no-op when already open.
             await this.rpcCall('open_wallet', { filename: walletName, password: sweepWalletPass });
             console.log(`[RealMonero] sweep(${swapId}): refreshing wallet (10min timeout)...`);
             await this.rpcCall('refresh', {}, 600_000);
@@ -1086,13 +1334,23 @@ export class RealMoneroService implements IMoneroService {
             console.log(`[RealMonero] sweep(${swapId}): unlocked balance = ${unlocked} piconero`);
 
             if (unlocked === 0n) {
+                // Zero balance: either funds never arrived or a prior sweep already cleared them.
+                // NEVER return ok:true here — a 0-balance wallet is not proof of a prior sweep.
+                // The coordinator must see a real txId (persisted in sweep_status/xmr_sweep_tx)
+                // before broadcasting the preimage. Returning ok:true on an empty wallet could
+                // cause preimage broadcast without actual XMR delivery.
+                const totalBalance = BigInt(balanceResp.result.balance);
+                const detail = totalBalance === 0n && aliceAmountPiconero > 0n
+                    ? 'Shared address completely empty — possible prior unrecorded sweep or deposit never arrived. Manual investigation required.'
+                    : 'No unlocked balance in shared address — funds may need more confirmations';
+                console.warn(`[RealMonero] sweep(${swapId}): 0 unlocked balance (total: ${totalBalance}, expected: ${aliceAmountPiconero}) — ${detail}`);
                 await this.closeAndReopen(walletName);
                 return {
                     ok: false,
                     txId: null,
                     feeAmount: '0',
                     aliceAmount: '0',
-                    error: 'No unlocked balance in shared address — funds may need more confirmations',
+                    error: detail,
                 };
             }
 
@@ -1106,7 +1364,16 @@ export class RealMoneroService implements IMoneroService {
             let actualAliceAmount = 0n;
 
             const dest = aliceAddress ?? feeAddr;
-            const expectedDevFee = unlocked - aliceAmountPiconero;
+
+            // Guard: unlocked balance must be >= Alice's amount to avoid underflow
+            if (unlocked < aliceAmountPiconero) {
+                console.warn(
+                    `[RealMonero] sweep(${swapId}): unlocked (${unlocked}) < aliceAmount (${aliceAmountPiconero}). ` +
+                    `Sending all available balance to Alice via sweep_all.`,
+                );
+                // Fall through to sweep_all (usedSweepAll will be true)
+            }
+            const expectedDevFee = unlocked > aliceAmountPiconero ? unlocked - aliceAmountPiconero : 0n;
 
             let usedSweepAll = false;
 
@@ -1119,13 +1386,17 @@ export class RealMoneroService implements IMoneroService {
 
             if (feeAddr.length > 0 && aliceAddress && expectedDevFee > MIN_DEV_FEE_FOR_SPLIT) {
                 // Pre-deduct estimated network fee from fee output so wallet has natural headroom.
-                // Alice gets her exact amount. Fee wallet gets devFee minus network fee.
-                // Any leftover (estimate - actual fee) stays as dust in the sweep wallet.
-                const feeOutputAmount = expectedDevFee - NETWORK_FEE_ESTIMATE;
-                try {
+                // Guard: if expectedDevFee <= NETWORK_FEE_ESTIMATE, feeOutputAmount would be zero or negative.
+                // This is already guarded by MIN_DEV_FEE_FOR_SPLIT above, but add explicit check for safety.
+                const feeOutputAmount = expectedDevFee > NETWORK_FEE_ESTIMATE ? expectedDevFee - NETWORK_FEE_ESTIMATE : 0n;
+                if (feeOutputAmount <= 0n) {
+                    console.warn(`[RealMonero] sweep(${swapId}): fee output would be non-positive — falling back to sweep_all`);
+                    usedSweepAll = true;
+                }
+                if (!usedSweepAll) try {
                     const destinations = [
-                        { amount: Number(aliceAmountPiconero), address: aliceAddress },
-                        { amount: Number(feeOutputAmount), address: feeAddr },
+                        { amount: safeAmountToNumber(aliceAmountPiconero, `sweep(${swapId}):alice`), address: aliceAddress },
+                        { amount: safeAmountToNumber(feeOutputAmount, `sweep(${swapId}):fee`), address: feeAddr },
                     ];
                     console.log(
                         `[RealMonero] sweep(${swapId}): transfer_split — alice=${aliceAmountPiconero}, fee=${feeOutputAmount} (to ${feeAddr.slice(0, 16)}...), headroom=${NETWORK_FEE_ESTIMATE}`,
@@ -1141,6 +1412,9 @@ export class RealMoneroService implements IMoneroService {
                     });
                     const txIds = transferResp.result?.tx_hash_list ?? [];
                     txId = txIds[0] ?? null;
+                    // Persist txId IMMEDIATELY — if coordinator crashes during closeAndReopen,
+                    // this ensures the txId is not lost (prevents re-sweep of empty wallet).
+                    if (txId && onTxBroadcast) onTxBroadcast(txId);
                     const networkFees = transferResp.result?.fee_list ?? [];
                     totalNetworkFee = networkFees.reduce((sum, f) => sum + f, 0);
                     actualAliceAmount = aliceAmountPiconero;
@@ -1172,19 +1446,42 @@ export class RealMoneroService implements IMoneroService {
                 });
                 const txIds = sweepResp.result?.tx_hash_list ?? [];
                 txId = txIds[0] ?? null;
+                // Persist txId IMMEDIATELY — if coordinator crashes during closeAndReopen,
+                // this ensures the txId is not lost (prevents re-sweep of empty wallet).
+                if (txId && onTxBroadcast) onTxBroadcast(txId);
                 const networkFees = sweepResp.result?.fee_list ?? [];
                 totalNetworkFee = networkFees.reduce((sum, f) => sum + f, 0);
                 actualAliceAmount = unlocked - BigInt(totalNetworkFee);
                 devFeeAmount = 0n;
             }
 
+            // Reject null txId as success — if wallet-rpc returned empty tx_hash_list,
+            // the sweep may not have actually been broadcast.
+            if (txId === null) {
+                console.error(
+                    `[RealMonero] sweep(${swapId}): wallet-rpc returned OK but NO txId — treating as failure`,
+                );
+                await this.closeAndReopen(walletName);
+                return {
+                    ok: false,
+                    txId: null,
+                    feeAmount: '0',
+                    aliceAmount: '0',
+                    error: 'Sweep succeeded but returned no transaction ID — funds may still be in shared address',
+                };
+            }
+
             console.log(
-                `[RealMonero] sweep(${swapId}): COMPLETE — txId=${txId?.slice(0, 16) ?? 'unknown'}...` +
+                `[RealMonero] sweep(${swapId}): COMPLETE — txId=${txId.slice(0, 16)}...` +
                 ` networkFee=${totalNetworkFee}, alice=${actualAliceAmount}, devFee=${devFeeAmount}`,
             );
 
-            // 6. Close the temporary wallet and reopen the main one
+            // 6. Close the temporary wallet and reopen the main one.
+            // The temp wallet file (walletName) persists on disk in wallet-rpc's --wallet-dir.
+            // monero-wallet-rpc has no delete RPC — files must be cleaned manually or via cron.
+            // At typical swap volume (~10/day) this accumulates ~1MB/month which is negligible.
             await this.closeAndReopen(walletName);
+            console.log(`[RealMonero] sweep(${swapId}): temp wallet '${walletName}' closed (file persists in wallet-dir)`);
 
             return {
                 ok: true,
@@ -1201,7 +1498,28 @@ export class RealMoneroService implements IMoneroService {
             try {
                 await this.closeAndReopen(walletName);
             } catch {
-                console.error(`[RealMonero] sweep(${swapId}): failed to restore main wallet after sweep error`);
+                console.error(`[RealMonero] sweep(${swapId}): CRITICAL — failed to restore main wallet after sweep error`);
+                // Mark wallet as unhealthy and start periodic recovery (same pattern as split-key poll error)
+                walletUnhealthy = true;
+                if (!walletRecoveryTimer) {
+                    walletRecoveryTimer = setInterval(async () => {
+                        const recoveryRelease = await this.acquireWalletRpcLock();
+                        try {
+                            await this.rpcCall('close_wallet', {}).catch(() => {});
+                            await this.rpcCall('open_wallet', { filename: this.walletName, password: this.walletPass });
+                            console.log(`[RealMonero] Wallet recovery (post-sweep) succeeded — main wallet restored`);
+                            walletUnhealthy = false;
+                            if (walletRecoveryTimer) {
+                                clearInterval(walletRecoveryTimer);
+                                walletRecoveryTimer = null;
+                            }
+                        } catch {
+                            console.error(`[RealMonero] Wallet recovery (post-sweep) attempt failed — retrying in 30s`);
+                        } finally {
+                            recoveryRelease();
+                        }
+                    }, 30_000);
+                }
             }
 
             return {
@@ -1215,8 +1533,25 @@ export class RealMoneroService implements IMoneroService {
     }
 
     /**
+     * Ensures the main coordinator wallet is open in wallet-rpc.
+     * Call on startup/recovery to fix stale state after crash during sweep.
+     */
+    public async ensureMainWalletOpen(): Promise<void> {
+        try {
+            // Try a simple balance check to see if any wallet is open
+            await this.rpcCall('get_balance', { account_index: 0 });
+            console.log('[RealMonero] ensureMainWalletOpen: wallet already open');
+        } catch {
+            // No wallet open or wrong wallet — close and reopen main
+            console.log(`[RealMonero] ensureMainWalletOpen: reopening main wallet '${this.walletName}'`);
+            try { await this.rpcCall('close_wallet', {}); } catch { /* may already be closed */ }
+            await this.rpcCall('open_wallet', { filename: this.walletName, password: this.walletPass });
+            console.log(`[RealMonero] ensureMainWalletOpen: main wallet '${this.walletName}' opened`);
+        }
+    }
+
+    /**
      * Closes the current wallet and reopens the main coordinator wallet.
-     * The main wallet filename is derived from XMR_WALLET_NAME env var (default: 'coordinator').
      */
     private async closeAndReopen(_tempWalletName: string): Promise<void> {
         try {
@@ -1224,13 +1559,25 @@ export class RealMoneroService implements IMoneroService {
         } catch {
             // May already be closed
         }
-        const mainWallet = process.env['XMR_WALLET_NAME'] ?? 'coordinator';
-        const mainPassword = process.env['XMR_WALLET_PASS'] ?? '';
-        await this.rpcCall('open_wallet', { filename: mainWallet, password: mainPassword });
-        console.log(`[RealMonero] Restored main wallet '${mainWallet}'`);
+        await this.rpcCall('open_wallet', { filename: this.walletName, password: this.walletPass });
+        console.log(`[RealMonero] Restored main wallet '${this.walletName}'`);
     }
 
+    // Circuit breaker: consecutive failures → short-circuit for CIRCUIT_BREAKER_COOLDOWN_MS
+    private consecutiveRpcFailures = 0;
+    private circuitBreakerOpenUntil = 0;
+    private static readonly CIRCUIT_BREAKER_THRESHOLD = 5;
+    private static readonly CIRCUIT_BREAKER_COOLDOWN_MS = 30_000;
+
     private async rpcCall<T>(method: string, params: Record<string, unknown> = {}, timeoutMs = 60_000): Promise<T> {
+        // Circuit breaker check — skip non-essential calls while cooling down.
+        // Always allow critical wallet operations (open_wallet, close_wallet, generate_from_keys)
+        // through the breaker to enable wallet recovery.
+        const criticalMethods = new Set(['open_wallet', 'close_wallet', 'generate_from_keys', 'get_version']);
+        if (this.circuitBreakerOpenUntil > Date.now() && !criticalMethods.has(method)) {
+            throw new Error(`Monero RPC circuit breaker OPEN — ${this.consecutiveRpcFailures} consecutive failures. Next attempt in ${Math.ceil((this.circuitBreakerOpenUntil - Date.now()) / 1000)}s`);
+        }
+
         const headers: Record<string, string> = {
             'Content-Type': 'application/json',
         };
@@ -1241,29 +1588,42 @@ export class RealMoneroService implements IMoneroService {
             headers['Authorization'] = `Basic ${encoded}`;
         }
 
-        const res = await fetch(this.rpcUrl, {
-            method: 'POST',
-            headers,
-            body: JSON.stringify({
-                jsonrpc: '2.0',
-                id: '0',
-                method,
-                params,
-            }),
-            signal: AbortSignal.timeout(timeoutMs),
-        });
+        try {
+            const res = await fetch(this.rpcUrl, {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({
+                    jsonrpc: '2.0',
+                    id: '0',
+                    method,
+                    params,
+                }),
+                signal: AbortSignal.timeout(timeoutMs),
+            });
 
-        if (!res.ok) {
-            throw new Error(`Monero RPC ${method} failed: HTTP ${res.status}`);
+            if (!res.ok) {
+                throw new Error(`Monero RPC ${method} failed: HTTP ${res.status}`);
+            }
+
+            const json = (await res.json()) as Record<string, unknown>;
+            if (json['error'] !== undefined && json['error'] !== null) {
+                const rpcErr = json['error'] as { code?: number; message?: string };
+                throw new Error(`Monero RPC ${method} error: ${rpcErr.message ?? 'unknown'} (code: ${rpcErr.code ?? -1})`);
+            }
+
+            // Success — reset circuit breaker
+            this.consecutiveRpcFailures = 0;
+            this.circuitBreakerOpenUntil = 0;
+
+            return json as T;
+        } catch (err) {
+            this.consecutiveRpcFailures++;
+            if (this.consecutiveRpcFailures >= RealMoneroService.CIRCUIT_BREAKER_THRESHOLD) {
+                this.circuitBreakerOpenUntil = Date.now() + RealMoneroService.CIRCUIT_BREAKER_COOLDOWN_MS;
+                console.error(`[RealMonero] Circuit breaker OPENED after ${this.consecutiveRpcFailures} consecutive failures — cooldown ${RealMoneroService.CIRCUIT_BREAKER_COOLDOWN_MS / 1000}s`);
+            }
+            throw err;
         }
-
-        const json = (await res.json()) as Record<string, unknown>;
-        if (json['error'] !== undefined && json['error'] !== null) {
-            const rpcErr = json['error'] as { code?: number; message?: string };
-            throw new Error(`Monero RPC ${method} error: ${rpcErr.message ?? 'unknown'} (code: ${rpcErr.code ?? -1})`);
-        }
-
-        return json as T;
     }
 }
 

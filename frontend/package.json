@@ -16,6 +16,7 @@
         "@btc-vision/transaction": "rc",
         "@btc-vision/walletconnect": "latest",
         "@noble/curves": "^2.0.1",
+        "@scure/bip39": "^2.0.1",
         "opnet": "rc",
         "react": "^19.0.0",
         "react-dom": "^19.0.0"

@@ -19,11 +19,15 @@ const VALID_TRANSITIONS: ReadonlyMap<SwapStatus, ReadonlySet<SwapStatus>> = new 
     ],
     [
         SwapStatus.XMR_LOCKING,
-        new Set([SwapStatus.XMR_LOCKED, SwapStatus.COMPLETED, SwapStatus.REFUNDED, SwapStatus.EXPIRED]),
+        new Set([SwapStatus.XMR_LOCKED, SwapStatus.MOTO_CLAIMING, SwapStatus.EXPIRED]),
     ],
     [
         SwapStatus.XMR_LOCKED,
-        new Set([SwapStatus.MOTO_CLAIMING, SwapStatus.COMPLETED, SwapStatus.REFUNDED, SwapStatus.EXPIRED]),
+        new Set([SwapStatus.XMR_SWEEPING, SwapStatus.MOTO_CLAIMING, SwapStatus.REFUNDED]),
+    ],
+    [
+        SwapStatus.XMR_SWEEPING,
+        new Set([SwapStatus.MOTO_CLAIMING, SwapStatus.COMPLETED]),
     ],
     [
         SwapStatus.MOTO_CLAIMING,
@@ -151,6 +155,19 @@ export class SwapStateMachine {
                 }
                 break;
 
+            case SwapStatus.XMR_SWEEPING:
+                if (!swap.preimage) {
+                    throw new TransitionGuardError(
+                        'preimage must be known before XMR_SWEEPING',
+                    );
+                }
+                if (swap.xmr_lock_confirmations < 10) {
+                    throw new TransitionGuardError(
+                        `XMR needs ≥10 confirmations, got ${swap.xmr_lock_confirmations}`,
+                    );
+                }
+                break;
+
             case SwapStatus.MOTO_CLAIMING:
                 if (!swap.preimage) {
                     throw new TransitionGuardError(
@@ -171,6 +188,15 @@ export class SwapStateMachine {
                 if (!swap.opnet_refund_tx) {
                     throw new TransitionGuardError(
                         'opnet_refund_tx must be set before REFUNDED',
+                    );
+                }
+                // SAFETY: Warn if preimage was known/broadcast — on-chain contract should
+                // reject refund if claim already submitted, but log critical warning for audit.
+                if (swap.preimage) {
+                    console.error(
+                        `[StateMachine] CRITICAL WARNING: Swap ${swap.swap_id} transitioning to REFUNDED ` +
+                        `but preimage is known. If preimage was broadcast, Bob may have claimed on-chain. ` +
+                        `Verify on-chain contract state — the refund may indicate the claim never landed.`,
                     );
                 }
                 break;

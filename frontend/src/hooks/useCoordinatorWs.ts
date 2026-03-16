@@ -9,11 +9,11 @@ const WS_URL = (import.meta.env.VITE_COORDINATOR_WS_URL ?? 'ws://localhost:3001'
 const WS_RECONNECT_BASE_MS = 1000;
 const WS_RECONNECT_MAX_MS = 30000;
 
-// In production, warn about non-WSS WebSocket URL
+// In production, block non-WSS WebSocket URL
 if (import.meta.env.PROD && WS_URL && !WS_URL.startsWith('wss://')) {
-    console.warn(
-        '[SECURITY] VITE_COORDINATOR_WS_URL should use wss:// in production. ' +
-        'Claim tokens and preimages sent over ws:// can be intercepted.',
+    throw new Error(
+        '[SECURITY] Refusing to open WebSocket over ws://. ' +
+        'Set VITE_COORDINATOR_WS_URL to a wss:// URL for production builds.',
     );
 }
 
@@ -25,7 +25,7 @@ interface WsSwapData {
 }
 
 interface WsMessage {
-    readonly type: 'swap_update' | 'active_swaps' | 'preimage_ready' | 'queue_update' | 'error';
+    readonly type: 'swap_update' | 'active_swaps' | 'connected' | 'preimage_ready' | 'queue_update' | 'error';
     readonly data: unknown;
 }
 
@@ -93,6 +93,13 @@ export function useCoordinatorWs(swapId: string | null, claimToken?: string | nu
     const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const reconnectAttemptRef = useRef(0);
     const mountedRef = useRef(true);
+    // Buffer: holds a preimage received before hashLockHex was available for verification.
+    const pendingPreimageRef = useRef<string | null>(null);
+    // Ref for hashLockHex — prevents WebSocket reconnection thrashing when
+    // hashLockHex changes from null to a value (swap data loading).
+    // hashLockHex is only used for preimage verification, not for subscription.
+    const hashLockRef = useRef(hashLockHex);
+    hashLockRef.current = hashLockHex;
 
     const connect = useCallback(() => {
         if (!swapId || !mountedRef.current) return;
@@ -130,18 +137,21 @@ export function useCoordinatorWs(swapId: string | null, claimToken?: string | nu
                             // Validate preimage format (64-char hex)
                             if (!/^[0-9a-f]{64}$/i.test(payload.preimage)) {
                                 console.error('[WS] Received invalid preimage format — ignoring');
-                            } else if (hashLockHex) {
+                            } else if (hashLockRef.current) {
                                 // Verify SHA-256(preimage) matches the on-chain hash lock
-                                void verifyPreimage(payload.preimage, hashLockHex).then((valid) => {
+                                void verifyPreimage(payload.preimage, hashLockRef.current).then((valid) => {
                                     if (valid) {
+                                        pendingPreimageRef.current = null;
                                         setPreimage(payload.preimage);
                                     } else {
                                         console.error('[WS] Preimage verification FAILED — SHA-256 mismatch. Possible spoofed message.');
                                     }
                                 });
                             } else {
-                                // No hash lock available — cannot verify preimage integrity
-                                console.error('[WS] Cannot verify preimage — no hash lock provided. Ignoring.');
+                                // hashLockHex not yet available (swap data still loading).
+                                // Buffer the preimage so we can verify once hashLockHex arrives.
+                                console.warn('[WS] Preimage received before hashLock available — buffering for deferred verification');
+                                pendingPreimageRef.current = payload.preimage;
                             }
                         }
                     }
@@ -188,7 +198,25 @@ export function useCoordinatorWs(swapId: string | null, claimToken?: string | nu
                 if (mountedRef.current) connect();
             }, delay);
         }
-    }, [swapId, claimToken, hashLockHex]);
+    }, [swapId, claimToken]);
+
+    // Deferred verification: when hashLockHex becomes available and we have a buffered preimage,
+    // verify it now. This handles the race where WS delivers preimage before swap data loads.
+    useEffect(() => {
+        const buffered = pendingPreimageRef.current;
+        if (!buffered || !hashLockHex || preimage !== null) return;
+
+        void verifyPreimage(buffered, hashLockHex).then((valid) => {
+            if (!mountedRef.current) return;
+            if (valid) {
+                pendingPreimageRef.current = null;
+                setPreimage(buffered);
+            } else {
+                console.error('[WS] Deferred preimage verification FAILED — SHA-256 mismatch');
+                pendingPreimageRef.current = null;
+            }
+        });
+    }, [hashLockHex, preimage]);
 
     useEffect(() => {
         mountedRef.current = true;

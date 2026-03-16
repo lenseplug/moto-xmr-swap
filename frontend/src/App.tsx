@@ -1,18 +1,20 @@
 /**
  * Main application component for MOTO-XMR Atomic Swap.
  */
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import { Header } from './components/Header';
 import { OrderBook } from './components/OrderBook';
 import { CreateSwap } from './components/CreateSwap';
 import { TakeSwap } from './components/TakeSwap';
 import { SwapStatus } from './components/SwapStatus';
 import { MySwaps } from './components/MySwaps';
+import { RecoverSwap } from './components/RecoverSwap';
 import { Docs } from './components/Docs';
+import { SwapSessionProvider } from './contexts/SwapSessionContext';
 import motoLogo from './assets/motoswap-logo.png';
 import xmrLogo from './assets/monero-xmr-logo.png';
 
-type TabId = 'orderbook' | 'create' | 'myswaps' | 'docs';
+type TabId = 'orderbook' | 'create' | 'myswaps' | 'recover' | 'docs';
 
 type ViewState =
     | { kind: 'tab'; tab: TabId }
@@ -25,31 +27,9 @@ type ViewState =
 export default function App(): React.ReactElement {
     const [view, setView] = useState<ViewState>({ kind: 'tab', tab: 'orderbook' });
 
-    // Recover in-flight swap takes on page refresh
-    useEffect(() => {
-        try {
-            // Check for Bob's claim tokens (taker side)
-            const claimRaw = localStorage.getItem('moto_xmr_claim_tokens');
-            if (claimRaw) {
-                const tokens = JSON.parse(claimRaw) as Record<string, string>;
-                const firstSwapId = Object.keys(tokens)[0];
-                if (firstSwapId) {
-                    setView({ kind: 'status', swapId: BigInt(firstSwapId) });
-                    return;
-                }
-            }
-            // Check for Alice's secrets (creator side)
-            const secretRaw = localStorage.getItem('moto_xmr_swap_secrets');
-            if (secretRaw) {
-                const secrets = JSON.parse(secretRaw) as Array<{ swapId: string }>;
-                if (secrets.length > 0) {
-                    setView({ kind: 'status', swapId: BigInt(secrets[0].swapId) });
-                }
-            }
-        } catch {
-            // localStorage parse error — ignore
-        }
-    }, []);
+    const handleRecovered = (swapId: bigint): void => {
+        setView({ kind: 'status', swapId });
+    };
 
     const activeTab: TabId =
         view.kind === 'tab' ? view.tab : view.kind === 'take' ? 'orderbook' : 'myswaps';
@@ -85,6 +65,7 @@ export default function App(): React.ReactElement {
     };
 
     return (
+        <SwapSessionProvider>
         <>
             {/* Watermark logos */}
             <div
@@ -209,6 +190,10 @@ export default function App(): React.ReactElement {
                     <MySwaps onViewStatus={handleViewStatus} />
                 )}
 
+                {view.kind === 'tab' && view.tab === 'recover' && (
+                    <RecoverSwap onRecovered={handleRecovered} />
+                )}
+
                 {view.kind === 'tab' && view.tab === 'docs' && <Docs />}
 
                 {view.kind === 'take' && (
@@ -245,5 +230,6 @@ export default function App(): React.ReactElement {
 
             <footer style={{ padding: '24px' }} />
         </>
+        </SwapSessionProvider>
     );
 }

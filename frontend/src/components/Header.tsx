@@ -6,7 +6,7 @@ import { useWalletConnect, SupportedWallets } from '@btc-vision/walletconnect';
 import motoLogo from '../assets/motoswap-logo.png';
 import xmrLogo from '../assets/monero-xmr-logo.png';
 
-type TabId = 'orderbook' | 'create' | 'myswaps' | 'docs';
+type TabId = 'orderbook' | 'create' | 'myswaps' | 'recover' | 'docs';
 
 interface HeaderProps {
     readonly activeTab: TabId;
@@ -34,6 +34,7 @@ export function Header({ activeTab, onTabChange }: HeaderProps): React.ReactElem
         { id: 'orderbook', label: 'Order Book' },
         { id: 'create', label: 'Create Swap' },
         { id: 'myswaps', label: 'My Swaps' },
+        { id: 'recover', label: 'Recover' },
         { id: 'docs', label: 'About' },
     ];
 

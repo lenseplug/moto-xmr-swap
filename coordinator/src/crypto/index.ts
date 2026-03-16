@@ -8,10 +8,14 @@ export {
     addEd25519Points,
     addEd25519Scalars,
     computeSharedMoneroAddress,
+    verifyMoneroAddressChecksum,
+    validateViewKeyScalar,
+    validateCombinedKey,
 } from './keys.js';
 
 export {
     verifyBobKeyProof,
+    verifyCrossCurveDleq,
 } from './dleq.js';
 
 export type {
