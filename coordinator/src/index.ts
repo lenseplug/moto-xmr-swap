@@ -23,7 +23,8 @@ import {
     handleSubmitKeys,
     handleAdminUpdateSwap,
     handleBackupSecret,
-    handleRecoverSecret,
+    handleGetMySecret,
+    handleGetMyKeys,
 } from './routes/swaps.js';
 import { type ISwapRecord, SwapStatus, type IUpdateSwapParams } from './types.js';
 import { SweepQueue, type SweepJob } from './sweep-queue.js';
@@ -209,11 +210,6 @@ function matchRoute(
     const part2 = parts[2];
     const part3 = parts[3];
 
-    // GET /api/secrets/recover/:hashLock — retrieve backed-up secret
-    if (parts.length === 4 && part0 === 'api' && part1 === 'secrets' && part2 === 'recover' && method === 'GET' && part3 !== undefined) {
-        return { route: 'recover_secret', params: { hashLock: part3 } };
-    }
-
     if (
         parts.length === 3 &&
         part0 === 'api' &&
@@ -279,6 +275,30 @@ function matchRoute(
         part2 !== undefined
     ) {
         return { route: 'claim_xmr', params: { id: part2 } };
+    }
+
+    // GET /api/swaps/:id/my-secret — Alice recovers her secret (auth: X-Depositor)
+    if (
+        parts.length === 4 &&
+        part0 === 'api' &&
+        part1 === 'swaps' &&
+        part3 === 'my-secret' &&
+        method === 'GET' &&
+        part2 !== undefined
+    ) {
+        return { route: 'get_my_secret', params: { id: part2 } };
+    }
+
+    // GET /api/swaps/:id/my-keys — Bob recovers his keys (auth: X-Counterparty)
+    if (
+        parts.length === 4 &&
+        part0 === 'api' &&
+        part1 === 'swaps' &&
+        part3 === 'my-keys' &&
+        method === 'GET' &&
+        part2 !== undefined
+    ) {
+        return { route: 'get_my_keys', params: { id: part2 } };
     }
 
     // PUT /api/admin/swaps/:id — test-only admin state endpoint
@@ -886,19 +906,6 @@ async function main(): Promise<void> {
                 });
                 break;
 
-            case 'recover_secret': {
-                const hl = match.params['hashLock'];
-                if (!hl) {
-                    notFound(res);
-                    break;
-                }
-                handleRecoverSecret(req, res, storage, hl).catch((err: unknown) => {
-                    const msg = err instanceof Error ? err.message : 'Unknown error';
-                    serverError(res, msg);
-                });
-                break;
-            }
-
             case 'get_fee_address':
                 handleGetFeeAddress(req, res);
                 break;
@@ -1105,6 +1112,20 @@ async function main(): Promise<void> {
                     message: 'XMR claim initiated',
                     ...(queuePos ? { sweepQueuePosition: queuePos.position, sweepQueueTotal: queuePos.total } : {}),
                 } }));
+                break;
+            }
+
+            case 'get_my_secret': {
+                const id = match.params['id'];
+                if (!id) { notFound(res); break; }
+                handleGetMySecret(req, res, storage, id);
+                break;
+            }
+
+            case 'get_my_keys': {
+                const id = match.params['id'];
+                if (!id) { notFound(res); break; }
+                handleGetMyKeys(req, res, storage, id);
                 break;
             }
 

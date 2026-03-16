@@ -334,25 +334,66 @@ export async function backupSecretToCoordinator(
 }
 
 /**
- * Recovers a backed-up secret from the coordinator by hashLock.
+ * Fetches Alice's secret from the coordinator (authenticated).
+ * Requires the depositor's address for auth (X-Depositor header).
  * Used when localStorage is cleared but the swap still exists.
  */
-export async function recoverSecretFromCoordinator(
-    hashLock: string,
-): Promise<{ secret: string; aliceViewKey: string | null; aliceXmrPayout: string | null } | null> {
+export async function fetchMySecret(
+    swapId: string,
+    depositorAddress: string,
+): Promise<{ secret: string; aliceViewKey: string | null; aliceXmrPayout: string | null; hashLock: string | null } | null> {
     try {
-        const res = await fetch(`${COORDINATOR_BASE}/api/secrets/recover/${hashLock}`, {
+        const res = await fetch(`${COORDINATOR_BASE}/api/swaps/${sanitizeSwapId(swapId)}/my-secret`, {
+            headers: { 'X-Depositor': depositorAddress },
             signal: AbortSignal.timeout(10000),
         });
         if (!res.ok) return null;
         const body = (await res.json()) as {
-            data?: { secret?: string; aliceViewKey?: string | null; aliceXmrPayout?: string | null };
+            data?: {
+                preimage?: string;
+                aliceViewKey?: string | null;
+                aliceXmrPayout?: string | null;
+                hashLock?: string | null;
+            };
         };
-        if (!body.data?.secret) return null;
+        if (!body.data?.preimage) return null;
         return {
-            secret: body.data.secret,
+            secret: body.data.preimage,
             aliceViewKey: body.data.aliceViewKey ?? null,
             aliceXmrPayout: body.data.aliceXmrPayout ?? null,
+            hashLock: body.data.hashLock ?? null,
+        };
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * Fetches Bob's keys from the coordinator (authenticated).
+ * Requires the counterparty's address for auth (X-Counterparty header).
+ */
+export async function fetchMyKeys(
+    swapId: string,
+    counterpartyAddress: string,
+): Promise<{ bobEd25519Pub: string; bobViewKey: string; bobSpendKey: string } | null> {
+    try {
+        const res = await fetch(`${COORDINATOR_BASE}/api/swaps/${sanitizeSwapId(swapId)}/my-keys`, {
+            headers: { 'X-Counterparty': counterpartyAddress },
+            signal: AbortSignal.timeout(10000),
+        });
+        if (!res.ok) return null;
+        const body = (await res.json()) as {
+            data?: {
+                bobEd25519Pub?: string;
+                bobViewKey?: string;
+                bobSpendKey?: string;
+            };
+        };
+        if (!body.data?.bobEd25519Pub) return null;
+        return {
+            bobEd25519Pub: body.data.bobEd25519Pub,
+            bobViewKey: body.data.bobViewKey ?? '',
+            bobSpendKey: body.data.bobSpendKey ?? '',
         };
     } catch {
         return null;

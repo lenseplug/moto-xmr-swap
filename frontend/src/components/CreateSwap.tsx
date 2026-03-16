@@ -6,7 +6,7 @@ import { useWalletConnect } from '@btc-vision/walletconnect';
 import { networks } from '@btc-vision/bitcoin';
 import { getSwapVaultContract, getMotoContract, parseMotoAmount, parseXmrAmount, splitXmrAddress, getProvider } from '../services/opnet';
 import { generateTrustlessSecret, saveLocalSwapSecret, clearLocalSwapSecret, updateLocalSwapSecretId, hashSecret } from '../utils/hashlock';
-import { submitSwapSecret, resolveSwapIdByHashLock, backupSecretToCoordinator } from '../services/coordinator';
+import { submitSwapSecret, resolveSwapIdByHashLock } from '../services/coordinator';
 import { PrivacyBanner } from './PrivacyBanner';
 import { ExplorerLinks } from './ExplorerLinks';
 
@@ -287,14 +287,9 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
             }
 
 
-            // CRITICAL: Save secret to localStorage BEFORE sending transaction.
-            // If sendTransaction hangs or the page is closed, the secret survives.
+            // Save secret to localStorage as CACHE (not authoritative).
             const aliceXmrPayout = form.xmrAddress.trim();
             saveLocalSwapSecret(swapId.toString(), secret, hashLockHex, aliceViewKey, aliceXmrPayout);
-
-            // CRITICAL: Also backup secret to coordinator immediately.
-            // This ensures the secret survives even if localStorage is cleared.
-            void backupSecretToCoordinator(hashLockHex, secret, aliceViewKey, aliceXmrPayout);
 
             // Check for cancellation before requesting wallet signature
             if (cancelledRef.current) return;
@@ -348,25 +343,31 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
                 }
             }
 
-            // Submit secret + view key + XMR payout to coordinator with retries.
-            // The coordinator may not know about this swap yet (it creates the record
-            // when the OPNet watcher detects the on-chain tx in the next block), so
-            // we retry for up to ~3 minutes. SwapStatus also retries as a fallback.
-            setStatusMessage('Registering swap secret with coordinator...');
+            // BLOCKING: Submit secret to coordinator. Do NOT show success until confirmed.
+            // The coordinator is the authoritative store — localStorage is just a cache.
+            setStatusMessage('Securing swap secret with coordinator (required)...');
             let secretSubmitted = false;
-            for (let attempt = 0; attempt < 36; attempt++) {
+            for (let attempt = 0; attempt < 60; attempt++) {
                 if (cancelledRef.current) break;
                 const result = await submitSwapSecret(resolvedSwapId.toString(), secret, aliceViewKey, aliceXmrPayout);
                 if (result.ok) {
                     secretSubmitted = true;
                     break;
                 }
-                if (attempt < 35) {
+                if (attempt < 59) {
                     await new Promise<void>((r) => setTimeout(r, 5_000));
                 }
             }
+
             if (!secretSubmitted) {
-                console.warn('[CreateSwap] Secret not confirmed by coordinator — SwapStatus will retry');
+                // CRITICAL: Do NOT show success. Secret is only in localStorage (cache).
+                setFormError(
+                    'Your swap was created on-chain but the coordinator could not store your secret. ' +
+                    'Your secret is saved locally. DO NOT clear browser data. ' +
+                    'Navigate to your swap to retry automatically.',
+                );
+                setStep('idle');
+                return;
             }
 
             setTxResult({ txId, swapId: resolvedSwapId });

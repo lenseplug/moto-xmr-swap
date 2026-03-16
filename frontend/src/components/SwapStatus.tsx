@@ -6,7 +6,7 @@ import { useWalletConnect } from '@btc-vision/walletconnect';
 import { networks } from '@btc-vision/bitcoin';
 import { getSwapVaultContract, formatTokenAmount, formatXmrAmount } from '../services/opnet';
 import { calculateXmrFee, calculateXmrTotal } from '../types/swap';
-import { getCoordinatorSwapStatus, submitSwapSecret, submitBobKeys, recoverSecretFromCoordinator } from '../services/coordinator';
+import { getCoordinatorSwapStatus, submitSwapSecret, submitBobKeys, fetchMySecret } from '../services/coordinator';
 import { getLocalSwapSecret, getClaimToken, clearLocalSwapSecret, clearClaimToken, secretHexToBigint, getBobKeys, markBobKeysSubmitted, clearBobKeys, saveLocalSwapSecret } from '../utils/hashlock';
 import { useSwap, useBlockNumber } from '../hooks/useSwaps';
 import { useCoordinatorWs } from '../hooks/useCoordinatorWs';
@@ -92,22 +92,28 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
     const localViewKey = localSecret?.aliceViewKey ?? recoveredSecret?.aliceViewKey ?? undefined;
     const localXmrPayout = localSecret?.aliceXmrPayout ?? recoveredSecret?.aliceXmrPayout ?? undefined;
 
-    // If no local secret and we have the swap's hashLock, try recovering from coordinator
+    // If no local secret, try recovering from coordinator (authenticated by depositor address).
+    // The coordinator is the authoritative store — localStorage is just a cache.
+    const swapDepositor = swap?.depositor;
     const swapHashLock = swap?.hashLock;
     useEffect(() => {
-        if (localSecret || recoveryAttempted.current || !swapHashLock) return;
+        if (localSecret || recoveryAttempted.current || !swapDepositor || !senderAddress) return;
+        // Only attempt if connected wallet matches the depositor
+        if (swapDepositor.toLowerCase() !== senderAddress.toString().toLowerCase()) return;
         recoveryAttempted.current = true;
 
-        const hashLockHex = swapHashLock.toString(16).padStart(64, '0');
-        void recoverSecretFromCoordinator(hashLockHex).then((result) => {
+        void fetchMySecret(swapId.toString(), senderAddress.toString()).then((result) => {
             if (result) {
-                console.log('[SwapStatus] Recovered secret from coordinator backup');
+                console.log('[SwapStatus] Recovered secret from coordinator (authenticated)');
+                const hashLockHex = result.hashLock ?? swapHashLock?.toString(16).padStart(64, '0') ?? '';
                 setRecoveredSecret(result);
-                // Re-save to localStorage for future use
-                saveLocalSwapSecret(swapId.toString(), result.secret, hashLockHex, result.aliceViewKey ?? undefined, result.aliceXmrPayout ?? undefined);
+                // Re-save to localStorage as cache
+                if (hashLockHex) {
+                    saveLocalSwapSecret(swapId.toString(), result.secret, hashLockHex, result.aliceViewKey ?? undefined, result.aliceXmrPayout ?? undefined);
+                }
             }
         });
-    }, [swapHashLock, swapId, localSecret]);
+    }, [swapDepositor, swapHashLock, swapId, localSecret, senderAddress]);
 
     // Retrieve claim_token for authenticated WebSocket subscription
     const claimToken = getClaimToken(swapId.toString());
@@ -222,22 +228,26 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
         };
     }, [swapId]); // eslint-disable-line react-hooks/exhaustive-deps
 
-    // Clean up secrets when swap reaches terminal state.
-    // For Alice: only clear AFTER XMR claim is done (sweep completed).
-    // For Bob/others: clear when on-chain status is terminal.
+    // Conservative cleanup: only clear localStorage cache when swap is FULLY resolved.
+    // The coordinator is the authoritative store — localStorage is just a cache.
     useEffect(() => {
         if (swap === null) return;
-        if (swap.status === 2n || swap.status === 3n) {
-            // Always clean up Bob's data
+        const sweepDone = coordinatorStatus?.sweepStatus?.startsWith('done:');
+        const noXmrLocked = !coordinatorStatus?.xmrLockAddress && !coordinatorStatus?.sweepStatus;
+
+        if (swap.status === 2n && sweepDone) {
+            // CLAIMED + XMR sweep done → safe to clear
             clearClaimToken(swapId.toString());
             clearBobKeys(swapId.toString());
-            // Only clear Alice's secret after XMR sweep is done
-            const sweepDone = coordinatorStatus?.sweepStatus?.startsWith('done:');
-            if (sweepDone || swap.status === 3n) {
-                clearLocalSwapSecret(swapId.toString());
-            }
+            clearLocalSwapSecret(swapId.toString());
+        } else if (swap.status === 3n && (noXmrLocked || sweepDone)) {
+            // REFUNDED + no XMR was ever locked, OR refund sweep done → safe to clear
+            clearClaimToken(swapId.toString());
+            clearBobKeys(swapId.toString());
+            clearLocalSwapSecret(swapId.toString());
         }
-    }, [swap, swapId, coordinatorStatus?.sweepStatus]);
+        // Otherwise: keep the cache (coordinator has the authoritative copy)
+    }, [swap, swapId, coordinatorStatus?.sweepStatus, coordinatorStatus?.xmrLockAddress]);
 
     // Poll coordinator
     useEffect(() => {

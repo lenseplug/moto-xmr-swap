@@ -233,7 +233,7 @@ export function MySwaps({ onViewStatus }: MySwapsProps): React.ReactElement {
                                         <tr key={cs.swapId}>
                                             <td style={{ ...tdStyle, fontFamily: 'var(--font-mono)', fontSize: '0.8rem' }}>#{cs.swapId}</td>
                                             <td style={tdStyle}>
-                                                {formatXmrAmount(cs.xmrTotal)}{' '}
+                                                {formatXmrAmount(BigInt(cs.xmrTotal ?? '0'))}{' '}
                                                 <span style={{ color: 'var(--color-text-muted)', fontSize: '0.75rem' }}>XMR</span>
                                             </td>
                                             <td style={tdStyle}>

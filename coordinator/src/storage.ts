@@ -23,6 +23,7 @@ const ENCRYPTED_FIELDS: ReadonlySet<string> = new Set([
     'alice_view_key',
     'bob_view_key',
     'bob_spend_key',
+    'alice_xmr_payout',
 ]);
 
 const CREATE_SWAPS_TABLE = `
@@ -78,7 +79,6 @@ CREATE TABLE IF NOT EXISTS secret_backups (
 const CREATE_INDEXES = `
 CREATE INDEX IF NOT EXISTS idx_swaps_status ON swaps (status);
 CREATE INDEX IF NOT EXISTS idx_history_swap_id ON state_history (swap_id);
-CREATE INDEX IF NOT EXISTS idx_secret_backups_hash ON secret_backups (hash_lock);
 `;
 
 /** Row returned from a sql.js query — values are positional. */
@@ -165,7 +165,7 @@ export class StorageService {
                 params.xmr_address ?? null,
                 params.depositor,
                 params.opnet_create_tx ?? null,
-                params.alice_xmr_payout ?? null,
+                params.alice_xmr_payout ? (encryptIfPresent(params.alice_xmr_payout) ?? params.alice_xmr_payout) : null,
             ],
         );
         this.scheduleSave();
@@ -263,7 +263,7 @@ export class StorageService {
         }
         if (updates.alice_xmr_payout !== undefined) {
             setClauses.push('alice_xmr_payout = ?');
-            values.push(updates.alice_xmr_payout);
+            values.push(encryptIfPresent(updates.alice_xmr_payout) ?? null);
         }
         if (updates.sweep_status !== undefined) {
             setClauses.push('sweep_status = ?');

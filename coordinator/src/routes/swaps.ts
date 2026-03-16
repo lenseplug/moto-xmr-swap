@@ -920,29 +920,67 @@ export async function handleBackupSecret(
 }
 
 /**
- * Handler: GET /api/secrets/recover/:hashLock
- * Retrieves a backed-up secret by hashLock.
- * Used when Alice's localStorage is cleared.
+ * Handler: GET /api/swaps/:id/my-secret
+ * Alice recovers her preimage + view key from the coordinator.
+ * Auth: X-Depositor header must match swap.depositor.
  */
-export async function handleRecoverSecret(
-    _req: IncomingMessage,
+export function handleGetMySecret(
+    req: IncomingMessage,
     res: ServerResponse,
     storage: StorageService,
-    hashLock: string,
-): Promise<void> {
-    if (!/^[0-9a-f]{64}$/.test(hashLock.toLowerCase())) {
-        jsonResponse(res, 400, fail('VALIDATION', 'hashLock must be exactly 64 hex characters'));
+    swapId: string,
+): void {
+    const swap = storage.getSwap(swapId);
+    if (!swap) {
+        jsonResponse(res, 404, fail('NOT_FOUND', 'Swap not found'));
         return;
     }
-    const backup = storage.getSecretBackup(hashLock.toLowerCase());
-    if (!backup) {
-        jsonResponse(res, 404, fail('NOT_FOUND', 'No backup found for this hashLock'));
+    if (!swap.preimage) {
+        jsonResponse(res, 404, fail('NO_SECRET', 'No secret stored for this swap'));
         return;
     }
+
+    const depositor = req.headers['x-depositor'];
+    if (typeof depositor !== 'string' || depositor.toLowerCase() !== swap.depositor.toLowerCase()) {
+        jsonResponse(res, 403, fail('FORBIDDEN', 'Not the depositor'));
+        return;
+    }
+
     jsonResponse(res, 200, success({
-        secret: backup.preimage,
-        aliceViewKey: backup.aliceViewKey,
-        aliceXmrPayout: backup.aliceXmrPayout,
+        preimage: swap.preimage,
+        aliceViewKey: swap.alice_view_key,
+        aliceXmrPayout: swap.alice_xmr_payout,
+        hashLock: swap.hash_lock,
+    }));
+}
+
+/**
+ * Handler: GET /api/swaps/:id/my-keys
+ * Bob recovers his key material from the coordinator.
+ * Auth: X-Counterparty header must match swap.counterparty.
+ */
+export function handleGetMyKeys(
+    req: IncomingMessage,
+    res: ServerResponse,
+    storage: StorageService,
+    swapId: string,
+): void {
+    const swap = storage.getSwap(swapId);
+    if (!swap) {
+        jsonResponse(res, 404, fail('NOT_FOUND', 'Swap not found'));
+        return;
+    }
+
+    const counterparty = req.headers['x-counterparty'];
+    if (typeof counterparty !== 'string' || counterparty.toLowerCase() !== (swap.counterparty ?? '').toLowerCase()) {
+        jsonResponse(res, 403, fail('FORBIDDEN', 'Not the counterparty'));
+        return;
+    }
+
+    jsonResponse(res, 200, success({
+        bobEd25519Pub: swap.bob_ed25519_pub,
+        bobViewKey: swap.bob_view_key,
+        bobSpendKey: swap.bob_spend_key,
     }));
 }
 
