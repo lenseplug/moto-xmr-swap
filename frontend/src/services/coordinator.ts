@@ -296,3 +296,65 @@ export async function claimXmr(swapId: string): Promise<{ ok: boolean; error?: s
         return { ok: false, error: err instanceof Error ? err.message : 'unknown' };
     }
 }
+
+/**
+ * Backs up the swap secret to the coordinator before the swap exists on-chain.
+ * This ensures the secret survives even if localStorage is cleared.
+ * Fire-and-forget with retries.
+ */
+export async function backupSecretToCoordinator(
+    hashLock: string,
+    secret: string,
+    aliceViewKey?: string,
+    aliceXmrPayout?: string,
+): Promise<boolean> {
+    for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+            const body: Record<string, string> = { hashLock, secret };
+            if (aliceViewKey) body['aliceViewKey'] = aliceViewKey;
+            if (aliceXmrPayout) body['aliceXmrPayout'] = aliceXmrPayout;
+
+            const res = await fetch(`${COORDINATOR_BASE}/api/secrets/backup`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body),
+                signal: AbortSignal.timeout(10000),
+            });
+            if (res.ok) {
+                console.log('[Coordinator] Secret backed up successfully');
+                return true;
+            }
+        } catch {
+            // Retry
+        }
+        if (attempt < 2) await new Promise((r) => setTimeout(r, 2000));
+    }
+    console.warn('[Coordinator] Failed to backup secret after 3 attempts');
+    return false;
+}
+
+/**
+ * Recovers a backed-up secret from the coordinator by hashLock.
+ * Used when localStorage is cleared but the swap still exists.
+ */
+export async function recoverSecretFromCoordinator(
+    hashLock: string,
+): Promise<{ secret: string; aliceViewKey: string | null; aliceXmrPayout: string | null } | null> {
+    try {
+        const res = await fetch(`${COORDINATOR_BASE}/api/secrets/recover/${hashLock}`, {
+            signal: AbortSignal.timeout(10000),
+        });
+        if (!res.ok) return null;
+        const body = (await res.json()) as {
+            data?: { secret?: string; aliceViewKey?: string | null; aliceXmrPayout?: string | null };
+        };
+        if (!body.data?.secret) return null;
+        return {
+            secret: body.data.secret,
+            aliceViewKey: body.data.aliceViewKey ?? null,
+            aliceXmrPayout: body.data.aliceXmrPayout ?? null,
+        };
+    } catch {
+        return null;
+    }
+}

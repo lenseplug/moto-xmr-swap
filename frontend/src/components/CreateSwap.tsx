@@ -6,7 +6,7 @@ import { useWalletConnect } from '@btc-vision/walletconnect';
 import { networks } from '@btc-vision/bitcoin';
 import { getSwapVaultContract, getMotoContract, parseMotoAmount, parseXmrAmount, splitXmrAddress, getProvider } from '../services/opnet';
 import { generateTrustlessSecret, saveLocalSwapSecret, clearLocalSwapSecret, updateLocalSwapSecretId, hashSecret } from '../utils/hashlock';
-import { submitSwapSecret, resolveSwapIdByHashLock } from '../services/coordinator';
+import { submitSwapSecret, resolveSwapIdByHashLock, backupSecretToCoordinator } from '../services/coordinator';
 import { PrivacyBanner } from './PrivacyBanner';
 import { ExplorerLinks } from './ExplorerLinks';
 
@@ -291,6 +291,10 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
             // If sendTransaction hangs or the page is closed, the secret survives.
             const aliceXmrPayout = form.xmrAddress.trim();
             saveLocalSwapSecret(swapId.toString(), secret, hashLockHex, aliceViewKey, aliceXmrPayout);
+
+            // CRITICAL: Also backup secret to coordinator immediately.
+            // This ensures the secret survives even if localStorage is cleared.
+            void backupSecretToCoordinator(hashLockHex, secret, aliceViewKey, aliceXmrPayout);
 
             // Check for cancellation before requesting wallet signature
             if (cancelledRef.current) return;

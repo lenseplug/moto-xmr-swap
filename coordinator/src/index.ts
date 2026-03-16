@@ -22,6 +22,8 @@ import {
     handleSubmitSecret,
     handleSubmitKeys,
     handleAdminUpdateSwap,
+    handleBackupSecret,
+    handleRecoverSecret,
 } from './routes/swaps.js';
 import { type ISwapRecord, SwapStatus, type IUpdateSwapParams } from './types.js';
 import { SweepQueue, type SweepJob } from './sweep-queue.js';
@@ -189,6 +191,11 @@ function matchRoute(
         return { route: 'create_swap', params: {} };
     }
 
+    // POST /api/secrets/backup — pre-register secret before swap exists on-chain
+    if (pathname === '/api/secrets/backup' && method === 'POST') {
+        return { route: 'backup_secret', params: {} };
+    }
+
     if (pathname === '/api/fee-address' && method === 'GET') {
         return { route: 'get_fee_address', params: {} };
     }
@@ -201,6 +208,11 @@ function matchRoute(
     const part1 = parts[1];
     const part2 = parts[2];
     const part3 = parts[3];
+
+    // GET /api/secrets/recover/:hashLock — retrieve backed-up secret
+    if (parts.length === 4 && part0 === 'api' && part1 === 'secrets' && part2 === 'recover' && method === 'GET' && part3 !== undefined) {
+        return { route: 'recover_secret', params: { hashLock: part3 } };
+    }
 
     if (
         parts.length === 3 &&
@@ -866,6 +878,26 @@ async function main(): Promise<void> {
                     serverError(res, msg);
                 });
                 break;
+
+            case 'backup_secret':
+                handleBackupSecret(req, res, storage).catch((err: unknown) => {
+                    const msg = err instanceof Error ? err.message : 'Unknown error';
+                    serverError(res, msg);
+                });
+                break;
+
+            case 'recover_secret': {
+                const hl = match.params['hashLock'];
+                if (!hl) {
+                    notFound(res);
+                    break;
+                }
+                handleRecoverSecret(req, res, storage, hl).catch((err: unknown) => {
+                    const msg = err instanceof Error ? err.message : 'Unknown error';
+                    serverError(res, msg);
+                });
+                break;
+            }
 
             case 'get_fee_address':
                 handleGetFeeAddress(req, res);

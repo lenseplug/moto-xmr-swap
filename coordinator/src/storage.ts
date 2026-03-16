@@ -63,9 +63,22 @@ CREATE TABLE IF NOT EXISTS state_history (
 );
 `;
 
+const CREATE_SECRET_BACKUP_TABLE = `
+CREATE TABLE IF NOT EXISTS secret_backups (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    hash_lock TEXT UNIQUE NOT NULL,
+    preimage TEXT NOT NULL,
+    alice_view_key TEXT,
+    alice_xmr_payout TEXT,
+    applied INTEGER DEFAULT 0,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+`;
+
 const CREATE_INDEXES = `
 CREATE INDEX IF NOT EXISTS idx_swaps_status ON swaps (status);
 CREATE INDEX IF NOT EXISTS idx_history_swap_id ON state_history (swap_id);
+CREATE INDEX IF NOT EXISTS idx_secret_backups_hash ON secret_backups (hash_lock);
 `;
 
 /** Row returned from a sql.js query — values are positional. */
@@ -371,6 +384,44 @@ export class StorageService {
         return rows as unknown as IStateHistoryEntry[];
     }
 
+    /**
+     * Stores a secret backup keyed by hashLock. Called before the swap exists on-chain.
+     * If a backup for this hashLock already exists, it's a no-op.
+     */
+    public backupSecret(hashLock: string, preimage: string, aliceViewKey?: string | null, aliceXmrPayout?: string | null): void {
+        const existing = this.query('SELECT id FROM secret_backups WHERE hash_lock = ?', [hashLock]);
+        if (existing.length > 0) return;
+        this.exec(
+            `INSERT INTO secret_backups (hash_lock, preimage, alice_view_key, alice_xmr_payout) VALUES (?, ?, ?, ?)`,
+            [hashLock, encryptIfPresent(preimage) ?? preimage, aliceViewKey ? (encryptIfPresent(aliceViewKey) ?? aliceViewKey) : null, aliceXmrPayout ?? null],
+        );
+        this.scheduleSave();
+        console.log(`[Storage] Secret backed up for hashLock ${hashLock.slice(0, 16)}...`);
+    }
+
+    /**
+     * Retrieves a secret backup by hashLock (decrypts sensitive fields).
+     * Returns null if not found.
+     */
+    public getSecretBackup(hashLock: string): { preimage: string; aliceViewKey: string | null; aliceXmrPayout: string | null } | null {
+        const rows = this.query('SELECT preimage, alice_view_key, alice_xmr_payout FROM secret_backups WHERE hash_lock = ?', [hashLock]);
+        if (rows.length === 0) return null;
+        const row = rows[0] as { preimage: string; alice_view_key: string | null; alice_xmr_payout: string | null };
+        return {
+            preimage: decryptIfPresent(row.preimage) ?? row.preimage,
+            aliceViewKey: row.alice_view_key ? (decryptIfPresent(row.alice_view_key) ?? row.alice_view_key) : null,
+            aliceXmrPayout: row.alice_xmr_payout,
+        };
+    }
+
+    /**
+     * Marks a secret backup as applied (consumed by a swap).
+     */
+    public markSecretBackupApplied(hashLock: string): void {
+        this.exec('UPDATE secret_backups SET applied = 1 WHERE hash_lock = ?', [hashLock]);
+        this.scheduleSave();
+    }
+
     private async initialize(): Promise<void> {
         this.SQL = await initSqlJs();
 
@@ -383,6 +434,7 @@ export class StorageService {
 
         this.exec(CREATE_SWAPS_TABLE);
         this.exec(CREATE_STATE_HISTORY_TABLE);
+        this.exec(CREATE_SECRET_BACKUP_TABLE);
         this.exec(CREATE_INDEXES);
 
         // Migrations: add columns if missing (existing DBs)

@@ -8,6 +8,7 @@ import type { Address } from '@btc-vision/transaction';
 import { type IOnChainSwap, type ISwapRecord, type IUpdateSwapParams, SwapStatus, calculateXmrFee, calculateXmrTotal } from './types.js';
 import { StorageService } from './storage.js';
 import { SwapStateMachine } from './state-machine.js';
+import { ed25519PublicFromPrivate } from './crypto/index.js';
 
 /** Typed SwapVault contract interface for coordinator-side reads. */
 interface ISwapVaultContract extends IOP_NETContract {
@@ -329,9 +330,14 @@ export class OpnetWatcher {
             const xmrFee = calculateXmrFee(xmrAmountStr);
             const xmrTotal = calculateXmrTotal(xmrAmountStr);
 
+            const hashLockHex = onChain.hashLock.toString(16).padStart(64, '0');
+
+            // Check for pre-registered secret backup
+            const backup = this.storage.getSecretBackup(hashLockHex);
+
             this.storage.createSwap({
                 swap_id: swapIdStr,
-                hash_lock: onChain.hashLock.toString(16).padStart(64, '0'),
+                hash_lock: hashLockHex,
                 refund_block: Number(onChain.refundBlock),
                 moto_amount: onChain.amount.toString(),
                 xmr_amount: xmrAmountStr,
@@ -340,9 +346,31 @@ export class OpnetWatcher {
                 xmr_address: null,
                 depositor: onChain.depositor,
                 opnet_create_tx: null,
-                alice_xmr_payout: null,
+                alice_xmr_payout: backup?.aliceXmrPayout ?? null,
             });
             console.log(`[OPNet Watcher] Created swap record for on-chain swap ${swapIdStr} (fee: ${xmrFee}, total: ${xmrTotal})`);
+
+            // Auto-apply backed-up secret so coordinator has it immediately
+            if (backup) {
+                const secretBytes = new Uint8Array(32);
+                for (let b = 0; b < 32; b++) {
+                    secretBytes[b] = parseInt(backup.preimage.slice(b * 2, b * 2 + 2), 16);
+                }
+                const alicePub = ed25519PublicFromPrivate(secretBytes);
+                const alicePubHex = Array.from(alicePub).map((x) => x.toString(16).padStart(2, '0')).join('');
+
+                const updateParams: Record<string, string | number | null> = {
+                    preimage: backup.preimage,
+                };
+                if (backup.aliceViewKey) {
+                    updateParams['trustless_mode'] = 1;
+                    updateParams['alice_ed25519_pub'] = alicePubHex;
+                    updateParams['alice_view_key'] = backup.aliceViewKey;
+                }
+                this.storage.updateSwap(swapIdStr, updateParams as import('./types.js').IUpdateSwapParams);
+                this.storage.markSecretBackupApplied(hashLockHex);
+                console.log(`[OPNet Watcher] Auto-applied backed-up secret for swap ${swapIdStr}`);
+            }
             return;
         }
 

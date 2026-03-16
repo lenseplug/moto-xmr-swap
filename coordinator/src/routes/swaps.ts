@@ -851,7 +851,99 @@ function hexCharToNibble(c: number): number {
     // 0-9: 48-57, a-f: 97-102
     if (c >= 48 && c <= 57) return c - 48;
     if (c >= 97 && c <= 102) return c - 87;
-    return 0;
+    throw new Error(`Invalid hex character: ${String.fromCharCode(c)}`);
+}
+
+/**
+ * Handler: POST /api/secrets/backup
+ * Pre-registers a secret before the swap exists on-chain.
+ * Accepts { hashLock, secret, aliceViewKey?, aliceXmrPayout? }
+ */
+export async function handleBackupSecret(
+    req: IncomingMessage,
+    res: ServerResponse,
+    storage: StorageService,
+): Promise<void> {
+    let hashLock: string;
+    let secret: string;
+    let aliceViewKey: string | undefined;
+    let aliceXmrPayout: string | undefined;
+
+    try {
+        const parsed = await readBody(req);
+        const candidate = parsed as Record<string, unknown>;
+        if (typeof candidate['hashLock'] !== 'string' || typeof candidate['secret'] !== 'string') {
+            jsonResponse(res, 400, fail('VALIDATION', 'hashLock and secret (hex strings) are required'));
+            return;
+        }
+        hashLock = candidate['hashLock'].trim().toLowerCase();
+        secret = candidate['secret'].trim().toLowerCase();
+        if (typeof candidate['aliceViewKey'] === 'string') {
+            aliceViewKey = candidate['aliceViewKey'].trim().toLowerCase();
+        }
+        if (typeof candidate['aliceXmrPayout'] === 'string' && candidate['aliceXmrPayout'].length > 0) {
+            aliceXmrPayout = candidate['aliceXmrPayout'].trim();
+        }
+    } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : 'Invalid request';
+        jsonResponse(res, 400, fail('INVALID_BODY', msg));
+        return;
+    }
+
+    if (!/^[0-9a-f]{64}$/.test(hashLock)) {
+        jsonResponse(res, 400, fail('VALIDATION', 'hashLock must be exactly 64 hex characters'));
+        return;
+    }
+    if (!/^[0-9a-f]{64}$/.test(secret)) {
+        jsonResponse(res, 400, fail('VALIDATION', 'secret must be exactly 64 hex characters'));
+        return;
+    }
+    if (aliceViewKey !== undefined && !/^[0-9a-f]{64}$/.test(aliceViewKey)) {
+        jsonResponse(res, 400, fail('VALIDATION', 'aliceViewKey must be exactly 64 hex characters'));
+        return;
+    }
+    if (aliceXmrPayout !== undefined) {
+        const addrErr = validateMoneroAddress(aliceXmrPayout);
+        if (addrErr !== null) {
+            jsonResponse(res, 400, fail('VALIDATION', `Invalid aliceXmrPayout: ${addrErr}`));
+            return;
+        }
+    }
+
+    if (!verifyPreimage(secret, hashLock)) {
+        jsonResponse(res, 400, fail('HASH_MISMATCH', 'SHA-256(secret) does not match hashLock'));
+        return;
+    }
+
+    storage.backupSecret(hashLock, secret, aliceViewKey ?? null, aliceXmrPayout ?? null);
+    jsonResponse(res, 200, success({ backed_up: true }));
+}
+
+/**
+ * Handler: GET /api/secrets/recover/:hashLock
+ * Retrieves a backed-up secret by hashLock.
+ * Used when Alice's localStorage is cleared.
+ */
+export async function handleRecoverSecret(
+    _req: IncomingMessage,
+    res: ServerResponse,
+    storage: StorageService,
+    hashLock: string,
+): Promise<void> {
+    if (!/^[0-9a-f]{64}$/.test(hashLock.toLowerCase())) {
+        jsonResponse(res, 400, fail('VALIDATION', 'hashLock must be exactly 64 hex characters'));
+        return;
+    }
+    const backup = storage.getSecretBackup(hashLock.toLowerCase());
+    if (!backup) {
+        jsonResponse(res, 404, fail('NOT_FOUND', 'No backup found for this hashLock'));
+        return;
+    }
+    jsonResponse(res, 200, success({
+        secret: backup.preimage,
+        aliceViewKey: backup.aliceViewKey,
+        aliceXmrPayout: backup.aliceXmrPayout,
+    }));
 }
 
 function bytesToHex(bytes: Uint8Array): string {

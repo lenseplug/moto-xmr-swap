@@ -6,8 +6,8 @@ import { useWalletConnect } from '@btc-vision/walletconnect';
 import { networks } from '@btc-vision/bitcoin';
 import { getSwapVaultContract, formatTokenAmount, formatXmrAmount } from '../services/opnet';
 import { calculateXmrFee, calculateXmrTotal } from '../types/swap';
-import { getCoordinatorSwapStatus, submitSwapSecret, submitBobKeys } from '../services/coordinator';
-import { getLocalSwapSecret, getClaimToken, clearLocalSwapSecret, clearClaimToken, secretHexToBigint, getBobKeys, markBobKeysSubmitted, clearBobKeys } from '../utils/hashlock';
+import { getCoordinatorSwapStatus, submitSwapSecret, submitBobKeys, recoverSecretFromCoordinator } from '../services/coordinator';
+import { getLocalSwapSecret, getClaimToken, clearLocalSwapSecret, clearClaimToken, secretHexToBigint, getBobKeys, markBobKeysSubmitted, clearBobKeys, saveLocalSwapSecret } from '../utils/hashlock';
 import { useSwap, useBlockNumber } from '../hooks/useSwaps';
 import { useCoordinatorWs } from '../hooks/useCoordinatorWs';
 import type { CoordinatorStatus } from '../types/swap';
@@ -83,12 +83,31 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
     const [actionTxId, setActionTxId] = useState<string | null>(null);
     const [actionError, setActionError] = useState<string | null>(null);
 
+    const [recoveredSecret, setRecoveredSecret] = useState<{ secret: string; aliceViewKey: string | null; aliceXmrPayout: string | null } | null>(null);
+    const recoveryAttempted = useRef(false);
+
     const localSecret = getLocalSwapSecret(swapId.toString());
     // Stable reference for useEffect deps — only changes if the actual secret string changes
-    const localSecretHex = localSecret?.secret ?? null;
-    const localViewKey = localSecret?.aliceViewKey ?? undefined;
-    const localXmrPayout = localSecret?.aliceXmrPayout ?? undefined;
+    const localSecretHex = localSecret?.secret ?? recoveredSecret?.secret ?? null;
+    const localViewKey = localSecret?.aliceViewKey ?? recoveredSecret?.aliceViewKey ?? undefined;
+    const localXmrPayout = localSecret?.aliceXmrPayout ?? recoveredSecret?.aliceXmrPayout ?? undefined;
 
+    // If no local secret and we have the swap's hashLock, try recovering from coordinator
+    const swapHashLock = swap?.hashLock;
+    useEffect(() => {
+        if (localSecret || recoveryAttempted.current || !swapHashLock) return;
+        recoveryAttempted.current = true;
+
+        const hashLockHex = swapHashLock.toString(16).padStart(64, '0');
+        void recoverSecretFromCoordinator(hashLockHex).then((result) => {
+            if (result) {
+                console.log('[SwapStatus] Recovered secret from coordinator backup');
+                setRecoveredSecret(result);
+                // Re-save to localStorage for future use
+                saveLocalSwapSecret(swapId.toString(), result.secret, hashLockHex, result.aliceViewKey ?? undefined, result.aliceXmrPayout ?? undefined);
+            }
+        });
+    }, [swapHashLock, swapId, localSecret]);
 
     // Retrieve claim_token for authenticated WebSocket subscription
     const claimToken = getClaimToken(swapId.toString());
