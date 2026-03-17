@@ -968,8 +968,10 @@ export async function handleSubmitKeys(
     // If no claim_token in DB (e.g., swap imported from on-chain after DB wipe), allow keys
     // since the swap is already TAKEN on-chain. This mirrors the WebSocket auth logic.
 
-    // Must be in split-key mode
-    if (swap.trustless_mode !== 1) {
+    // Must be in split-key mode. For on-chain imported swaps (no claim_token),
+    // trustless_mode may not be set yet — skip this check and set it during key storage.
+    const isOnChainImport = !swap.claim_token || swap.claim_token.length === 0;
+    if (swap.trustless_mode !== 1 && !isOnChainImport) {
         jsonResponse(res, 409, fail('NOT_TRUSTLESS', 'Swap is not in split-key mode — Alice must submit aliceViewKey with secret first'));
         return;
     }
@@ -1033,23 +1035,26 @@ export async function handleSubmitKeys(
         return;
     }
 
-    // Always require claim_token — no bypass even after DB wipe
-    if (!claimToken) {
-        jsonResponse(res, 401, fail('AUTH_REQUIRED', 'claimToken is required for key submission'));
-        return;
-    }
-    if (!/^[0-9a-f]{64}$/.test(claimToken)) {
-        jsonResponse(res, 400, fail('VALIDATION', 'claimToken must be exactly 64 hex characters'));
-        return;
-    }
-    if (!swap.claim_token || swap.claim_token.length === 0) {
-        jsonResponse(res, 403, fail('NO_TOKEN', 'Swap has no claim token — Bob must call /take first to get a claim token'));
-        return;
-    }
-    if (!safeTokenCompare(swap.claim_token, claimToken)) {
-        jsonResponse(res, 401, fail('AUTH_FAILED', 'Invalid claim token'));
-        console.log(`[Routes] Rejected key submission for swap ${swapId} — invalid claim_token`);
-        return;
+    // If the DB has a claim_token, require and verify it.
+    // If the DB has NO claim_token (swap imported from on-chain after watcher sync),
+    // allow key submission without token — the on-chain TAKEN status is authorization.
+    if (swap.claim_token && swap.claim_token.length > 0) {
+        if (!claimToken) {
+            jsonResponse(res, 401, fail('AUTH_REQUIRED', 'claimToken is required for key submission'));
+            return;
+        }
+        if (!/^[0-9a-f]{64}$/.test(claimToken)) {
+            jsonResponse(res, 400, fail('VALIDATION', 'claimToken must be exactly 64 hex characters'));
+            return;
+        }
+        if (!safeTokenCompare(swap.claim_token, claimToken)) {
+            jsonResponse(res, 401, fail('AUTH_FAILED', 'Invalid claim token'));
+            console.log(`[Routes] Rejected key submission for swap ${swapId} — invalid claim_token`);
+            return;
+        }
+    } else {
+        // No claim_token in DB — swap was imported from on-chain. Allow key submission.
+        console.log(`[Routes] Swap ${swapId}: accepting keys without claim_token (on-chain imported swap)`);
     }
 
     // Validate formats
@@ -1118,6 +1123,10 @@ export async function handleSubmitKeys(
         bob_ed25519_pub: bobPub,
         bob_view_key: bobViewKey,
     };
+    // For on-chain imported swaps, set trustless_mode if not already set
+    if (isOnChainImport && swap.trustless_mode !== 1) {
+        updateFields['trustless_mode'] = 1;
+    }
     if (bobSpendKey !== undefined) {
         updateFields['bob_spend_key'] = bobSpendKey;
     }

@@ -52,6 +52,7 @@ export function useSwaps(): UseSwapsResult {
 
             const blockHeight = typeof currentHeight === 'bigint' ? currentHeight : BigInt(currentHeight ?? 0);
             const count = countResult.properties.count ?? 0n;
+            console.log(`[useSwaps] getSwapCount=${count} contract=${SWAP_VAULT_ADDRESS} block=${blockHeight}`);
             const swapDataArr: SwapData[] = [];
 
             for (let i = 0n; i < count; i++) {

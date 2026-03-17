@@ -525,8 +525,10 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
                     return;
                 }
             } else {
-                // Fallback: verify claim_token maps to this swap via coordinator lookup
+                // Coordinator has no bob_ed25519_pub — try claim_token lookup first,
+                // then fall back to submitting bob keys (for on-chain imported swaps).
                 const COORDINATOR_BASE = import.meta.env.VITE_COORDINATOR_URL as string;
+                let verified = false;
                 if (COORDINATOR_BASE && /^[0-9a-f]{64}$/i.test(bob.claimTokenHex)) {
                     try {
                         const res = await fetch(
@@ -540,15 +542,27 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
                                 setRecoveryError('This mnemonic belongs to a different swap. Check your recovery words or swap ID.');
                                 return;
                             }
-                        } else if (res.status === 404) {
-                            setRecoveryError('This mnemonic does not match any known swap. Check your recovery words.');
-                            return;
+                            verified = true;
                         }
+                        // 404 = claim_token not found — fall through to key submission
                     } catch {
-                        // Network error — block recovery when coordinator is unreachable.
-                        // Allowing unverified recovery risks using wrong keys for the wrong swap,
-                        // which could lead to lost funds.
                         setRecoveryError('Cannot verify mnemonic — coordinator is unreachable. Please try again when the coordinator is online.');
+                        return;
+                    }
+                }
+                // If claim_token didn't verify, try submitting bob keys directly.
+                // This handles swaps imported from on-chain where no claim_token exists.
+                if (!verified) {
+                    const submitted = await submitBobKeys(
+                        swapId.toString(),
+                        {
+                            bobEd25519PubKey: bob.bobEd25519PubKey,
+                            bobViewKey: bob.bobViewKey,
+                            bobKeyProof: bob.bobKeyProof,
+                        },
+                    );
+                    if (!submitted) {
+                        setRecoveryError('This mnemonic does not match any known swap. Check your recovery words.');
                         return;
                     }
                 }
