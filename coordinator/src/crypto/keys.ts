@@ -19,6 +19,7 @@
 
 import { ed25519 } from '@noble/curves/ed25519.js';
 import { keccak_256 } from '@noble/hashes/sha3.js';
+import { sha512 } from '@noble/hashes/sha2.js';
 import { randomBytes } from 'node:crypto';
 import type { IEd25519KeyPair, ISharedMoneroAddress, MoneroNetwork } from './types.js';
 
@@ -122,6 +123,32 @@ export function validateViewKeyScalar(viewKeyBytes: Uint8Array): string | null {
 }
 
 /**
+ * Applies a domain-separation nonce tweak to a combined view key scalar.
+ * Used to ensure unique escrow addresses even when the same Alice+Bob keys are reused.
+ *
+ * Tweak = reduce(SHA-512(viewScalar || nonce)) mod l
+ * Result = (viewScalar + tweak) mod l
+ *
+ * @param combinedViewScalar - The combined view key (v_a + v_b), 32 bytes.
+ * @param nonce - Domain-separation nonce (e.g. hashLock bytes), arbitrary length.
+ * @returns The tweaked view key scalar (32 bytes).
+ */
+export function applyNonceTweak(combinedViewScalar: Uint8Array, nonce: Uint8Array): Uint8Array {
+    if (nonce.length === 0) return combinedViewScalar;
+
+    const tweakInput = new Uint8Array(combinedViewScalar.length + nonce.length);
+    tweakInput.set(combinedViewScalar);
+    tweakInput.set(nonce, combinedViewScalar.length);
+
+    const tweakHash = sha512(tweakInput);
+    // Reduce 64-byte hash to scalar mod l (standard ed25519 scalar reduction)
+    const tweakScalar = bytesToScalar(tweakHash) % ED25519_ORDER;
+    const tweak = scalarToBytes(tweakScalar);
+
+    return addEd25519Scalars(combinedViewScalar, tweak);
+}
+
+/**
  * Computes a shared Monero address from Alice's and Bob's key shares.
  *
  * The shared address is a standard Monero address where:
@@ -133,6 +160,8 @@ export function validateViewKeyScalar(viewKeyBytes: Uint8Array): string | null {
  * @param aliceViewPriv - Alice's ed25519 private view key (32 bytes, raw scalar).
  * @param bobViewPriv - Bob's ed25519 private view key (32 bytes, raw scalar).
  * @param network - Monero network ('mainnet' or 'stagenet').
+ * @param nonce - Optional nonce for domain separation (hashLock bytes). Produces unique
+ *                escrow address per swap even with identical Alice+Bob keys.
  * @returns The shared Monero address with its component keys.
  */
 export function computeSharedMoneroAddress(
@@ -141,6 +170,7 @@ export function computeSharedMoneroAddress(
     aliceViewPriv: Uint8Array,
     bobViewPriv: Uint8Array,
     network: MoneroNetwork,
+    nonce?: Uint8Array,
 ): ISharedMoneroAddress {
     // Compute shared public spend key: S = S_a + S_b
     const publicSpendKey = addEd25519Points(aliceSpendPub, bobSpendPub);
@@ -154,7 +184,7 @@ export function computeSharedMoneroAddress(
     }
 
     // Compute shared view key: v = v_a + v_b, V = v * G (direct scalar mult)
-    const combinedViewScalar = addEd25519Scalars(aliceViewPriv, bobViewPriv);
+    let combinedViewScalar = addEd25519Scalars(aliceViewPriv, bobViewPriv);
 
     // Reject zero combined view scalar — would make the address unscannable (cannot detect incoming txs).
     // Check both the scalar value (all bytes zero) and the resulting point (identity).
@@ -162,6 +192,12 @@ export function computeSharedMoneroAddress(
     if (viewScalarIsZero) {
         throw new Error('Combined view key scalar is zero — view keys are negations of each other');
     }
+
+    // Apply nonce tweak for domain separation (unique address per swap)
+    if (nonce && nonce.length > 0) {
+        combinedViewScalar = applyNonceTweak(combinedViewScalar, nonce);
+    }
+
     const publicViewKey = ed25519PublicFromPrivate(combinedViewScalar);
 
     // Encode as a standard Monero address

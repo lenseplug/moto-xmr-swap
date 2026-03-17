@@ -903,6 +903,7 @@ export async function handleCreateSwap(
             ? backup.recoveryToken
             : randomBytes(32).toString('hex');
         storage.updateSwap(body.swap_id, { recovery_token: recoveryToken });
+        if (backup) storage.markSecretBackupApplied(body.hash_lock);
         const withToken = storage.getSwap(body.swap_id);
         jsonResponse(res, 201, success({ ...sanitizeSwapForApi(withToken ?? created), recovery_token: recoveryToken }));
     } catch (err: unknown) {

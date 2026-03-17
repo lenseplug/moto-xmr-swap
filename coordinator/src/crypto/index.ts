@@ -8,6 +8,7 @@ export {
     addEd25519Points,
     addEd25519Scalars,
     computeSharedMoneroAddress,
+    applyNonceTweak,
     verifyMoneroAddressChecksum,
     validateViewKeyScalar,
     validateCombinedKey,

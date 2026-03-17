@@ -14,6 +14,7 @@ import type { SwapWebSocketServer } from './websocket.js';
 import { verifyMoneroAddressChecksum, generateEd25519KeyPair, computeSharedMoneroAddress } from './crypto/index.js';
 
 const XMR_REQUIRED_CONFIRMATIONS = 10;
+const XMR_MAX_CONFIRMATION_AGE = 150; // ~5 hours at 2min/block — reject stale deposits
 
 // ---------------------------------------------------------------------------
 // Monero address validation
@@ -772,6 +773,10 @@ export class RealMoneroService implements IMoneroService {
                         );
                     }
                     const confs = tx.confirmations ?? 0;
+                    if (confs > XMR_MAX_CONFIRMATION_AGE) {
+                        console.warn(`[RealMonero] Swap ${swapId}: skipping stale tx ${tx.txid ?? 'unknown'} (${confs} confs > max ${XMR_MAX_CONFIRMATION_AGE})`);
+                        continue;
+                    }
                     if (confs > bestConfs) {
                         bestConfs = confs;
                         bestTxId = tx.txid ?? '';
@@ -800,6 +805,11 @@ export class RealMoneroService implements IMoneroService {
         const pollByDaemonTx = async (txId: string): Promise<void> => {
             try {
                 const confs = await this.daemonGetTxConfirmations(txId);
+
+                if (confs > XMR_MAX_CONFIRMATION_AGE) {
+                    console.warn(`[RealMonero] Swap ${swapId}: REJECTING stale deposit (${confs} confs > max ${XMR_MAX_CONFIRMATION_AGE}, daemon)`);
+                    return;
+                }
 
                 if (confs > 0) {
                     onProgress?.(confs);
@@ -910,6 +920,10 @@ export class RealMoneroService implements IMoneroService {
                         const txAmount = BigInt(tx.amount ?? 0);
                         if (txAmount < expectedAmount) continue;
                         const confs = tx.confirmations ?? 0;
+                        if (confs > XMR_MAX_CONFIRMATION_AGE) {
+                            console.warn(`[RealMonero] Swap ${swapId}: skipping stale tx ${tx.txid ?? 'unknown'} (${confs} confs > max ${XMR_MAX_CONFIRMATION_AGE}, split-key)`);
+                            continue;
+                        }
                         if (confs > bestConfs) {
                             bestConfs = confs;
                             bestTxId = tx.txid ?? '';

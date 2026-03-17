@@ -556,7 +556,25 @@ function buildSweepJob(
         return null;
     }
 
-    const combinedViewHex = bytesToHex(combinedViewKey);
+    let combinedViewHex = bytesToHex(combinedViewKey);
+
+    // Detect nonce-tweaked view key (new swaps use hashLock as nonce for unique escrow addresses).
+    // Compare computed nonce-tweaked address to stored address to determine which view key to use.
+    if (swap.xmr_address && swap.alice_ed25519_pub && swap.bob_ed25519_pub) {
+        try {
+            const moneroNetwork = (process.env['MONERO_NETWORK'] ?? 'stagenet') as 'mainnet' | 'stagenet';
+            const withNonce = computeSharedMoneroAddress(
+                hexToBytes(swap.alice_ed25519_pub),
+                hexToBytes(swap.bob_ed25519_pub),
+                aliceViewBytes, bobViewBytes,
+                moneroNetwork,
+                hexToBytes(swap.hash_lock),
+            );
+            if (withNonce.address === swap.xmr_address) {
+                combinedViewHex = bytesToHex(withNonce.privateViewKey);
+            }
+        } catch { /* old swap without nonce — use plain combined view key */ }
+    }
 
     return {
         swapId,
@@ -704,12 +722,31 @@ function startXmrLocking(
             if (existingAddr && existingAddr.length > 10) {
                 xmrLockAddress = existingAddr;
                 console.log(`[XMR Locking] Swap ${swapId} — reusing existing address: ${xmrLockAddress.slice(0, 12)}...`);
-                // Re-derive shared view key for split-key monitoring
+                // Re-derive shared view key for split-key monitoring.
+                // Detect whether nonce tweak was used: compute address with nonce,
+                // compare to stored address to determine correct view key.
                 if (swap.trustless_mode === 1 && swap.alice_view_key && swap.bob_view_key) {
                     const aliceViewPriv = hexToBytes(swap.alice_view_key);
                     const bobViewPriv = hexToBytes(swap.bob_view_key);
                     const combined = addEd25519Scalars(aliceViewPriv, bobViewPriv);
                     sharedViewKeyHex = Buffer.from(combined).toString('hex');
+
+                    // Try nonce-tweaked version and check if it matches stored address
+                    if (swap.alice_ed25519_pub && swap.bob_ed25519_pub) {
+                        try {
+                            const moneroNetwork = (process.env['MONERO_NETWORK'] ?? 'stagenet') as 'mainnet' | 'stagenet';
+                            const withNonce = computeSharedMoneroAddress(
+                                hexToBytes(swap.alice_ed25519_pub),
+                                hexToBytes(swap.bob_ed25519_pub),
+                                aliceViewPriv, bobViewPriv,
+                                moneroNetwork,
+                                hexToBytes(swap.hash_lock),
+                            );
+                            if (withNonce.address === existingAddr) {
+                                sharedViewKeyHex = Buffer.from(withNonce.privateViewKey).toString('hex');
+                            }
+                        } catch { /* old swap without nonce — use plain combined view key */ }
+                    }
                 }
             } else if (swap.trustless_mode === 1 && swap.alice_ed25519_pub && swap.alice_view_key && swap.bob_ed25519_pub && swap.bob_view_key) {
                 // Split-key mode: compute shared Monero address from split keys
@@ -723,6 +760,7 @@ function startXmrLocking(
                     aliceSpendPub, bobSpendPub,
                     aliceViewPriv, bobViewPriv,
                     moneroNetwork,
+                    hexToBytes(swap.hash_lock), // nonce: unique address per swap
                 );
                 xmrLockAddress = shared.address;
                 sharedViewKeyHex = Buffer.from(shared.privateViewKey).toString('hex');

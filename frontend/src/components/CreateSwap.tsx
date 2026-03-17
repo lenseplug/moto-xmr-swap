@@ -8,7 +8,7 @@ import { networks } from '@btc-vision/bitcoin';
 import { getSwapVaultContract, getMotoContract, parseMotoAmount, parseXmrAmount, splitXmrAddress, getProvider } from '../services/opnet';
 import { hashSecret } from '../utils/hashlock';
 import { generateSwapMnemonic, deriveAliceKeys } from '../utils/mnemonic';
-import { submitSwapSecret, resolveSwapIdByHashLock, backupSecret } from '../services/coordinator';
+import { submitSwapSecret, resolveSwapIdByHashLock, lookupSwapByHashLock, backupSecret } from '../services/coordinator';
 import { useSwapSession } from '../contexts/SwapSessionContext';
 import { MnemonicDisplay } from './MnemonicDisplay';
 import { PrivacyBanner } from './PrivacyBanner';
@@ -221,6 +221,15 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
             const verifyHash = await hashSecret(aliceKeys.secret);
             if (verifyHash !== aliceKeys.hashLock) {
                 throw new Error('BUG: SHA-256(secret) does not match hashLock — key derivation failed');
+            }
+
+            // Check if this hashLock has been used in a previous swap (escrow address reuse prevention)
+            const existing = await lookupSwapByHashLock(aliceKeys.hashLockHex);
+            if (existing.swapId !== null) {
+                setFormError('This mnemonic has been used in a previous swap. A new mnemonic will be generated.');
+                const newWords = generateSwapMnemonic();
+                setMnemonic(newWords);
+                return;
             }
 
             const xmrHex = form.xmrAddress.trim();

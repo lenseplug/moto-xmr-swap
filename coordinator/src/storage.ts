@@ -611,7 +611,7 @@ export class StorageService {
         // Note: query() -> rowToObject() already decrypts ENCRYPTED_FIELDS transparently.
         // Do NOT call decryptIfPresent again here — that causes double-decryption and
         // spurious "Found unencrypted value in DB" warnings.
-        const rows = this.query('SELECT preimage, alice_view_key, alice_xmr_payout, recovery_token FROM secret_backups WHERE hash_lock = ?', [hashLock]);
+        const rows = this.query('SELECT preimage, alice_view_key, alice_xmr_payout, recovery_token FROM secret_backups WHERE hash_lock = ? AND applied = 0', [hashLock]);
         if (rows.length === 0) return null;
         const row = rows[0] as { preimage: string; alice_view_key: string | null; alice_xmr_payout: string | null; recovery_token: string | null };
         return {
