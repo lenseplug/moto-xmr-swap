@@ -239,7 +239,31 @@ export class OpnetWatcher {
             }
 
             const count = countResult.properties.count;
-            console.log(`[OPNet Watcher] getSwapCount returned: ${count} (type: ${typeof count}, lastKnown: ${this.lastKnownSwapCount})`);
+            console.log(`[OPNet Watcher] getSwapCount returned: ${count} (type: ${typeof count}, lastKnown: ${this.lastKnownSwapCount}, contract: ${CONTRACT_ADDRESS})`);
+            console.log(`[OPNet Watcher] DEBUG countResult keys: ${JSON.stringify(Object.keys(countResult))}, properties keys: ${JSON.stringify(Object.keys(countResult.properties))}`);
+
+            // Also try getSwap(0) directly regardless of count — diagnose RPC inconsistency
+            if (count === 0n && this.lastKnownSwapCount === 0n) {
+                try {
+                    const swap0 = await contract.getSwap(0n);
+                    const hasError = 'error' in swap0;
+                    if (!hasError && swap0.properties) {
+                        const p = swap0.properties;
+                        console.log(`[OPNet Watcher] DEBUG getSwap(0) returned data! status=${p.status}, amount=${p.amount}, depositor=${p.depositor} — count is WRONG`);
+                        // Count is wrong but swap exists — force count to at least 1
+                        // and process the swap
+                        this.lastKnownSwapCount = 0n;
+                        await this.syncSwapRange(0n, 1n, contract);
+                        this.lastKnownSwapCount = 1n;
+                        return;
+                    } else {
+                        console.log(`[OPNet Watcher] DEBUG getSwap(0) returned error/empty — contract truly has 0 swaps`);
+                    }
+                } catch (e: unknown) {
+                    console.log(`[OPNet Watcher] DEBUG getSwap(0) threw: ${e instanceof Error ? e.message : String(e)}`);
+                }
+            }
+
             if (count === undefined) return;
 
             if (count > this.lastKnownSwapCount) {
