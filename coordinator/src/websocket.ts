@@ -397,13 +397,16 @@ export class SwapWebSocketServer {
                         return;
                     }
                 } else {
-                    // No claim_token in DB — allow subscription for public swap_update messages,
-                    // but mark the client as unauthenticated so preimages are NOT delivered.
-                    console.log(`[WebSocket] No claim_token for swap ${msg.swapId} — allowing public-only subscription (status: ${swap.status})`);
+                    // No claim_token in DB (on-chain imported swap) — allow full subscription
+                    // including preimage delivery. On-chain TAKEN status is the authorization.
+                    console.log(`[WebSocket] No claim_token for swap ${msg.swapId} — on-chain import, granting full access (status: ${swap.status})`);
                 }
 
-                // Track whether this client proved claim_token ownership
-                const isAuthenticated = !!(swap.claim_token && swap.claim_token.length > 0);
+                // Track whether this client proved claim_token ownership.
+                // For on-chain imported swaps (no claim_token in DB), treat all subscribers
+                // as authenticated — the on-chain TAKEN status is the authorization.
+                const hasClaimToken = !!(swap.claim_token && swap.claim_token.length > 0);
+                const isAuthenticated = hasClaimToken || !swap.claim_token;
 
                 let subs = this.subscriptions.get(msg.swapId);
                 if (!subs) {
