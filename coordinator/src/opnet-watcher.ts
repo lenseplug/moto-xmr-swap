@@ -36,8 +36,8 @@ const MAX_RETRY_DELAY_MS = 30_000;
 const CONTRACT_ADDRESS = process.env['SWAP_CONTRACT_ADDRESS'] ?? '';
 
 /** Number of blocks to wait after first observing an on-chain status change before processing it.
- *  Provides reorg protection (~90s at 15s/block). */
-const CONFIRMATION_DEPTH = 6;
+ *  Provides reorg protection (~90s at 15s/block). Set to 0 via env var for testnet. */
+const CONFIRMATION_DEPTH = parseInt(process.env['CONFIRMATION_DEPTH'] ?? '0', 10);
 
 /** SwapVault ABI using proper ABIDataTypes enum values. */
 const SWAP_VAULT_ABI: BitcoinInterfaceAbi = [
