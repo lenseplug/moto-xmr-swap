@@ -1279,7 +1279,7 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
                         claimablePreimage !== null &&
                         !isAlice &&
                         coordinatorStatus !== null &&
-                        (coordinatorStatus.step === 'xmr_locked' || coordinatorStatus.step === 'claimed');
+                        (coordinatorStatus.step === 'xmr_locked' || coordinatorStatus.step === 'xmr_sweeping' || coordinatorStatus.step === 'claimed');
 
                     // Block claim if DLEQ verification failed in trustless mode
                     const dleqBlocked = coordinatorStatus?.trustlessMode && dleqVerified === 'invalid';
