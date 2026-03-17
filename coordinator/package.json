@@ -21,18 +21,18 @@
         "@btc-vision/transaction": "rc",
         "@noble/curves": "^2.0.1",
         "dotenv": "^17.3.1",
-        "opnet": "^1.8.3",
-        "sql.js": "^1.12.0",
-        "ws": "^8.18.0"
+        "opnet": "^1.8.6",
+        "sql.js": "^1.14.1",
+        "ws": "^8.19.0"
     },
     "devDependencies": {
-        "@eslint/js": "^9.39.2",
+        "@eslint/js": "^10.0.1",
         "@types/node": "latest",
         "@types/sql.js": "^1.4.9",
-        "@types/ws": "^8.5.12",
-        "eslint": "^9.39.2",
+        "@types/ws": "^8.18.1",
+        "eslint": "^10.0.3",
         "typescript": "latest",
-        "typescript-eslint": "^8.56.0"
+        "typescript-eslint": "^8.57.1"
     },
     "overrides": {
         "@noble/hashes": "2.0.1"

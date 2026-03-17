@@ -11,15 +11,15 @@
     },
     "dependencies": {
         "@btc-vision/bip32": "latest",
-        "@btc-vision/bitcoin": "rc",
+        "@btc-vision/bitcoin": "^7.0.0-rc.6",
         "@btc-vision/ecpair": "latest",
-        "@btc-vision/transaction": "rc",
-        "@btc-vision/walletconnect": "latest",
+        "@btc-vision/transaction": "^1.8.2",
+        "@btc-vision/walletconnect": "^1.10.5",
         "@noble/curves": "^2.0.1",
         "@scure/bip39": "^2.0.1",
-        "opnet": "rc",
-        "react": "^19.0.0",
-        "react-dom": "^19.0.0"
+        "opnet": "^1.8.6",
+        "react": "^19.2.4",
+        "react-dom": "^19.2.4"
     },
     "devDependencies": {
         "@eslint/js": "^9.39.2",
@@ -33,7 +33,7 @@
         "eslint-plugin-react-refresh": "^0.4.9",
         "stream-browserify": "latest",
         "typescript": "latest",
-        "typescript-eslint": "^8.26.0",
+        "typescript-eslint": "^8.57.1",
         "vite": "latest",
         "vite-plugin-eslint2": "latest",
         "vite-plugin-node-polyfills": "latest"
