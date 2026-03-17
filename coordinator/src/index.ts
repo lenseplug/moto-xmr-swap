@@ -1110,6 +1110,28 @@ async function main(): Promise<void> {
                     storage.updateSwap(swapId, {
                         sweep_status: `${failedPrefix}:${sanitizeSweepError(result.error ?? 'unknown')}${retrySuffix}`,
                     });
+
+                    // If sweep failed because the address is completely empty AND this swap
+                    // reached XMR_SWEEPING (meaning XMR was previously confirmed), the XMR
+                    // was likely swept in a prior coordinator run. Broadcast preimage so Bob
+                    // can claim MOTO — the XMR has already been delivered.
+                    const errorStr = result.error ?? '';
+                    const freshSwap = storage.getSwap(swapId);
+                    if (
+                        errorStr.includes('completely empty') &&
+                        freshSwap?.status === SwapStatus.XMR_SWEEPING &&
+                        freshSwap.preimage
+                    ) {
+                        const cb = watcher.getCurrentBlock();
+                        const remaining = cb > 0n ? BigInt(freshSwap.refund_block) - cb : 0n;
+                        if (cb === 0n || remaining >= 30n) {
+                            console.log(`[Sweep] ${swapId}: address already swept — broadcasting preimage (${remaining} blocks remaining)`);
+                            wsServer?.broadcastPreimageReady(swapId, freshSwap.preimage);
+                            storage.savePendingPreimage(swapId, freshSwap.preimage);
+                        } else {
+                            console.warn(`[Sweep] ${swapId}: address already swept but HTLC margin too tight (${remaining} blocks) — NOT broadcasting`);
+                        }
+                    }
                 }
             } catch (err: unknown) {
                 const msg = err instanceof Error ? err.message : 'Unknown error';
@@ -1975,6 +1997,21 @@ function recoverInterruptedSwaps(
                     wsServer.broadcastPreimageReady(swap.swap_id, swap.preimage);
                 } else {
                     console.warn(`[Recovery] Swap ${swap.swap_id} (XMR_SWEEPING, sweep done) — HTLC margin too tight (${remaining} blocks). NOT re-broadcasting preimage.`);
+                }
+            } else if (swap.sweep_status?.includes('max_retries_exceeded') && swap.preimage) {
+                // Sweep exhausted all retries — if preimage exists, broadcast it anyway.
+                // The XMR was confirmed before XMR_SWEEPING (otherwise we wouldn't be here).
+                // The address may have been swept in a prior coordinator run.
+                const currentBlock = currentBlockGetter();
+                const remaining = currentBlock > 0n ? BigInt(swap.refund_block) - currentBlock : 0n;
+                if (currentBlock === 0n) {
+                    console.warn(`[Recovery] Swap ${swap.swap_id} (XMR_SWEEPING, max retries) — block height unknown, deferring preimage broadcast`);
+                } else if (remaining >= 30n) {
+                    console.log(`[Recovery] Sweep max retries exceeded for ${swap.swap_id} — broadcasting preimage anyway (${remaining} blocks remaining)`);
+                    wsServer.broadcastPreimageReady(swap.swap_id, swap.preimage);
+                    storage.savePendingPreimage(swap.swap_id, swap.preimage);
+                } else {
+                    console.warn(`[Recovery] Swap ${swap.swap_id} (max retries) — HTLC margin too tight (${remaining} blocks). NOT broadcasting.`);
                 }
             } else if (swap.sweep_status === 'pending' || swap.sweep_status?.startsWith('failed:')) {
                 // Sweep not yet completed — re-enqueue
