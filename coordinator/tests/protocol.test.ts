@@ -151,11 +151,11 @@ async function driveToState(
     const aliceViewKey = trustless ? 'cc'.repeat(32) : undefined;
     await api.submitSecret(swapId, preimage, aliceViewKey, recoveryToken);
 
-    // 2. Take
+    // 2. Take (OPEN → TAKE_PENDING) then advance to TAKEN
     const claimToken = randomClaimToken();
     await api.takeSwap(swapId, 'aa'.repeat(32), claimToken);
-    // Ensure counterparty is set
-    await api.adminUpdate(swapId, { counterparty: 'opt1sqcounterparty' + 'bb'.repeat(10) });
+    // takeSwap now goes OPEN → TAKE_PENDING; advance to TAKEN via admin
+    await api.adminUpdate(swapId, { counterparty: 'opt1sqcounterparty' + 'bb'.repeat(10), status: 'TAKEN' });
 
     if (targetState === 'TAKEN') return { swapId, preimage, recoveryToken, claimToken };
 
@@ -1100,7 +1100,8 @@ describe('6. Browser Refresh / Wallet Disconnect', () => {
 
         await api.submitSecret(params.swap_id, preimage, undefined, rt);
         await api.takeSwap(params.swap_id, 'aa'.repeat(32), ct);
-        await api.adminUpdate(params.swap_id, { counterparty: 'cp' });
+        // takeSwap → TAKE_PENDING; advance to TAKEN
+        await api.adminUpdate(params.swap_id, { counterparty: 'cp', status: 'TAKEN' });
 
         // Connect WS, subscribe, then disconnect
         const ws1 = new WsClient(coord.baseUrl);
@@ -1241,23 +1242,46 @@ describe('7. State Machine Integrity', () => {
     it('7.1 Every valid transition verified against map', async () => {
         // Test all valid transitions individually
         const transitions: Array<{ from: string; to: string }> = [
+            { from: 'OPEN', to: 'TAKE_PENDING' },
             { from: 'OPEN', to: 'TAKEN' },
             { from: 'OPEN', to: 'EXPIRED' },
+            { from: 'TAKE_PENDING', to: 'TAKEN' },
+            { from: 'TAKE_PENDING', to: 'OPEN' },
+            { from: 'TAKE_PENDING', to: 'EXPIRED' },
             { from: 'TAKEN', to: 'XMR_LOCKING' },
             { from: 'TAKEN', to: 'EXPIRED' },
             { from: 'XMR_LOCKING', to: 'XMR_LOCKED' },
+            { from: 'XMR_LOCKING', to: 'MOTO_CLAIMING' },
             { from: 'XMR_LOCKING', to: 'EXPIRED' },
             { from: 'XMR_LOCKED', to: 'XMR_SWEEPING' },
+            { from: 'XMR_LOCKED', to: 'MOTO_CLAIMING' },
+            { from: 'XMR_LOCKED', to: 'REFUNDED' },
+            { from: 'XMR_LOCKED', to: 'EXPIRED' },
             { from: 'XMR_SWEEPING', to: 'MOTO_CLAIMING' },
+            { from: 'XMR_SWEEPING', to: 'COMPLETED' },
             { from: 'MOTO_CLAIMING', to: 'COMPLETED' },
             { from: 'EXPIRED', to: 'REFUNDED' },
         ];
 
         for (const { from, to } of transitions) {
-            const { swapId } = await driveToState(from, { trustless: to === 'XMR_SWEEPING' || from === 'XMR_SWEEPING' });
+            // Drive to TAKE_PENDING manually since driveToState doesn't support it
+            let swapId: string;
+            if (from === 'TAKE_PENDING') {
+                const { params, preimage } = generateSwapParams('7.1tp');
+                await api.createSwap(params);
+                await api.submitSecret(params.swap_id, preimage);
+                await api.takeSwap(params.swap_id, 'aa'.repeat(32));
+                swapId = params.swap_id;
+            } else {
+                const result = await driveToState(from, { trustless: to === 'XMR_SWEEPING' || from === 'XMR_SWEEPING' });
+                swapId = result.swapId;
+            }
 
             // Apply required guard fields
             const guardFields: Record<string, string | number | null> = {};
+            if (to === 'TAKE_PENDING') {
+                // OPEN → TAKE_PENDING doesn't need extra guard fields
+            }
             if (to === 'TAKEN') {
                 guardFields['counterparty'] = 'opt1sqtest' + 'aa'.repeat(16);
             }
@@ -1288,16 +1312,27 @@ describe('7. State Machine Integrity', () => {
             { from: 'OPEN', to: 'XMR_LOCKED' },
             { from: 'OPEN', to: 'MOTO_CLAIMING' },
             { from: 'OPEN', to: 'COMPLETED' },
+            { from: 'TAKE_PENDING', to: 'XMR_LOCKING' },
+            { from: 'TAKE_PENDING', to: 'COMPLETED' },
             { from: 'TAKEN', to: 'COMPLETED' },
             { from: 'TAKEN', to: 'MOTO_CLAIMING' },
-            { from: 'XMR_LOCKED', to: 'EXPIRED' },
             { from: 'XMR_SWEEPING', to: 'EXPIRED' },
             { from: 'COMPLETED', to: 'OPEN' },
             { from: 'REFUNDED', to: 'OPEN' },
         ];
 
         for (const { from, to } of invalidTransitions) {
-            const { swapId } = await driveToState(from);
+            let swapId: string;
+            if (from === 'TAKE_PENDING') {
+                const { params, preimage } = generateSwapParams('7.2tp');
+                await api.createSwap(params);
+                await api.submitSecret(params.swap_id, preimage);
+                await api.takeSwap(params.swap_id, 'aa'.repeat(32));
+                swapId = params.swap_id;
+            } else {
+                const result = await driveToState(from);
+                swapId = result.swapId;
+            }
             const res = await api.adminUpdate(swapId, { status: to });
             assert.ok(res.status >= 400, `${from} → ${to} should be INVALID (got ${res.status})`);
         }
@@ -1416,14 +1451,14 @@ describe('7. State Machine Integrity', () => {
     it('7.10 Terminal states have no outbound transitions', async () => {
         // COMPLETED
         const { swapId: completedId } = await driveToState('COMPLETED');
-        for (const target of ['OPEN', 'TAKEN', 'XMR_LOCKING', 'EXPIRED']) {
+        for (const target of ['OPEN', 'TAKE_PENDING', 'TAKEN', 'XMR_LOCKING', 'XMR_LOCKED', 'EXPIRED']) {
             const res = await api.adminUpdate(completedId, { status: target });
             assert.ok(res.status >= 400, `COMPLETED → ${target} should be rejected`);
         }
 
         // REFUNDED
         const { swapId: refundedId } = await driveToState('REFUNDED');
-        for (const target of ['OPEN', 'TAKEN', 'COMPLETED', 'EXPIRED']) {
+        for (const target of ['OPEN', 'TAKE_PENDING', 'TAKEN', 'XMR_LOCKING', 'COMPLETED', 'EXPIRED']) {
             const res = await api.adminUpdate(refundedId, { status: target });
             assert.ok(res.status >= 400, `REFUNDED → ${target} should be rejected`);
         }
@@ -1499,24 +1534,31 @@ describe('8. Coordinator Crash Recovery', () => {
         await recoveryApi.submitSecret(params.swap_id, preimage, 'cc'.repeat(32), rt);
         const ct = randomClaimToken();
         await recoveryApi.takeSwap(params.swap_id, 'aa'.repeat(32), ct);
-        await recoveryApi.adminUpdate(params.swap_id, {
+        // takeSwap → TAKE_PENDING; advance to TAKEN with trustless fields
+        const r1 = await recoveryApi.adminUpdate(params.swap_id, {
             counterparty: 'cp',
             bob_ed25519_pub: 'dd'.repeat(32),
             bob_view_key: 'ee'.repeat(32),
+            status: 'TAKEN',
         });
-        await recoveryApi.adminUpdate(params.swap_id, {
+        assert.equal(r1.status, 200, `TAKE_PENDING → TAKEN failed: ${JSON.stringify(r1.body.error)}`);
+        const r2 = await recoveryApi.adminUpdate(params.swap_id, {
             xmr_lock_tx: 'pending',
             xmr_address: STAGENET_XMR_ADDR,
             status: 'XMR_LOCKING',
         });
-        await recoveryApi.adminUpdate(params.swap_id, {
+        assert.equal(r2.status, 200, `TAKEN → XMR_LOCKING failed: ${JSON.stringify(r2.body.error)}`);
+        const r3 = await recoveryApi.adminUpdate(params.swap_id, {
             xmr_lock_confirmations: 10,
             status: 'XMR_LOCKED',
         });
+        assert.equal(r3.status, 200, `XMR_LOCKING → XMR_LOCKED failed: ${JSON.stringify(r3.body.error)}`);
 
         await recoveryCoord.restart();
         recoveryApi = new SwapApiClient(recoveryCoord.baseUrl);
 
+        // After restart, TAKE_PENDING reverts to OPEN. But we advanced past that.
+        // XMR_LOCKED should survive the restart.
         const swap = extractSwap(await recoveryApi.getSwap(params.swap_id));
         assert.equal(swap['status'], 'XMR_LOCKED', 'XMR_LOCKED state should survive restart');
     });

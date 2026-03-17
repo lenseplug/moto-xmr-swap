@@ -24,11 +24,13 @@ import {
     handleSubmitSecret,
     handleSubmitKeys,
     handleAdminUpdateSwap,
+    handleAdminRecover,
     handleBackupSecret,
     handleGetMySecret,
     handleGetMyKeys,
     withSwapLock,
     claimXmrLimiter,
+    SwapLockTimeoutError,
 } from './routes/swaps.js';
 import { type ISwapRecord, SwapStatus, type IUpdateSwapParams, FEE_BPS, MAX_FEE_BPS } from './types.js';
 import { SweepQueue, type SweepJob } from './sweep-queue.js';
@@ -375,6 +377,21 @@ function matchRoute(
         return { route: 'admin_update_swap', params: { id: part3 } };
     }
 
+    // POST /api/admin/swaps/:id/recover — admin recovery endpoint
+    if (
+        parts.length === 5 &&
+        part0 === 'api' &&
+        part1 === 'admin' &&
+        part2 === 'swaps' &&
+        method === 'POST' &&
+        part3 !== undefined
+    ) {
+        const part4 = parts[4];
+        if (part4 === 'recover') {
+            return { route: 'admin_recover', params: { id: part3 } };
+        }
+    }
+
     return null;
 }
 
@@ -435,6 +452,22 @@ function serverError(res: ServerResponse, message: string): void {
     });
     res.writeHead(500, { 'Content-Type': 'application/json' });
     res.end(body);
+}
+
+/** Sends 503 on swap lock timeout, 500 otherwise. */
+function handleRouteError(res: ServerResponse, err: unknown): void {
+    if (err instanceof SwapLockTimeoutError) {
+        const body = JSON.stringify({
+            success: false,
+            data: null,
+            error: { code: 'LOCK_TIMEOUT', message: 'Swap is busy, try again', retryable: true },
+        });
+        res.writeHead(503, { 'Content-Type': 'application/json', 'Retry-After': '5' });
+        res.end(body);
+        return;
+    }
+    const msg = err instanceof Error ? err.message : 'Unknown error';
+    serverError(res, msg);
 }
 
 // ---------------------------------------------------------------------------
@@ -1150,15 +1183,19 @@ async function main(): Promise<void> {
                         if (job) sweepQueue.enqueue(job);
                     }
                 }
-            } else if (to === SwapStatus.EXPIRED && swap.trustless_mode === 1 && swap.xmr_address && operatorXmrAddress) {
-                // Expired swap with XMR locked: auto-recover XMR back to operator.
-                // Coordinator has both spend key halves, so it can sweep.
-                storage.updateSwap(swap.swap_id, { sweep_status: 'refund_pending', claim_token: null } as IUpdateSwapParams);
-                console.log(`[Refund Sweep] ${swap.swap_id}: enqueuing XMR recovery sweep to operator address`);
-                const freshSwap = storage.getSwap(swap.swap_id);
-                if (freshSwap) {
-                    const job = buildSweepJob(freshSwap, storage, operatorXmrAddress);
-                    if (job) sweepQueue.enqueue(job);
+            } else if (to === SwapStatus.EXPIRED && swap.trustless_mode === 1 && swap.xmr_address) {
+                // Expired swap with XMR locked: auto-recover XMR to Bob's refund address or operator.
+                const refundDest = swap.bob_xmr_refund ?? operatorXmrAddress;
+                if (!refundDest) {
+                    console.error(`[Refund Sweep] ${swap.swap_id}: no refund destination (no bob_xmr_refund, no operator address)`);
+                } else {
+                    storage.updateSwap(swap.swap_id, { sweep_status: 'refund_pending', claim_token: null } as IUpdateSwapParams);
+                    console.log(`[Refund Sweep] ${swap.swap_id}: enqueuing XMR recovery sweep to ${refundDest.slice(0, 12)}...`);
+                    const freshSwap = storage.getSwap(swap.swap_id);
+                    if (freshSwap) {
+                        const job = buildSweepJob(freshSwap, storage, refundDest);
+                        if (job) sweepQueue.enqueue(job);
+                    }
                 }
             } else {
                 // Non-trustless or non-sweepable: scrub all sensitive data immediately
@@ -1296,8 +1333,7 @@ async function main(): Promise<void> {
                 }
                 if (!wsServer) { serverError(res, 'Server not ready'); break; }
                 handleTakeSwap(req, res, storage, id, stateMachine, wsServer).catch((err: unknown) => {
-                    const msg = err instanceof Error ? err.message : 'Unknown error';
-                    serverError(res, msg);
+                    handleRouteError(res, err);
                 });
                 break;
             }
@@ -1327,8 +1363,7 @@ async function main(): Promise<void> {
                         }
                     })
                     .catch((err: unknown) => {
-                        const msg = err instanceof Error ? err.message : 'Unknown error';
-                        serverError(res, msg);
+                        handleRouteError(res, err);
                     });
                 break;
             }
@@ -1339,7 +1374,7 @@ async function main(): Promise<void> {
                     notFound(res);
                     break;
                 }
-                handleSubmitKeys(req, res, storage, id)
+                handleSubmitKeys(req, res, storage, id, stateMachine, wsServer ?? undefined)
                     .then(() => {
                         // After Bob submits keys for a trustless swap that's TAKEN
                         // with a preimage, trigger XMR locking
@@ -1364,8 +1399,7 @@ async function main(): Promise<void> {
                         }
                     })
                     .catch((err: unknown) => {
-                        const msg = err instanceof Error ? err.message : 'Unknown error';
-                        serverError(res, msg);
+                        handleRouteError(res, err);
                     });
                 break;
             }
@@ -1537,6 +1571,20 @@ async function main(): Promise<void> {
                 break;
             }
 
+            case 'admin_recover': {
+                const id = match.params['id'];
+                if (!id) { notFound(res); break; }
+                if (!isAdminAuthorized(req)) { unauthorized(res); break; }
+                if (!wsServer) { serverError(res, 'WebSocket server not initialized'); break; }
+                handleAdminRecover(req, res, storage, stateMachine, wsServer, sweepQueue, id, operatorXmrAddress).catch(
+                    (err: unknown) => {
+                        const msg = err instanceof Error ? err.message : 'Unknown error';
+                        serverError(res, msg);
+                    },
+                );
+                break;
+            }
+
             default:
                 notFound(res);
         }
@@ -1634,6 +1682,23 @@ async function main(): Promise<void> {
                 const createdMs = new Date(swap.created_at).getTime();
                 const age = now - createdMs;
 
+                // TAKE_PENDING timeout: revert to OPEN after 60s if Bob hasn't submitted keys
+                if (swap.status === SwapStatus.TAKE_PENDING && swap.take_pending_at) {
+                    const pendingAge = now - new Date(swap.take_pending_at).getTime();
+                    if (pendingAge > 60_000 && stateMachine.canTransition(SwapStatus.TAKE_PENDING, SwapStatus.OPEN)) {
+                        const updated = storage.updateSwap(
+                            swap.swap_id,
+                            { status: SwapStatus.OPEN, counterparty: null, claim_token: null, take_pending_at: null },
+                            SwapStatus.TAKE_PENDING,
+                            `TAKE_PENDING timeout: ${Math.round(pendingAge / 1000)}s without key submission`,
+                        );
+                        stateMachine.notifyTransition(updated, SwapStatus.TAKE_PENDING, SwapStatus.OPEN);
+                        wsServer?.broadcastSwapUpdate(updated);
+                        console.log(`[Cleanup] TAKE_PENDING timeout: swap ${swap.swap_id} reverted to OPEN (${Math.round(pendingAge / 1000)}s)`);
+                        continue;
+                    }
+                }
+
                 // Only auto-expire OPEN and TAKEN (no XMR at risk).
                 // Skip expiry if XMR locking is actively in progress for this swap.
                 if (
@@ -1680,17 +1745,37 @@ async function main(): Promise<void> {
                     console.log(`[Cleanup] HTLC expiry: swap ${swap.swap_id} (${prev} → EXPIRED, refund_block: ${swap.refund_block})`);
                 }
 
-                // XMR_LOCKED with expired HTLC: warn but do NOT auto-expire.
+                // XMR_LOCKED with expired HTLC: auto-expire when BOTH deadline exceeded AND HTLC expired.
+                // This prevents double-spend: only expire after on-chain refund window is open.
                 if (
                     swap.status === SwapStatus.XMR_LOCKED &&
                     currentBlock > 0n &&
                     BigInt(swap.refund_block) <= currentBlock
                 ) {
-                    console.warn(
-                        `[Cleanup] WARNING: Swap ${swap.swap_id} is XMR_LOCKED but HTLC expired at block ${currentBlock} ` +
-                        `(refund_block: ${swap.refund_block}). Preimage was already broadcast — NOT auto-expiring ` +
-                        `to prevent double-spend race. Requires manual admin resolution.`,
-                    );
+                    const XMR_LOCKED_DEADLINE_MS = 30 * 60 * 1000;
+                    const lockedAt = swap.xmr_locked_at ? new Date(swap.xmr_locked_at).getTime() : 0;
+                    const lockedAge = lockedAt > 0 ? now - lockedAt : 0;
+
+                    if (lockedAge > XMR_LOCKED_DEADLINE_MS && stateMachine.canTransition(SwapStatus.XMR_LOCKED, SwapStatus.EXPIRED)) {
+                        const prev = swap.status;
+                        const updated = storage.updateSwap(
+                            swap.swap_id,
+                            { status: SwapStatus.EXPIRED },
+                            prev,
+                            `XMR_LOCKED deadline: locked ${Math.round(lockedAge / 60000)}min + HTLC expired at block ${currentBlock}`,
+                        );
+                        stateMachine.notifyTransition(updated, prev, SwapStatus.EXPIRED);
+                        moneroService.stopMonitoring(swap.swap_id);
+                        wsServer?.clearPendingPreimage(swap.swap_id);
+                        console.log(`[Cleanup] XMR_LOCKED deadline: swap ${swap.swap_id} expired (locked ${Math.round(lockedAge / 60000)}min, HTLC expired)`);
+                    } else {
+                        console.warn(
+                            `[Cleanup] WARNING: Swap ${swap.swap_id} is XMR_LOCKED, HTLC expired at block ${currentBlock} ` +
+                            `(refund_block: ${swap.refund_block})` +
+                            (lockedAge > 0 ? `, locked ${Math.round(lockedAge / 60000)}min` : ', xmr_locked_at not set') +
+                            `. Waiting for both conditions to auto-expire.`,
+                        );
+                    }
                 }
 
                 // XMR_SWEEPING with expired HTLC: warn but do NOT auto-expire.
@@ -1781,18 +1866,20 @@ async function main(): Promise<void> {
         }
 
         // Retry failed refund sweeps (EXPIRED swaps with XMR recovery pending)
-        if (operatorXmrAddress) {
+        {
             const failedRefunds = storage.getFailedRefundSweeps();
             if (failedRefunds.length > 0) {
                 console.log(`[Refund Sweep Retry] Found ${failedRefunds.length} failed refund sweep(s) — checking retry limits`);
                 for (const swap of failedRefunds) {
                     if (swap.trustless_mode === 1) {
+                        const refundDest = swap.bob_xmr_refund ?? operatorXmrAddress;
+                        if (!refundDest) continue;
                         // Skip if already queued — prevents burning retry budget while sweep is processing
                         if (sweepQueue.getPosition(swap.swap_id) !== null) continue;
                         if (!bumpSweepRetryCount(swap, storage, true)) continue;
                         const retries = getSweepRetryCount(swap.sweep_status) + 1;
                         storage.updateSwap(swap.swap_id, { sweep_status: `refund_failed:retry_pending||retries=${retries}` });
-                        const job = buildSweepJob(swap, storage, operatorXmrAddress);
+                        const job = buildSweepJob(swap, storage, refundDest);
                         if (job) sweepQueue.enqueue(job);
                     }
                 }
@@ -1856,6 +1943,24 @@ function recoverInterruptedSwaps(
     console.log(`[Recovery] Found ${interrupted.length} interrupted swap(s) — resuming monitoring`);
     for (const swap of interrupted) {
         console.log(`[Recovery]   ${swap.swap_id} (${swap.status})`);
+
+        // TAKE_PENDING recovery: revert stale reservations to OPEN
+        if (swap.status === SwapStatus.TAKE_PENDING) {
+            try {
+                const updated = storage.updateSwap(
+                    swap.swap_id,
+                    { status: SwapStatus.OPEN, counterparty: null, claim_token: null, take_pending_at: null },
+                    SwapStatus.TAKE_PENDING,
+                    'Recovery: stale TAKE_PENDING reverted to OPEN on startup',
+                );
+                stateMachine.notifyTransition(updated, SwapStatus.TAKE_PENDING, SwapStatus.OPEN);
+                console.log(`[Recovery] Reverted TAKE_PENDING → OPEN: ${swap.swap_id}`);
+            } catch (err: unknown) {
+                const msg = err instanceof Error ? err.message : String(err);
+                console.warn(`[Recovery] Failed to revert TAKE_PENDING for ${swap.swap_id}: ${msg}`);
+            }
+            continue;
+        }
 
         // XMR_SWEEPING recovery: re-enqueue sweep or re-broadcast preimage
         if (swap.status === SwapStatus.XMR_SWEEPING) {
@@ -2014,13 +2119,15 @@ function recoverInterruptedSwaps(
     }
 
     // Retry failed refund sweeps on startup (EXPIRED swaps with XMR at risk)
-    if (operatorXmrAddress) {
+    {
         const failedRefunds = storage.getFailedRefundSweeps();
         if (failedRefunds.length > 0) {
             console.log(`[Recovery] Found ${failedRefunds.length} failed refund sweep(s) — enqueuing`);
             for (const swap of failedRefunds) {
                 if (swap.trustless_mode === 1) {
-                    const job = buildSweepJob(swap, storage, operatorXmrAddress);
+                    const refundDest = swap.bob_xmr_refund ?? operatorXmrAddress;
+                    if (!refundDest) continue;
+                    const job = buildSweepJob(swap, storage, refundDest);
                     if (job) sweepQueue.enqueue(job);
                 }
             }

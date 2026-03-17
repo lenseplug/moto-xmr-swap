@@ -22,6 +22,7 @@ import {
 // ── Constants ────────────────────────────────────────────────────────────────
 
 const MIN_TIMEOUT: u256 = u256.fromU32(10);
+const MAX_TIMEOUT: u256 = u256.fromU32(1008); // ~7 days at ~10min/block
 const MAX_ACTIVE_SWAPS: u32 = 50;
 
 // Swap status values
@@ -258,6 +259,12 @@ export class SwapVault extends OP_NET {
         const minRefundBlock = SafeMath.add(Blockchain.block.numberU256, MIN_TIMEOUT);
         if (!u256.gt(refundBlock, minRefundBlock)) {
             throw new Revert('RefundBlock too soon (min +10 blocks)');
+        }
+
+        // refundBlock must be <= current block + MAX_TIMEOUT
+        const maxRefundBlock = SafeMath.add(Blockchain.block.numberU256, MAX_TIMEOUT);
+        if (u256.gt(refundBlock, maxRefundBlock)) {
+            throw new Revert('RefundBlock too far (max +1008 blocks)');
         }
 
         const depositor = Blockchain.tx.sender;

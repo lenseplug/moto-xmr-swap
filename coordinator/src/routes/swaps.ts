@@ -23,6 +23,9 @@ import { SwapWebSocketServer } from '../websocket.js';
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { getFeeAddress, setFeeAddress, verifyPreimage, validateMoneroAddress } from '../monero-module.js';
 import { ed25519PublicFromPrivate, verifyBobKeyProof, verifyCrossCurveDleq, validateViewKeyScalar } from '../crypto/index.js';
+import { createLogger } from '../logger.js';
+
+const log = createLogger('routes');
 
 /**
  * Constant-time token comparison that does NOT leak token length via early-return.
@@ -55,9 +58,21 @@ function isDleqRequired(): boolean {
 
 const swapOperationLocks = new Map<string, Promise<void>>();
 
+/** Maximum time (ms) to wait for a swap lock before timing out. */
+const SWAP_LOCK_TIMEOUT_MS = 30_000;
+
+/** Thrown when a swap lock times out — callers should return 503. */
+export class SwapLockTimeoutError extends Error {
+    public constructor(swapId: string) {
+        super(`Swap lock timeout after ${SWAP_LOCK_TIMEOUT_MS}ms for swap ${swapId}`);
+        this.name = 'SwapLockTimeoutError';
+    }
+}
+
 /**
  * Serializes concurrent operations on the same swap.
  * Prevents TOCTOU race conditions where two requests check state simultaneously.
+ * Times out after SWAP_LOCK_TIMEOUT_MS to prevent deadlocks.
  */
 export async function withSwapLock<T>(swapId: string, fn: () => Promise<T>): Promise<T> {
     const prev = swapOperationLocks.get(swapId) ?? Promise.resolve();
@@ -65,7 +80,24 @@ export async function withSwapLock<T>(swapId: string, fn: () => Promise<T>): Pro
     const lockPromise = new Promise<void>((resolve) => { releaseLock = resolve; });
     swapOperationLocks.set(swapId, lockPromise);
 
-    await prev;
+    // Race the previous lock against a timeout
+    const timeout = new Promise<never>((_resolve, reject) => {
+        const timer = setTimeout(() => {
+            reject(new SwapLockTimeoutError(swapId));
+        }, SWAP_LOCK_TIMEOUT_MS);
+        timer.unref(); // Don't block process exit
+    });
+
+    try {
+        await Promise.race([prev, timeout]);
+    } catch (err) {
+        // On timeout, release this lock so the queue doesn't deadlock
+        releaseLock();
+        if (swapOperationLocks.get(swapId) === lockPromise) {
+            swapOperationLocks.delete(swapId);
+        }
+        throw err;
+    }
 
     try {
         return await fn();
@@ -263,6 +295,7 @@ function sanitizeSwapForApi(swap: ISwapRecord): Record<string, unknown> {
         // to her Monero address, breaking cross-chain privacy. Only exposed via authenticated
         // endpoints (my-secret, admin).
         alice_xmr_payout: null,
+        bob_xmr_refund: null,
         // DLEQ proofs and secp256k1 pubkeys are zero-knowledge proofs, NOT secrets.
         // They MUST be exposed so the counterparty can verify cross-curve key binding.
         // alice_dleq_proof, bob_dleq_proof, alice_secp256k1_pub, bob_secp256k1_pub: kept as-is
@@ -377,12 +410,13 @@ export async function handleTakeSwap(
             return;
         }
 
-        // Allow take when OPEN, TAKEN, XMR_LOCKING, or XMR_LOCKED.
+        // Allow take when OPEN, TAKE_PENDING, TAKEN, XMR_LOCKING, or XMR_LOCKED.
         // The OPNet watcher may transition to TAKEN and startXmrLocking may progress
         // to XMR_LOCKING/XMR_LOCKED before Bob's POST /take arrives (race condition).
         // The double-take guard below prevents multiple claim_token assignments.
         const TAKE_ALLOWED_STATES: ReadonlySet<SwapStatus> = new Set([
             SwapStatus.OPEN,
+            SwapStatus.TAKE_PENDING,
             SwapStatus.TAKEN,
             SwapStatus.XMR_LOCKING,
             SwapStatus.XMR_LOCKED,
@@ -440,11 +474,26 @@ export async function handleTakeSwap(
             return;
         }
         const claimToken = hint;
+
+        // Optional: Bob's XMR refund address (where expired swap XMR is returned)
+        const rawBobRefund = typeof (body as unknown as Record<string, unknown>)['bobXmrRefund'] === 'string'
+            ? ((body as unknown as Record<string, unknown>)['bobXmrRefund'] as string).trim()
+            : null;
+        let bobXmrRefund: string | null = null;
+        if (rawBobRefund && rawBobRefund.length > 0) {
+            const addrErr = validateMoneroAddress(rawBobRefund);
+            if (addrErr) {
+                jsonResponse(res, 400, fail('VALIDATION', `Invalid bobXmrRefund address: ${addrErr}`));
+                return;
+            }
+            bobXmrRefund = rawBobRefund;
+        }
+
         const currentSwap = freshSwap ?? swap;
         const wasOpen = currentSwap.status === SwapStatus.OPEN;
 
-        // If swap is OPEN, transition to TAKEN immediately so Bob can submit keys
-        // without waiting for the OPNet watcher to detect the on-chain take.
+        // If swap is OPEN, transition to TAKE_PENDING (reservation).
+        // Bob must POST /keys to advance to TAKEN. 60s timeout reverts to OPEN.
         if (wasOpen) {
             const counterparty = body.opnetTxId.trim().replace(/[^0-9a-fA-F]/g, '').slice(0, 64);
             // Validate counterparty is a proper 64-char hex transaction ID.
@@ -453,23 +502,23 @@ export async function handleTakeSwap(
                 return;
             }
             // Validate transition BEFORE writing, using a synthetic swap with updated fields.
-            // This avoids a non-atomic two-step write that could leave claim_token set
-            // but status still OPEN on crash (permanently blocking future take attempts).
             const syntheticSwap = { ...currentSwap, counterparty, claim_token: claimToken } as ISwapRecord;
             try {
-                stateMachine.validate(syntheticSwap, SwapStatus.TAKEN);
+                stateMachine.validate(syntheticSwap, SwapStatus.TAKE_PENDING);
             } catch (err: unknown) {
                 const msg = err instanceof Error ? err.message : 'Invalid transition';
                 jsonResponse(res, 409, fail('INVALID_TRANSITION', msg));
                 return;
             }
-            // Atomic write: claim_token + counterparty + status in a single SQL UPDATE.
-            // Uses fromState=OPEN for optimistic concurrency — no partial state on crash.
-            storage.updateSwap(swapId, {
+            // Atomic write: claim_token + counterparty + status + take_pending_at in one UPDATE.
+            const takeFields: IUpdateSwapParams = {
                 claim_token: claimToken,
                 counterparty,
-                status: SwapStatus.TAKEN,
-            } as IUpdateSwapParams, SwapStatus.OPEN, 'Swap taken');
+                status: SwapStatus.TAKE_PENDING,
+                take_pending_at: new Date().toISOString(),
+                ...(bobXmrRefund ? { bob_xmr_refund: bobXmrRefund } : {}),
+            };
+            storage.updateSwap(swapId, takeFields, SwapStatus.OPEN, 'Swap take pending');
         } else {
             storage.updateSwap(swapId, { claim_token: claimToken });
         }
@@ -478,7 +527,7 @@ export async function handleTakeSwap(
 
         // Notify state machine + broadcast if we transitioned
         if (wasOpen && updatedSwap) {
-            stateMachine.notifyTransition(updatedSwap, SwapStatus.OPEN, SwapStatus.TAKEN);
+            stateMachine.notifyTransition(updatedSwap, SwapStatus.OPEN, SwapStatus.TAKE_PENDING);
             wsServer.broadcastSwapUpdate(updatedSwap);
         }
 
@@ -689,7 +738,7 @@ export async function handleSubmitSecret(
         }
 
         storage.updateSwap(swapId, updateParams as import('../types.js').IUpdateSwapParams);
-        console.log(`[Routes] Secret stored for swap ${swapId}`);
+        log.info('Secret stored', swapId);
 
         jsonResponse(res, 200, success({ stored: true, trustless: !!aliceViewKey }));
     });
@@ -903,6 +952,8 @@ export async function handleSubmitKeys(
     res: ServerResponse,
     storage: StorageService,
     swapId: string,
+    stateMachine?: import('../state-machine.js').SwapStateMachine,
+    wsServer?: import('../websocket.js').SwapWebSocketServer,
 ): Promise<void> {
     if (!keySubmitLimiter.check(getClientIp(req))) { tooManyRequests(res); return; }
     // Per-swap lock prevents concurrent key submissions from racing
@@ -923,8 +974,9 @@ export async function handleSubmitKeys(
         return;
     }
 
-    // Only accept keys when swap is TAKEN or later pre-claim states
+    // Accept keys when swap is TAKE_PENDING, TAKEN, or later pre-claim states
     const ACCEPT_KEYS_STATES = new Set([
+        SwapStatus.TAKE_PENDING,
         SwapStatus.TAKEN,
         SwapStatus.XMR_LOCKING,
         SwapStatus.XMR_LOCKED,
@@ -1088,7 +1140,26 @@ export async function handleSubmitKeys(
     }
 
     storage.updateSwap(swapId, updateFields as import('../types.js').IUpdateSwapParams);
-    console.log(`[Routes] Bob's keys verified and stored for split-key swap ${swapId}`);
+    log.info('Bob keys verified and stored', swapId);
+
+    // Auto-advance TAKE_PENDING → TAKEN now that Bob's keys are validated
+    if (swap.status === SwapStatus.TAKE_PENDING && stateMachine) {
+        try {
+            stateMachine.validate(swap, SwapStatus.TAKEN);
+            const updated = storage.updateSwap(
+                swapId,
+                { status: SwapStatus.TAKEN, take_pending_at: null },
+                SwapStatus.TAKE_PENDING,
+                'TAKE_PENDING → TAKEN: Bob keys validated',
+            );
+            stateMachine.notifyTransition(updated, SwapStatus.TAKE_PENDING, SwapStatus.TAKEN);
+            if (wsServer) wsServer.broadcastSwapUpdate(updated);
+            log.info('Auto-advanced TAKE_PENDING → TAKEN after key validation', swapId);
+        } catch (advanceErr: unknown) {
+            const msg = advanceErr instanceof Error ? advanceErr.message : String(advanceErr);
+            log.warn(`Failed to auto-advance TAKE_PENDING → TAKEN: ${msg}`, swapId);
+        }
+    }
 
     jsonResponse(res, 200, success({ stored: true }));
     });
@@ -1228,6 +1299,132 @@ export async function handleAdminUpdateSwap(
     const updated = storage.updateSwap(swapId, updateParams as IUpdateSwapParams);
     wsServer.broadcastSwapUpdate(updated);
     jsonResponse(res, 200, success({ swap: sanitizeSwapForApi(updated) }));
+    }); // end withSwapLock
+}
+
+/**
+ * Handler: POST /api/admin/swaps/:id/recover
+ * Production-safe admin recovery endpoint for unsticking swaps.
+ * Actions: force_expire, retry_sweep, force_refund, scrub_secrets
+ */
+export async function handleAdminRecover(
+    req: IncomingMessage,
+    res: ServerResponse,
+    storage: StorageService,
+    stateMachine: SwapStateMachine,
+    wsServer: SwapWebSocketServer,
+    _sweepQueue: import('../sweep-queue.js').SweepQueue,
+    swapId: string,
+    _operatorXmrAddress: string | null,
+): Promise<void> {
+    return withSwapLock(swapId, async () => {
+    const swap = storage.getSwap(swapId);
+    if (!swap) {
+        jsonResponse(res, 404, fail('NOT_FOUND', `Swap ${swapId} not found`));
+        return;
+    }
+
+    let body: Record<string, unknown>;
+    try {
+        const parsed = await readBody(req);
+        if (typeof parsed !== 'object' || parsed === null) {
+            jsonResponse(res, 400, fail('VALIDATION', 'Request body must be a JSON object'));
+            return;
+        }
+        body = parsed as Record<string, unknown>;
+    } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : 'Invalid request';
+        jsonResponse(res, 400, fail('INVALID_BODY', msg));
+        return;
+    }
+
+    const action = body['action'];
+    if (typeof action !== 'string') {
+        jsonResponse(res, 400, fail('VALIDATION', 'Required: action (force_expire | retry_sweep | force_refund | scrub_secrets)'));
+        return;
+    }
+
+    const before = swap.status;
+
+    switch (action) {
+        case 'force_expire': {
+            const FORCE_EXPIRE_ALLOWED = new Set([
+                SwapStatus.TAKE_PENDING, SwapStatus.TAKEN,
+                SwapStatus.XMR_LOCKING, SwapStatus.XMR_LOCKED,
+            ]);
+            if (!FORCE_EXPIRE_ALLOWED.has(swap.status)) {
+                jsonResponse(res, 409, fail('INVALID_STATE', `Cannot force_expire from ${swap.status}`));
+                return;
+            }
+            const updated = storage.updateSwap(
+                swapId,
+                { status: SwapStatus.EXPIRED },
+                swap.status,
+                `Admin force_expire from ${swap.status}`,
+            );
+            stateMachine.notifyTransition(updated, before, SwapStatus.EXPIRED);
+            wsServer.broadcastSwapUpdate(updated);
+            log.warn(`Admin force_expire: ${before} → EXPIRED`, swapId);
+            jsonResponse(res, 200, success({ before, after: SwapStatus.EXPIRED, swap: sanitizeSwapForApi(updated) }));
+            break;
+        }
+
+        case 'retry_sweep': {
+            if (!swap.sweep_status?.startsWith('failed:')) {
+                jsonResponse(res, 409, fail('INVALID_STATE', `Cannot retry_sweep: sweep_status is "${swap.sweep_status}", expected "failed:..."`));
+                return;
+            }
+            storage.updateSwap(swapId, { sweep_status: 'pending' });
+            log.warn('Admin retry_sweep: reset sweep_status to pending', swapId);
+            jsonResponse(res, 200, success({ before: swap.sweep_status, after: 'pending' }));
+            break;
+        }
+
+        case 'force_refund': {
+            if (swap.status !== SwapStatus.EXPIRED) {
+                jsonResponse(res, 409, fail('INVALID_STATE', `Cannot force_refund from ${swap.status}, must be EXPIRED`));
+                return;
+            }
+            const refundTx = body['opnet_refund_tx'];
+            if (typeof refundTx !== 'string' || !/^[0-9a-f]{64}$/i.test(refundTx)) {
+                jsonResponse(res, 400, fail('VALIDATION', 'Required: opnet_refund_tx (64 hex char tx hash)'));
+                return;
+            }
+            const updated = storage.updateSwap(
+                swapId,
+                { status: SwapStatus.REFUNDED, opnet_refund_tx: refundTx.toLowerCase() },
+                SwapStatus.EXPIRED,
+                `Admin force_refund with tx ${refundTx.slice(0, 16)}...`,
+            );
+            stateMachine.notifyTransition(updated, SwapStatus.EXPIRED, SwapStatus.REFUNDED);
+            wsServer.broadcastSwapUpdate(updated);
+            log.warn(`Admin force_refund: EXPIRED → REFUNDED`, swapId);
+            jsonResponse(res, 200, success({ before, after: SwapStatus.REFUNDED, swap: sanitizeSwapForApi(updated) }));
+            break;
+        }
+
+        case 'scrub_secrets': {
+            const TERMINAL = new Set([SwapStatus.COMPLETED, SwapStatus.REFUNDED]);
+            if (!TERMINAL.has(swap.status)) {
+                jsonResponse(res, 409, fail('INVALID_STATE', `Cannot scrub_secrets from ${swap.status}, must be COMPLETED or REFUNDED`));
+                return;
+            }
+            storage.updateSwap(swapId, {
+                preimage: null,
+                alice_view_key: null,
+                bob_view_key: null,
+                bob_spend_key: null,
+                claim_token: null,
+                recovery_token: null,
+            } as IUpdateSwapParams);
+            log.warn('Admin scrub_secrets: cleared sensitive fields', swapId);
+            jsonResponse(res, 200, success({ scrubbed: true }));
+            break;
+        }
+
+        default:
+            jsonResponse(res, 400, fail('VALIDATION', `Unknown action: ${action}. Must be force_expire | retry_sweep | force_refund | scrub_secrets`));
+    }
     }); // end withSwapLock
 }
 

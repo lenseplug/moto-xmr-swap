@@ -64,6 +64,7 @@ export function calculateXmrTotal(xmrAmount: string): string {
 /** All possible states of a swap in the coordinator state machine. */
 export enum SwapStatus {
     OPEN = 'OPEN',
+    TAKE_PENDING = 'TAKE_PENDING',
     TAKEN = 'TAKEN',
     XMR_LOCKING = 'XMR_LOCKING',
     XMR_LOCKED = 'XMR_LOCKED',
@@ -145,6 +146,12 @@ export interface ISwapRecord {
     readonly xmr_deposit_height: number | null;
     /** Recovery token issued to Alice at swap creation — used to authenticate secret recovery. */
     readonly recovery_token: string | null;
+    /** Timestamp when swap entered TAKE_PENDING state (ISO string). */
+    readonly take_pending_at: string | null;
+    /** Timestamp when XMR deposit reached 10 confirmations (ISO string). Used for 30-min reveal deadline. */
+    readonly xmr_locked_at: string | null;
+    /** Bob's optional XMR refund address — where expired swap XMR is returned. Falls back to operator address. */
+    readonly bob_xmr_refund: string | null;
     readonly created_at: string;
     readonly updated_at: string;
 }
@@ -168,7 +175,7 @@ export interface ICreateSwapParams {
 export interface IUpdateSwapParams {
     readonly status?: SwapStatus;
     readonly preimage?: string | null;
-    readonly counterparty?: string;
+    readonly counterparty?: string | null;
     readonly opnet_claim_tx?: string;
     readonly opnet_refund_tx?: string;
     readonly xmr_lock_tx?: string;
@@ -192,6 +199,9 @@ export interface IUpdateSwapParams {
     readonly sweep_status?: string | null;
     readonly xmr_deposit_height?: number | null;
     readonly recovery_token?: string | null;
+    readonly take_pending_at?: string | null;
+    readonly xmr_locked_at?: string | null;
+    readonly bob_xmr_refund?: string | null;
 }
 
 /** A state history entry. */

@@ -68,6 +68,7 @@ export interface CoordinatorStatus {
     readonly swapId: string;
     readonly step:
         | 'created'
+        | 'take_pending'
         | 'taken'
         | 'xmr_locking'
         | 'xmr_locked'

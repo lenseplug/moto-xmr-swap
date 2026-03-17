@@ -30,10 +30,11 @@ interface SwapStatusProps {
     readonly onBack: () => void;
 }
 
-type StepKey = 'created' | 'taken' | 'xmr_locking' | 'xmr_locked' | 'xmr_sweeping' | 'claimed' | 'complete';
+type StepKey = 'created' | 'take_pending' | 'taken' | 'xmr_locking' | 'xmr_locked' | 'xmr_sweeping' | 'claimed' | 'complete';
 
 const STEPS: Array<{ key: StepKey; label: string; description: string }> = [
     { key: 'created', label: 'Created', description: 'MOTO locked in vault' },
+    { key: 'take_pending', label: 'Reserving', description: 'Counterparty reserving slot' },
     { key: 'taken', label: 'Taken', description: 'Counterparty accepted' },
     { key: 'xmr_locking', label: 'XMR Locking', description: 'Awaiting XMR deposit' },
     { key: 'xmr_locked', label: 'XMR Locked', description: 'XMR in escrow' },
@@ -48,6 +49,9 @@ function getActiveDescription(step: StepKey, isAlice: boolean, xmrConfirmations?
         created: isAlice
             ? 'Your MOTO is locked on-chain. Waiting for a buyer to accept this swap.'
             : 'Your take transaction is confirming on-chain (3-5 min).',
+        take_pending: isAlice
+            ? 'A buyer is reserving this swap. Waiting for their key submission (~60s).'
+            : 'Reserving swap slot. Submitting your keys to the coordinator.',
         taken: isAlice
             ? 'A buyer has accepted your swap. The coordinator is setting up the XMR escrow.'
             : 'Swap accepted. The coordinator is generating the XMR escrow address.',

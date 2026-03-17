@@ -625,16 +625,18 @@ describe('H. Happy Path -- Standard Mode', () => {
         const secretRes = await api.submitSecret(params.swap_id, preimage, undefined, undefined, alicePayout);
         assert.equal(secretRes.status, 200);
 
-        // 3. Take swap (Bob takes it) — this transitions OPEN → TAKEN automatically
+        // 3. Take swap (Bob takes it) — this transitions OPEN → TAKE_PENDING
         const takeRes = await api.takeSwap(params.swap_id, 'aa'.repeat(32));
         assert.equal(takeRes.status, 200);
         const claimToken = (takeRes.body.data as { claim_token: string }).claim_token;
 
-        // takeSwap already set counterparty and transitioned to TAKEN.
+        // 3b. Advance TAKE_PENDING → TAKEN via admin (standard mode, no split-key)
+        await api.adminUpdate(params.swap_id, { counterparty: 'aa'.repeat(32), status: 'TAKEN' });
+
+        // After admin advance, status is TAKEN.
         // The state machine callback triggers startXmrLocking on TAKEN transition.
 
         // 4. Wait for mock Monero to auto-progress: TAKEN -> XMR_LOCKING -> XMR_LOCKED
-        // The state machine callback triggers startXmrLocking on TAKEN transition
         // Mock confirm delay is 2000ms
         await sleep(4000);
 
@@ -1674,6 +1676,9 @@ describe('R. Audit Finding Coverage', () => {
         const takeRes = await api.takeSwap(params.swap_id, 'ab'.repeat(32));
         const claimToken = (takeRes.body.data as { claim_token: string }).claim_token;
 
+        // Advance TAKE_PENDING → TAKEN via admin (standard mode, no split-key)
+        await api.adminUpdate(params.swap_id, { status: 'TAKEN' });
+
         const ws1 = new WsClient(coord.baseUrl);
         const ws2 = new WsClient(coord.baseUrl);
         await ws1.connect();
@@ -1685,7 +1690,7 @@ describe('R. Audit Finding Coverage', () => {
         ws2.subscribe(params.swap_id, claimToken);
         await sleep(200);
 
-        // takeSwap already triggered startXmrLocking → mock Monero auto-confirms → preimage broadcast
+        // Admin advance to TAKEN triggers startXmrLocking → mock Monero auto-confirms → preimage broadcast
 
         const [pre1, pre2] = await Promise.all([
             ws1.waitForPreimage(10000),
@@ -1771,15 +1776,15 @@ describe('R. Audit Finding Coverage', () => {
         // Verify all three fields are set atomically
         const getRes = await api.getSwap(params.swap_id);
         const getData = getRes.body as { data: { swap: Record<string, unknown>; history: Array<{ from_state: string; to_state: string }> } };
-        assert.equal(getData.data.swap.status, 'TAKEN');
+        assert.equal(getData.data.swap.status, 'TAKE_PENDING');
         assert.ok(getData.data.swap.counterparty, 'counterparty should be set');
 
-        // State history should show OPEN → TAKEN
+        // State history should show OPEN → TAKE_PENDING
         assert.ok(getData.data.history.length > 0, 'History should record the transition');
         const transition = getData.data.history.find(
-            (h) => h.from_state === 'OPEN' && h.to_state === 'TAKEN'
+            (h) => h.from_state === 'OPEN' && h.to_state === 'TAKE_PENDING'
         );
-        assert.ok(transition, 'History should have OPEN → TAKEN entry');
+        assert.ok(transition, 'History should have OPEN → TAKE_PENDING entry');
     });
 });
 

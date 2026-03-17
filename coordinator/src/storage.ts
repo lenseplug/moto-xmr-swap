@@ -26,6 +26,7 @@ const ENCRYPTED_FIELDS: ReadonlySet<string> = new Set([
     'bob_spend_key',
     'alice_xmr_payout',
     'recovery_token',
+    'bob_xmr_refund',
 ]);
 
 const CREATE_SWAPS_TABLE = `
@@ -157,6 +158,9 @@ function mapRowToSwapRecord(row: Record<string, string | number | null>): ISwapR
         sweep_status: (row['sweep_status'] as string | null) ?? null,
         xmr_deposit_height: (row['xmr_deposit_height'] as number | null) ?? null,
         recovery_token: (row['recovery_token'] as string | null) ?? null,
+        take_pending_at: (row['take_pending_at'] as string | null) ?? null,
+        xmr_locked_at: (row['xmr_locked_at'] as string | null) ?? null,
+        bob_xmr_refund: (row['bob_xmr_refund'] as string | null) ?? null,
         created_at: (row['created_at'] as string) ?? '',
         updated_at: (row['updated_at'] as string) ?? '',
     };
@@ -380,6 +384,18 @@ export class StorageService {
         if (updates.recovery_token !== undefined) {
             setClauses.push('recovery_token = ?');
             values.push(encryptIfPresent(updates.recovery_token) ?? null);
+        }
+        if (updates.take_pending_at !== undefined) {
+            setClauses.push('take_pending_at = ?');
+            values.push(updates.take_pending_at ?? null);
+        }
+        if (updates.xmr_locked_at !== undefined) {
+            setClauses.push('xmr_locked_at = ?');
+            values.push(updates.xmr_locked_at ?? null);
+        }
+        if (updates.bob_xmr_refund !== undefined) {
+            setClauses.push('bob_xmr_refund = ?');
+            values.push(encryptIfPresent(updates.bob_xmr_refund) ?? null);
         }
 
         if (setClauses.length > 1) {
@@ -749,6 +765,12 @@ export class StorageService {
         this.migrateAddColumn('secret_backups', 'recovery_token', 'TEXT');
         // Deposit height for accurate sweep restore_height
         this.migrateAddColumn('swaps', 'xmr_deposit_height', 'INTEGER');
+        // TAKE_PENDING timestamp
+        this.migrateAddColumn('swaps', 'take_pending_at', 'TEXT');
+        // XMR_LOCKED timestamp (30-min reveal deadline)
+        this.migrateAddColumn('swaps', 'xmr_locked_at', 'TEXT');
+        // Bob's XMR refund address
+        this.migrateAddColumn('swaps', 'bob_xmr_refund', 'TEXT');
         // HMAC index for O(1) claim_token lookup (avoids full table scan with AES decryption)
         this.migrateAddColumn('swaps', 'claim_token_hmac', 'TEXT');
         this.exec('CREATE INDEX IF NOT EXISTS idx_swaps_claim_token_hmac ON swaps (claim_token_hmac)');

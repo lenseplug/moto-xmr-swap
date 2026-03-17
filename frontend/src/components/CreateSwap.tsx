@@ -98,8 +98,8 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
         if (form.xmrAddress.trim().length < 10) return 'Please enter a valid XMR address';
 
         const blocks = parseInt(form.timeoutBlocks, 10);
-        if (isNaN(blocks) || blocks < 60 || blocks > 10000)
-            return 'Timeout must be between 60 and 10,000 blocks (coordinator needs at least 50 blocks to lock XMR safely)';
+        if (isNaN(blocks) || blocks < 60 || blocks > 988)
+            return 'Timeout must be between 60 and 988 blocks (~7 days max; coordinator needs at least 50 blocks to lock XMR safely)';
 
         return null;
     }, [form]);

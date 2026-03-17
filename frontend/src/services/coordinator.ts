@@ -40,6 +40,7 @@ export async function checkCoordinatorHealth(): Promise<CoordinatorHealth> {
 /** Maps coordinator SwapStatus enum to frontend step keys. */
 const STATUS_TO_STEP: Record<string, CoordinatorStatus['step']> = {
     OPEN: 'created',
+    TAKE_PENDING: 'take_pending',
     TAKEN: 'taken',
     XMR_LOCKING: 'xmr_locking',
     XMR_LOCKED: 'xmr_locked',
@@ -131,9 +132,10 @@ export interface TakeSwapResult {
  * Notifies the coordinator that a swap has been taken on-chain.
  * claimTokenHint is REQUIRED — deterministically derived from Bob's mnemonic via HKDF.
  */
-export async function notifySwapTaken(swapId: string, txId: string, claimTokenHint: string): Promise<TakeSwapResult> {
+export async function notifySwapTaken(swapId: string, txId: string, claimTokenHint: string, bobXmrRefund?: string): Promise<TakeSwapResult> {
     try {
         const bodyObj: Record<string, string> = { opnetTxId: txId, claimTokenHint };
+        if (bobXmrRefund) bodyObj['bobXmrRefund'] = bobXmrRefund;
         const res = await fetch(`${COORDINATOR_BASE}/api/swaps/${sanitizeSwapId(swapId)}/take`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },

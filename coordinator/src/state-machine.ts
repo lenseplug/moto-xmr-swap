@@ -3,6 +3,9 @@
  */
 
 import { type ISwapRecord, SwapStatus, TERMINAL_STATES } from './types.js';
+import { createLogger } from './logger.js';
+
+const log = createLogger('state');
 
 /** A state change callback invoked after every successful transition. */
 export type StateChangeCallback = (swap: ISwapRecord, from: SwapStatus, to: SwapStatus) => void;
@@ -11,7 +14,11 @@ export type StateChangeCallback = (swap: ISwapRecord, from: SwapStatus, to: Swap
 const VALID_TRANSITIONS: ReadonlyMap<SwapStatus, ReadonlySet<SwapStatus>> = new Map([
     [
         SwapStatus.OPEN,
-        new Set([SwapStatus.TAKEN, SwapStatus.EXPIRED, SwapStatus.REFUNDED]),
+        new Set([SwapStatus.TAKE_PENDING, SwapStatus.TAKEN, SwapStatus.EXPIRED, SwapStatus.REFUNDED]),
+    ],
+    [
+        SwapStatus.TAKE_PENDING,
+        new Set([SwapStatus.TAKEN, SwapStatus.OPEN, SwapStatus.EXPIRED]),
     ],
     [
         SwapStatus.TAKEN,
@@ -23,7 +30,7 @@ const VALID_TRANSITIONS: ReadonlyMap<SwapStatus, ReadonlySet<SwapStatus>> = new 
     ],
     [
         SwapStatus.XMR_LOCKED,
-        new Set([SwapStatus.XMR_SWEEPING, SwapStatus.MOTO_CLAIMING, SwapStatus.REFUNDED]),
+        new Set([SwapStatus.XMR_SWEEPING, SwapStatus.MOTO_CLAIMING, SwapStatus.REFUNDED, SwapStatus.EXPIRED]),
     ],
     [
         SwapStatus.XMR_SWEEPING,
@@ -105,12 +112,13 @@ export class SwapStateMachine {
      * @param to - The new state.
      */
     public notifyTransition(swap: ISwapRecord, from: SwapStatus, to: SwapStatus): void {
+        log.info(`${from} → ${to}`, swap.swap_id, { from, to });
         for (const cb of this.callbacks) {
             try {
                 cb(swap, from, to);
             } catch (err: unknown) {
                 if (err instanceof Error) {
-                    console.error(`State change callback error: ${err.message}`);
+                    log.error(`State change callback error: ${err.message}`, swap.swap_id);
                 }
             }
         }
@@ -193,10 +201,10 @@ export class SwapStateMachine {
                 // SAFETY: Warn if preimage was known/broadcast — on-chain contract should
                 // reject refund if claim already submitted, but log critical warning for audit.
                 if (swap.preimage) {
-                    console.error(
-                        `[StateMachine] CRITICAL WARNING: Swap ${swap.swap_id} transitioning to REFUNDED ` +
-                        `but preimage is known. If preimage was broadcast, Bob may have claimed on-chain. ` +
-                        `Verify on-chain contract state — the refund may indicate the claim never landed.`,
+                    log.error(
+                        'Transitioning to REFUNDED but preimage is known — verify on-chain state',
+                        swap.swap_id,
+                        { preimageKnown: true },
                     );
                 }
                 break;

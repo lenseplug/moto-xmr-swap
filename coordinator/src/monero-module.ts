@@ -5,6 +5,9 @@
 
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { type IPreimageResult, SwapStatus, FEE_BPS } from './types.js';
+import { createLogger } from './logger.js';
+
+const log = createLogger('monero');
 import type { StorageService } from './storage.js';
 import type { SwapStateMachine } from './state-machine.js';
 import type { SwapWebSocketServer } from './websocket.js';
@@ -190,7 +193,7 @@ export function notifyXmrConfirmed(
     currentBlockGetter?: () => bigint,
 ): void {
     if (xmrConfirmedSwaps.has(swapId)) {
-        console.log(`[Monero] notifyXmrConfirmed: swap ${swapId} already confirmed — skipping duplicate`);
+        log.info('notifyXmrConfirmed: already confirmed — skipping duplicate', swapId);
         return;
     }
     xmrConfirmedSwaps.add(swapId);
@@ -236,7 +239,7 @@ export function notifyXmrConfirmed(
         stateMachine.validate(withConfs, SwapStatus.XMR_LOCKED);
         const updated = storage.updateSwap(
             swapId,
-            { status: SwapStatus.XMR_LOCKED },
+            { status: SwapStatus.XMR_LOCKED, xmr_locked_at: new Date().toISOString() },
             SwapStatus.XMR_LOCKING,
             `XMR lock confirmed with ${confirmations} confirmations`,
         );
@@ -302,7 +305,7 @@ export function notifyXmrConfirmed(
         }
     } catch (err: unknown) {
         const message = err instanceof Error ? err.message : 'Unknown error';
-        console.error(`[Monero] notifyXmrConfirmed failed for swap ${swapId}: ${message}`);
+        log.error(`notifyXmrConfirmed failed: ${message}`, swapId);
         // Clear from xmrConfirmedSwaps so the swap can be retried on the next monitoring poll.
         // Without this, a failed transition (e.g., optimistic concurrency conflict) permanently
         // prevents the swap from reaching XMR_LOCKED state.

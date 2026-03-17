@@ -10,6 +10,9 @@ import { StorageService } from './storage.js';
 import { SwapStateMachine } from './state-machine.js';
 import { ed25519PublicFromPrivate } from './crypto/index.js';
 import { withSwapLock } from './routes/swaps.js';
+import { createLogger } from './logger.js';
+
+const log = createLogger('watcher');
 
 /** Typed SwapVault contract interface for coordinator-side reads. */
 interface ISwapVaultContract extends IOP_NETContract {
@@ -31,6 +34,10 @@ const OPNET_RPC_URL = 'https://testnet.opnet.org';
 const POLL_INTERVAL_MS = 15_000;
 const MAX_RETRY_DELAY_MS = 30_000;
 const CONTRACT_ADDRESS = process.env['SWAP_CONTRACT_ADDRESS'] ?? '';
+
+/** Number of blocks to wait after first observing an on-chain status change before processing it.
+ *  Provides reorg protection (~90s at 15s/block). */
+const CONFIRMATION_DEPTH = 6;
 
 /** SwapVault ABI using proper ABIDataTypes enum values. */
 const SWAP_VAULT_ABI: BitcoinInterfaceAbi = [
@@ -127,6 +134,10 @@ export class OpnetWatcher {
     /** Tracks the highest block number observed per swap to detect reorgs. */
     private readonly lastSeenBlock = new Map<string, bigint>();
 
+    /** Tracks (swapId:status) → block number where an on-chain status change was first seen.
+     *  Events are only processed after CONFIRMATION_DEPTH blocks have passed. */
+    private readonly pendingConfirmations = new Map<string, { status: SwapStatus; firstSeenBlock: bigint }>();
+
     public constructor(storage: StorageService, stateMachine: SwapStateMachine) {
         this.storage = storage;
         this.stateMachine = stateMachine;
@@ -192,9 +203,8 @@ export class OpnetWatcher {
             await this.checkForNewSwaps();
             await this.refreshActiveSwaps();
         } catch (err: unknown) {
-            if (err instanceof Error) {
-                console.error(`[OPNet Watcher] Poll error: ${err.message}`);
-            }
+            const msg = err instanceof Error ? err.message : String(err);
+            console.error(`[OPNet Watcher] Poll error: ${msg}`);
         }
 
         this.pollTimer = setTimeout(() => {
@@ -229,6 +239,7 @@ export class OpnetWatcher {
             }
 
             const count = countResult.properties.count;
+            console.log(`[OPNet Watcher] getSwapCount returned: ${count} (type: ${typeof count}, lastKnown: ${this.lastKnownSwapCount})`);
             if (count === undefined) return;
 
             if (count > this.lastKnownSwapCount) {
@@ -344,10 +355,13 @@ export class OpnetWatcher {
         // A reorg could cause a confirmed state to be undone.
         const prevBlock = this.lastSeenBlock.get(swapIdStr) ?? 0n;
         if (this.currentBlockNumber > 0n && this.currentBlockNumber < prevBlock) {
-            console.warn(
-                `[OPNet Watcher] POSSIBLE REORG: block ${this.currentBlockNumber} < previous ${prevBlock} for swap ${swapIdStr}. ` +
-                `State may be stale — re-reading on-chain data.`,
-            );
+            log.warn(`POSSIBLE REORG: block ${this.currentBlockNumber} < previous ${prevBlock}`, swapIdStr);
+            // Clear pending confirmations for this swap — reorg invalidates observation depth
+            for (const key of this.pendingConfirmations.keys()) {
+                if (key.startsWith(`${swapIdStr}:`)) {
+                    this.pendingConfirmations.delete(key);
+                }
+            }
         }
         if (this.currentBlockNumber > prevBlock) {
             this.lastSeenBlock.set(swapIdStr, this.currentBlockNumber);
@@ -443,6 +457,22 @@ export class OpnetWatcher {
         if (this.stateMachine.isTerminal(existing.status)) return;
         if (!this.stateMachine.canTransition(existing.status, onChainMappedStatus)) return;
 
+        // CONFIRMATION_DEPTH gate: delay processing until the status has been observed
+        // for at least CONFIRMATION_DEPTH blocks to protect against reorgs.
+        const pendingKey = `${swapIdStr}:${onChainMappedStatus}`;
+        const pending = this.pendingConfirmations.get(pendingKey);
+        if (!pending) {
+            this.pendingConfirmations.set(pendingKey, { status: onChainMappedStatus, firstSeenBlock: this.currentBlockNumber });
+            log.info(`Pending confirmation (depth 0/${CONFIRMATION_DEPTH})`, swapIdStr, { onChainStatus: onChainMappedStatus, firstSeenBlock: Number(this.currentBlockNumber) });
+            return;
+        }
+        const depth = this.currentBlockNumber - pending.firstSeenBlock;
+        if (depth < BigInt(CONFIRMATION_DEPTH)) {
+            return; // Not yet confirmed deep enough
+        }
+        // Confirmed — remove from pending and proceed
+        this.pendingConfirmations.delete(pendingKey);
+
         const prevStatus = existing.status;
         const hasNewCounterparty =
             onChain.counterparty.length > 0 &&
@@ -484,9 +514,7 @@ export class OpnetWatcher {
 
         const updated = this.storage.updateSwap(swapIdStr, updates, prevStatus);
         this.stateMachine.notifyTransition(updated, prevStatus, onChainMappedStatus);
-        console.log(
-            `[OPNet Watcher] Swap ${swapIdStr}: ${prevStatus} → ${onChainMappedStatus}`,
-        );
+        log.info(`on-chain ${prevStatus} → ${onChainMappedStatus}`, swapIdStr, { from: prevStatus, to: onChainMappedStatus });
 
         // After transitioning to MOTO_CLAIMING, immediately transition to COMPLETED.
         // On-chain CLAIMED means the claim TX is confirmed — the swap is done.
@@ -522,6 +550,12 @@ export class OpnetWatcher {
             const swap = this.storage.getSwap(swapId);
             if (!swap || this.stateMachine.isTerminal(swap.status) || swap.status === SwapStatus.EXPIRED) {
                 this.lastSeenBlock.delete(swapId);
+                // Also clean up any pending confirmations for this swap
+                for (const key of this.pendingConfirmations.keys()) {
+                    if (key.startsWith(`${swapId}:`)) {
+                        this.pendingConfirmations.delete(key);
+                    }
+                }
                 pruned++;
             }
         }
@@ -559,9 +593,7 @@ export class OpnetWatcher {
                     );
                     this.stateMachine.notifyTransition(updated, prev, SwapStatus.EXPIRED);
                     expired.push(updated);
-                    console.log(
-                        `[OPNet Watcher] Swap ${swap.swap_id} expired at block ${currentBlock}`,
-                    );
+                    log.info(`Expired at block ${currentBlock}`, swap.swap_id, { currentBlock: Number(currentBlock), refundBlock: swap.refund_block });
                 }
             } catch (err: unknown) {
                 const msg = err instanceof Error ? err.message : 'Unknown error';

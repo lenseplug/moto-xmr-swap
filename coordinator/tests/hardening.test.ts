@@ -91,7 +91,8 @@ async function driveToState(
 
     const claimToken = randomClaimToken();
     await api.takeSwap(swapId, 'aa'.repeat(32), claimToken);
-    await api.adminUpdate(swapId, { counterparty: 'opt1sqcounterparty' + 'bb'.repeat(10) });
+    // takeSwap now goes OPEN → TAKE_PENDING; advance to TAKEN via admin
+    await api.adminUpdate(swapId, { counterparty: 'opt1sqcounterparty' + 'bb'.repeat(10), status: 'TAKEN' });
 
     if (target === 'TAKEN') return { swapId, preimage, recoveryToken, claimToken };
 
@@ -154,7 +155,7 @@ describe('1. State Machine Constraint Enforcement', () => {
 
     it('1.4 Terminal states reject all transitions', async () => {
         const { swapId } = await driveToState('COMPLETED');
-        const states = ['OPEN', 'TAKEN', 'XMR_LOCKING', 'XMR_LOCKED', 'MOTO_CLAIMING', 'COMPLETED', 'REFUNDED'];
+        const states = ['OPEN', 'TAKE_PENDING', 'TAKEN', 'XMR_LOCKING', 'XMR_LOCKED', 'XMR_SWEEPING', 'MOTO_CLAIMING', 'COMPLETED', 'REFUNDED'];
         for (const status of states) {
             const res = await api.adminUpdate(swapId, { status });
             assert.notEqual(res.status, 200, `COMPLETED → ${status} should be rejected`);

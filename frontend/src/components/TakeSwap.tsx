@@ -38,6 +38,7 @@ export function TakeSwap({ swapId, onBack, onTaken }: TakeSwapProps): React.Reac
     const [txId, setTxId] = useState<string | null>(null);
     const [errorMsg, setErrorMsg] = useState<string | null>(null);
     const [mnemonic, setMnemonic] = useState<string | null>(null);
+    const [bobXmrRefund, setBobXmrRefund] = useState<string>('');
 
     // Warn user before closing/navigating away during mnemonic step.
     // Losing the mnemonic means losing access to swap funds.
@@ -125,7 +126,11 @@ export function TakeSwap({ swapId, onBack, onTaken }: TakeSwapProps): React.Reac
             setStatusMessage('Notifying coordinator...');
 
             // Notify coordinator with deterministic claimTokenHint (required, from mnemonic)
-            const takeResult = await notifySwapTaken(swapId.toString(), resultTxId, bobKeys.claimTokenHex);
+            const refundAddr = bobXmrRefund.trim();
+            const takeResult = await notifySwapTaken(
+                swapId.toString(), resultTxId, bobKeys.claimTokenHex,
+                refundAddr.length > 0 ? refundAddr : undefined,
+            );
             const claimToken = takeResult.claimToken ?? bobKeys.claimTokenHex;
 
             // Set session context — clear mnemonic from memory after keys are derived
@@ -449,6 +454,34 @@ export function TakeSwap({ swapId, onBack, onTaken }: TakeSwapProps): React.Reac
                                     You will be given <strong>12 recovery words</strong> — have pen and paper ready.
                                     After taking the swap, you will need to <strong>deposit XMR</strong> to a shared escrow address.
                                     The swap requires ~20 minutes for Monero confirmations.
+                                </div>
+                                <div style={{ marginTop: '12px' }}>
+                                    <label
+                                        style={{
+                                            display: 'block',
+                                            fontSize: '0.78rem',
+                                            color: 'var(--color-text-secondary)',
+                                            marginBottom: '4px',
+                                        }}
+                                    >
+                                        XMR Refund Address (optional)
+                                    </label>
+                                    <input
+                                        type="text"
+                                        className="input"
+                                        placeholder="4... or 8..."
+                                        value={bobXmrRefund}
+                                        onChange={e => setBobXmrRefund(e.target.value)}
+                                        style={{
+                                            width: '100%',
+                                            fontFamily: 'var(--font-mono)',
+                                            fontSize: '0.78rem',
+                                        }}
+                                        disabled={step === 'taking'}
+                                    />
+                                    <p style={{ fontSize: '0.7rem', color: 'var(--color-text-muted)', marginTop: '2px' }}>
+                                        If the swap expires, XMR will be refunded here. Leave blank to use the operator address.
+                                    </p>
                                 </div>
                                 <button
                                     className="btn btn-primary btn-lg"
