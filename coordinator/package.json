@@ -21,7 +21,7 @@
         "@btc-vision/transaction": "rc",
         "@noble/curves": "^2.0.1",
         "dotenv": "^17.3.1",
-        "opnet": "rc",
+        "opnet": "^1.8.3",
         "sql.js": "^1.12.0",
         "ws": "^8.18.0"
     },
