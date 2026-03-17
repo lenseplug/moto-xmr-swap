@@ -15,6 +15,7 @@ interface RecoverSwapProps {
 export function RecoverSwap({ onRecovered }: RecoverSwapProps): React.ReactElement {
     const { setSession } = useSwapSession();
     const [role, setRole] = useState<'alice' | 'bob'>('alice');
+    const [swapIdInput, setSwapIdInput] = useState<string>('');
     const [status, setStatus] = useState<'idle' | 'searching' | 'error'>('idle');
     const [error, setError] = useState<string | null>(null);
 
@@ -25,6 +26,20 @@ export function RecoverSwap({ onRecovered }: RecoverSwapProps): React.ReactEleme
         try {
             if (role === 'alice') {
                 const aliceKeys = await deriveAliceKeys(mnemonic);
+
+                // If swap ID provided, go directly to SwapStatus (handles on-chain imports)
+                if (swapIdInput.trim()) {
+                    setSession({
+                        swapId: swapIdInput.trim(),
+                        role: 'alice',
+                        mnemonic: '',
+                        aliceKeys,
+                        bobKeys: null,
+                    });
+                    onRecovered(BigInt(swapIdInput.trim()));
+                    return;
+                }
+
                 // Look up swap by hashLock
                 const result = await lookupSwapByHashLock(aliceKeys.hashLockHex);
                 if (result.error === 'network') {
@@ -34,7 +49,7 @@ export function RecoverSwap({ onRecovered }: RecoverSwapProps): React.ReactEleme
                 }
                 const swapId = result.swapId;
                 if (!swapId) {
-                    setError('No swap found with this mnemonic. Make sure you selected the correct role (Alice = creator).');
+                    setError('No swap found with this mnemonic. Try entering the Swap ID manually.');
                     setStatus('error');
                     return;
                 }
@@ -49,6 +64,20 @@ export function RecoverSwap({ onRecovered }: RecoverSwapProps): React.ReactEleme
                 onRecovered(BigInt(swapId));
             } else {
                 const bobKeys = await deriveBobKeys(mnemonic);
+
+                // If swap ID provided, go directly to SwapStatus (handles on-chain imports)
+                if (swapIdInput.trim()) {
+                    setSession({
+                        swapId: swapIdInput.trim(),
+                        role: 'bob',
+                        mnemonic: '',
+                        aliceKeys: null,
+                        bobKeys,
+                    });
+                    onRecovered(BigInt(swapIdInput.trim()));
+                    return;
+                }
+
                 // For Bob, we derive the claim token and look up via coordinator
                 const bobResult = await lookupSwapByClaimToken(bobKeys.claimTokenHex);
                 if (bobResult.error === 'network') {
@@ -58,7 +87,7 @@ export function RecoverSwap({ onRecovered }: RecoverSwapProps): React.ReactEleme
                 }
                 const swapId = bobResult.swapId;
                 if (!swapId) {
-                    setError('No swap found with this mnemonic. Make sure you selected the correct role (Bob = taker).');
+                    setError('No swap found with this mnemonic. Try entering the Swap ID manually.');
                     setStatus('error');
                     return;
                 }
@@ -76,7 +105,7 @@ export function RecoverSwap({ onRecovered }: RecoverSwapProps): React.ReactEleme
             setError(err instanceof Error ? err.message : 'Recovery failed');
             setStatus('error');
         }
-    }, [role, setSession, onRecovered]);
+    }, [role, swapIdInput, setSession, onRecovered]);
 
     return (
         <div style={{ maxWidth: '560px' }}>
@@ -119,6 +148,40 @@ export function RecoverSwap({ onRecovered }: RecoverSwapProps): React.ReactEleme
                             Bob (Taker)
                         </button>
                     </div>
+                </div>
+
+                <div style={{ marginBottom: '20px' }}>
+                    <label
+                        style={{
+                            display: 'block',
+                            fontSize: '0.8rem',
+                            fontWeight: 600,
+                            color: 'var(--color-text-secondary)',
+                            marginBottom: '8px',
+                            letterSpacing: '0.04em',
+                            textTransform: 'uppercase',
+                        }}
+                    >
+                        Swap ID (optional)
+                    </label>
+                    <input
+                        type="text"
+                        value={swapIdInput}
+                        onChange={(e) => setSwapIdInput(e.target.value.replace(/\D/g, ''))}
+                        placeholder="e.g. 0"
+                        style={{
+                            width: '100%',
+                            padding: '10px 14px',
+                            background: 'rgba(255,255,255,0.04)',
+                            border: '1px solid var(--color-border-subtle)',
+                            borderRadius: 'var(--radius-md)',
+                            color: 'var(--color-text-primary)',
+                            fontSize: '0.9rem',
+                        }}
+                    />
+                    <p style={{ fontSize: '0.75rem', color: 'var(--color-text-muted)', marginTop: '4px' }}>
+                        Enter the swap ID if automatic lookup fails.
+                    </p>
                 </div>
 
                 <MnemonicInput
