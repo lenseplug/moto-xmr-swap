@@ -2,6 +2,7 @@
  * Main application component for MOTO-XMR Atomic Swap.
  */
 import React, { useState } from 'react';
+import { Toaster } from 'sonner';
 import { Header } from './components/Header';
 import { OrderBook } from './components/OrderBook';
 import { CreateSwap } from './components/CreateSwap';
@@ -10,7 +11,9 @@ import { SwapStatus } from './components/SwapStatus';
 import { MySwaps } from './components/MySwaps';
 import { RecoverSwap } from './components/RecoverSwap';
 import { Docs } from './components/Docs';
+import { Footer } from './components/Footer';
 import { SwapSessionProvider } from './contexts/SwapSessionContext';
+import { SettingsProvider } from './contexts/SettingsContext';
 import motoLogo from './assets/motoswap-logo.png';
 import xmrLogo from './assets/monero-xmr-logo.png';
 
@@ -65,8 +68,24 @@ export default function App(): React.ReactElement {
     };
 
     return (
+        <SettingsProvider>
         <SwapSessionProvider>
         <>
+            <Toaster
+                position="top-right"
+                theme="dark"
+                richColors
+                closeButton
+                toastOptions={{
+                    style: {
+                        background: 'var(--color-bg-elevated)',
+                        border: '1px solid var(--color-border-default)',
+                        color: 'var(--color-text-primary)',
+                        fontFamily: 'var(--font-display)',
+                    },
+                }}
+            />
+
             {/* Watermark logos */}
             <div
                 style={{
@@ -209,27 +228,9 @@ export default function App(): React.ReactElement {
                 )}
             </main>
 
-            {/* Powered by OPNET */}
-            <div
-                style={{
-                    textAlign: 'center',
-                    padding: '40px 24px 16px',
-                }}
-            >
-                <p
-                    style={{
-                        fontSize: 'clamp(1.2rem, 2.5vw, 1.8rem)',
-                        fontWeight: 700,
-                        color: 'var(--color-text-primary)',
-                    }}
-                >
-                    Powered by{' '}
-                    <span style={{ color: 'var(--color-orange)' }}>OPNET</span>
-                </p>
-            </div>
-
-            <footer style={{ padding: '24px' }} />
+            <Footer />
         </>
         </SwapSessionProvider>
+        </SettingsProvider>
     );
 }

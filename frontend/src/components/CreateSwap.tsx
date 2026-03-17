@@ -5,14 +5,20 @@
 import React, { useState, useCallback, useRef, useEffect } from 'react';
 import { useWalletConnect } from '@btc-vision/walletconnect';
 import { networks } from '@btc-vision/bitcoin';
+import { toast } from 'sonner';
 import { getSwapVaultContract, getMotoContract, parseMotoAmount, parseXmrAmount, splitXmrAddress, getProvider } from '../services/opnet';
 import { hashSecret } from '../utils/hashlock';
 import { generateSwapMnemonic, deriveAliceKeys } from '../utils/mnemonic';
 import { submitSwapSecret, resolveSwapIdByHashLock, lookupSwapByHashLock, backupSecret } from '../services/coordinator';
 import { useSwapSession } from '../contexts/SwapSessionContext';
+import { useBlockCountdown } from '../hooks/useBlockCountdown';
+import { useMotoBalance } from '../hooks/useMotoBalance';
 import { MnemonicDisplay } from './MnemonicDisplay';
 import { PrivacyBanner } from './PrivacyBanner';
 import { ExplorerLinks } from './ExplorerLinks';
+
+/** Use MAX_UINT256 approval so repeat swaps skip the approval step entirely. */
+const MAX_UINT256 = (1n << 256n) - 1n;
 
 const SWAP_VAULT_ADDRESS = import.meta.env.VITE_SWAP_VAULT_ADDRESS;
 const MOTO_TOKEN_ADDRESS = import.meta.env.VITE_MOTO_TOKEN_ADDRESS;
@@ -40,6 +46,8 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
     const { setSession } = useSwapSession();
 
     const isConnected = publicKey !== null;
+    const { balance: motoBalance, formatted: motoFormatted } = useMotoBalance(senderAddress ?? null);
+    const { secondsToNextBlock, waitingForBlock } = useBlockCountdown();
 
     const [form, setForm] = useState<FormState>({
         motoAmount: '',
@@ -56,6 +64,7 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
     const [txResult, setTxResult] = useState<TxResult | null>(null);
     const [formError, setFormError] = useState<string | null>(null);
     const [mnemonic, setMnemonic] = useState<string | null>(null);
+    const [showMnemonic, setShowMnemonic] = useState(true);
 
     // Warn user before closing/navigating away during mnemonic step.
     // Losing the mnemonic means losing access to swap funds.
@@ -146,8 +155,8 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
                 setStep('approving');
                 setStatusMessage('Approving MOTO for SwapVault...');
 
-                const deficit = motoAmount - currentAllowance;
-                const approveSim = await motoContract.increaseAllowance(vaultAddress, deficit);
+                // MAX approval — future swaps skip this step entirely
+                const approveSim = await motoContract.increaseAllowance(vaultAddress, MAX_UINT256);
                 if ('error' in approveSim) {
                     throw new Error(`Allowance simulation failed: ${String(approveSim.error)}`);
                 }
@@ -165,46 +174,33 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
                 if ('error' in approveObj) {
                     throw new Error(`Allowance transaction failed: ${String(approveObj['error'])}`);
                 }
-
-                setStatusMessage('Approving MOTO — waiting for block confirmation...');
-                const maxWaitMs = 10 * 60 * 1000;
-                const pollMs = 5_000;
-                const startTime = Date.now();
-                let confirmed = false;
-
-                while (Date.now() - startTime < maxWaitMs) {
-                    await new Promise<void>((r) => setTimeout(r, pollMs));
-                    const elapsed = Math.round((Date.now() - startTime) / 1000);
-                    setStatusMessage(`Approving MOTO — waiting for block confirmation (${elapsed}s)...`);
-                    try {
-                        const recheckResult = await motoContract.allowance(senderAddress, vaultAddress);
-                        if (!('error' in recheckResult) && recheckResult.properties.remaining >= motoAmount) {
-                            confirmed = true;
-                            break;
-                        }
-                    } catch {
-                        // RPC hiccup — keep polling
-                    }
-                }
-
-                if (!confirmed) {
-                    throw new Error('Approval timed out — the allowance TX may still be pending. Try again in a few minutes.');
-                }
+                toast.success('MOTO approval sent');
+                // Approval sent — skip polling. The createSwap simulation retry loop
+                // (36 attempts × 5s) handles unconfirmed allowance gracefully.
             }
 
-            // Generate mnemonic and show it
+            // Generate mnemonic
             const words = generateSwapMnemonic();
             setMnemonic(words);
-            setStep('mnemonic');
+
+            if (showMnemonic) {
+                setStep('mnemonic');
+            } else {
+                // Skip mnemonic display — proceed directly
+                void handleMnemonicConfirmed(words);
+            }
         } catch (err) {
+            const msg = err instanceof Error ? err.message : 'Unknown error occurred';
             setStep('error');
-            setStatusMessage(err instanceof Error ? err.message : 'Unknown error occurred');
+            setStatusMessage(msg);
+            toast.error(msg);
         }
     }, [isConnected, walletAddress, publicKey, senderAddress, form, validateForm]);
 
     // Step 2: User confirmed they wrote down words -> proceed with on-chain tx
-    const handleMnemonicConfirmed = useCallback(async (): Promise<void> => {
-        if (!mnemonic || !senderAddress || !walletAddress) return;
+    const handleMnemonicConfirmed = useCallback(async (mnemonicOverride?: string): Promise<void> => {
+        const words = mnemonicOverride ?? mnemonic;
+        if (!words || !senderAddress || !walletAddress) return;
         if (!SWAP_VAULT_ADDRESS) return;
 
         const motoAmount = parseMotoAmount(form.motoAmount);
@@ -215,7 +211,7 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
         setStatusMessage('Deriving swap keys from mnemonic...');
 
         try {
-            const aliceKeys = await deriveAliceKeys(mnemonic);
+            const aliceKeys = await deriveAliceKeys(words);
 
             // Verify secret matches hashLock
             const verifyHash = await hashSecret(aliceKeys.secret);
@@ -288,8 +284,11 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
 
                     if (errMsg.toLowerCase().includes('allowance') && attempt < maxRetries) {
                         setStep('approving');
-                        setStatusMessage(`Approving MOTO — waiting for block confirmation (${attempt}/${maxRetries})...`);
-                        await new Promise<void>((r) => setTimeout(r, 5_000));
+                        const blockHint = secondsToNextBlock !== null && !waitingForBlock
+                            ? ` — next block ~${Math.floor(secondsToNextBlock / 60)}m ${(secondsToNextBlock % 60).toString().padStart(2, '0')}s`
+                            : waitingForBlock ? ' — next block any moment' : '';
+                        setStatusMessage(`Waiting for approval confirmation (${attempt}/${maxRetries})${blockHint}`);
+                        await new Promise<void>((r) => setTimeout(r, 3_000));
                         continue;
                     }
 
@@ -348,61 +347,11 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
                       ? receiptObj['txid']
                       : 'pending';
 
-            // Resolve actual on-chain swap ID
-            setStatusMessage('Verifying swap ID on-chain...');
-            let resolvedSwapId = swapId;
-            for (let attempt = 0; attempt < 36; attempt++) {
-                if (cancelledRef.current) break;
-                const actualId = await resolveSwapIdByHashLock(aliceKeys.hashLockHex);
-                if (actualId !== null) {
-                    const actualBigInt = BigInt(actualId);
-                    if (actualBigInt !== swapId) {
-                        console.warn(`[CreateSwap] Swap ID corrected: simulated=${swapId}, actual=${actualId}`);
-                        resolvedSwapId = actualBigInt;
-                    }
-                    break;
-                }
-                if (attempt < 35) {
-                    await new Promise<void>((r) => setTimeout(r, 5_000));
-                }
-            }
-
-            // Submit secret to coordinator
-            const aliceXmrPayout = form.xmrAddress.trim();
-            setStatusMessage('Securing swap secret with coordinator (required)...');
-            let secretSubmitted = false;
-            for (let attempt = 0; attempt < 60; attempt++) {
-                if (cancelledRef.current) break;
-                const result = await submitSwapSecret(
-                    resolvedSwapId.toString(),
-                    aliceKeys.secret,
-                    aliceKeys.recoveryToken,
-                    aliceKeys.aliceViewKey,
-                    aliceXmrPayout,
-                    aliceKeys.aliceSecp256k1Pub,
-                    aliceKeys.aliceDleqProof,
-                );
-                if (result.ok) {
-                    secretSubmitted = true;
-                    break;
-                }
-                if (attempt < 59) {
-                    await new Promise<void>((r) => setTimeout(r, 5_000));
-                }
-            }
-
-            if (!secretSubmitted) {
-                setFormError(
-                    'Your swap was created on-chain but the coordinator could not store your secret. ' +
-                    'Keep your 12 recovery words safe. Navigate to "Recover" tab to retry.',
-                );
-                setStep('idle');
-                return;
-            }
-
-            // Set session context — clear mnemonic from memory after keys are derived
+            // Set session immediately with simulated swap ID — navigate fast.
+            // Secret was already pre-backed-up via backupSecret() before the tx.
+            // SwapStatus has its own retry logic for secret submission.
             setSession({
-                swapId: resolvedSwapId.toString(),
+                swapId: swapId.toString(),
                 role: 'alice',
                 mnemonic: '',
                 aliceKeys,
@@ -410,12 +359,56 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
             });
             setMnemonic(null);
 
-            setTxResult({ txId, swapId: resolvedSwapId });
+            setTxResult({ txId, swapId });
             setStep('done');
-            onSwapCreated(resolvedSwapId);
+            toast.success('Swap transaction sent!');
+            onSwapCreated(swapId);
+
+            // Background: resolve actual swap ID + submit secret (non-blocking)
+            const aliceXmrPayout = form.xmrAddress.trim();
+            void (async () => {
+                let resolvedSwapId = swapId;
+                for (let attempt = 0; attempt < 36; attempt++) {
+                    const actualId = await resolveSwapIdByHashLock(aliceKeys.hashLockHex);
+                    if (actualId !== null) {
+                        const actualBigInt = BigInt(actualId);
+                        if (actualBigInt !== swapId) {
+                            console.warn(`[CreateSwap] Swap ID corrected: simulated=${swapId}, actual=${actualId}`);
+                            resolvedSwapId = actualBigInt;
+                            // Update session with corrected ID
+                            setSession({
+                                swapId: resolvedSwapId.toString(),
+                                role: 'alice',
+                                mnemonic: '',
+                                aliceKeys,
+                                bobKeys: null,
+                            });
+                        }
+                        break;
+                    }
+                    await new Promise<void>((r) => setTimeout(r, 3_000));
+                }
+
+                // Submit secret with resolved ID
+                for (let attempt = 0; attempt < 60; attempt++) {
+                    const result = await submitSwapSecret(
+                        resolvedSwapId.toString(),
+                        aliceKeys.secret,
+                        aliceKeys.recoveryToken,
+                        aliceKeys.aliceViewKey,
+                        aliceXmrPayout,
+                        aliceKeys.aliceSecp256k1Pub,
+                        aliceKeys.aliceDleqProof,
+                    );
+                    if (result.ok) break;
+                    await new Promise<void>((r) => setTimeout(r, 3_000));
+                }
+            })();
         } catch (err) {
+            const msg = err instanceof Error ? err.message : 'Unknown error occurred';
             setStep('error');
-            setStatusMessage(err instanceof Error ? err.message : 'Unknown error occurred');
+            setStatusMessage(msg);
+            toast.error(msg);
         }
     }, [mnemonic, senderAddress, walletAddress, form, setSession, onSwapCreated]);
 
@@ -501,6 +494,55 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
                             onChange={handleFieldChange('motoAmount')}
                             disabled={isProcessing || step === 'done'}
                         />
+                        {senderAddress && motoBalance !== null && (
+                            <div style={{
+                                display: 'flex',
+                                alignItems: 'center',
+                                justifyContent: 'space-between',
+                                marginTop: '6px',
+                            }}>
+                                <span style={{
+                                    fontSize: '0.75rem',
+                                    color: 'var(--color-text-muted)',
+                                    fontFamily: 'var(--font-mono)',
+                                }}>
+                                    Balance: {motoFormatted} MOTO
+                                </span>
+                                <div style={{ display: 'flex', gap: '4px' }}>
+                                    {[25, 50, 75, 100].map((pct) => (
+                                        <button
+                                            key={pct}
+                                            type="button"
+                                            disabled={isProcessing || step === 'done' || motoBalance === 0n}
+                                            onClick={() => {
+                                                const amt = motoBalance * BigInt(pct) / 100n;
+                                                const decimals = 18;
+                                                const whole = amt / (10n ** BigInt(decimals));
+                                                const frac = amt % (10n ** BigInt(decimals));
+                                                const fracStr = frac.toString().padStart(decimals, '0').replace(/0+$/, '');
+                                                const formatted = fracStr ? `${whole}.${fracStr}` : whole.toString();
+                                                setForm((prev) => ({ ...prev, motoAmount: formatted }));
+                                                setFormError(null);
+                                            }}
+                                            style={{
+                                                padding: '2px 8px',
+                                                fontSize: '0.68rem',
+                                                fontWeight: 600,
+                                                fontFamily: 'var(--font-mono)',
+                                                background: 'rgba(232, 115, 42, 0.08)',
+                                                border: '1px solid rgba(232, 115, 42, 0.2)',
+                                                borderRadius: 'var(--radius-sm)',
+                                                color: 'var(--color-text-accent)',
+                                                cursor: 'pointer',
+                                                transition: 'all var(--transition-fast)',
+                                            }}
+                                        >
+                                            {pct === 100 ? 'MAX' : `${pct}%`}
+                                        </button>
+                                    ))}
+                                </div>
+                            </div>
+                        )}
                         <p style={{ fontSize: '0.75rem', color: 'var(--color-text-muted)', marginTop: '4px' }}>
                             Amount of MOTO tokens to lock in the swap vault
                         </p>
@@ -683,6 +725,58 @@ export function CreateSwap({ onSwapCreated }: CreateSwapProps): React.ReactEleme
                                 Your 12 recovery words are the ONLY way to recover this swap. Keep them safe.
                             </p>
                             <ExplorerLinks txId={txResult.txId} address={walletAddress ?? undefined} />
+                        </div>
+                    )}
+
+                    {/* Mnemonic toggle */}
+                    {step !== 'done' && step !== 'mnemonic' && !isProcessing && (
+                        <div style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'space-between',
+                            padding: '10px 14px',
+                            background: showMnemonic ? 'rgba(0, 230, 118, 0.04)' : 'rgba(255, 82, 82, 0.04)',
+                            border: `1px solid ${showMnemonic ? 'rgba(0, 230, 118, 0.15)' : 'rgba(255, 82, 82, 0.15)'}`,
+                            borderRadius: 'var(--radius-md)',
+                        }}>
+                            <div>
+                                <p style={{ fontSize: '0.82rem', color: 'var(--color-text-secondary)', fontWeight: 500 }}>
+                                    Show recovery words
+                                </p>
+                                <p style={{ fontSize: '0.7rem', color: 'var(--color-text-muted)', marginTop: '2px' }}>
+                                    {showMnemonic ? 'You\'ll see your 12 words before the swap is created' : 'Skipping — make sure you have a backup strategy'}
+                                </p>
+                            </div>
+                            <button
+                                type="button"
+                                role="switch"
+                                aria-checked={showMnemonic}
+                                aria-label="Toggle recovery words display"
+                                onClick={() => setShowMnemonic(!showMnemonic)}
+                                style={{
+                                    width: '40px',
+                                    height: '22px',
+                                    borderRadius: '11px',
+                                    border: 'none',
+                                    background: showMnemonic ? 'var(--color-text-success)' : 'rgba(255,255,255,0.12)',
+                                    cursor: 'pointer',
+                                    position: 'relative',
+                                    transition: 'background var(--transition-fast)',
+                                    flexShrink: 0,
+                                    marginLeft: '12px',
+                                }}
+                            >
+                                <span style={{
+                                    position: 'absolute',
+                                    top: '2px',
+                                    left: showMnemonic ? '20px' : '2px',
+                                    width: '18px',
+                                    height: '18px',
+                                    borderRadius: '50%',
+                                    background: '#fff',
+                                    transition: 'left var(--transition-fast)',
+                                }} />
+                            </button>
                         </div>
                     )}
 

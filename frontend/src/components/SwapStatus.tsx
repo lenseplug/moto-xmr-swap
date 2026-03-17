@@ -6,6 +6,7 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useWalletConnect } from '@btc-vision/walletconnect';
 import { networks } from '@btc-vision/bitcoin';
+import { toast } from 'sonner';
 import { getSwapVaultContract, formatTokenAmount, formatXmrAmount } from '../services/opnet';
 import { calculateXmrFee, calculateXmrTotal } from '../types/swap';
 import { getCoordinatorSwapStatus, submitSwapSecret, submitBobKeys } from '../services/coordinator';
@@ -14,9 +15,12 @@ import { deriveAliceKeys, deriveBobKeys } from '../utils/mnemonic';
 import { signBobKeyProof } from '../utils/ed25519';
 import { verifyDleqProof } from '../utils/dleq';
 import { useSwapSession } from '../contexts/SwapSessionContext';
+import { useSettingsContext } from '../contexts/SettingsContext';
 import { useSwap, useBlockNumber } from '../hooks/useSwaps';
 import { useCoordinatorWs } from '../hooks/useCoordinatorWs';
+import { playSound } from '../utils/sound';
 import { MnemonicInput } from './MnemonicInput';
+import { ActivityFeed, type ActivityEvent } from './ActivityFeed';
 import type { CoordinatorStatus } from '../types/swap';
 import { ExplorerLinks } from './ExplorerLinks';
 import { SkeletonBlock } from './SkeletonRow';
@@ -95,6 +99,14 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
     const [cancelStep, setCancelStep] = useState<'idle' | 'cancelling' | 'done' | 'error'>('idle');
     const [actionTxId, setActionTxId] = useState<string | null>(null);
     const [actionError, setActionError] = useState<string | null>(null);
+
+    // Settings for sound
+    const { settings } = useSettingsContext();
+
+    // Activity feed events
+    const activityEventsRef = useRef<ActivityEvent[]>([]);
+    const [activityEvents, setActivityEvents] = useState<ActivityEvent[]>([]);
+    const prevStepRef = useRef<StepKey | null>(null);
 
     // DLEQ verification state for counterparty's cross-curve key binding
     const [dleqVerified, setDleqVerified] = useState<'pending' | 'valid' | 'invalid' | 'none'>('none');
@@ -334,6 +346,43 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
 
     const currentStepIdx = stepIndex(currentStep);
 
+    // Sound + activity feed on step transitions
+    useEffect(() => {
+        if (prevStepRef.current === currentStep) return;
+        const prev = prevStepRef.current;
+        prevStepRef.current = currentStep;
+
+        // Activity event labels
+        const STEP_LABELS: Record<StepKey, { label: string; type: ActivityEvent['type'] }> = {
+            created: { label: 'Swap created', type: 'info' },
+            take_pending: { label: 'Counterparty reserving', type: 'info' },
+            taken: { label: 'Counterparty accepted', type: 'info' },
+            xmr_locking: { label: 'XMR deposit detected', type: 'warning' },
+            xmr_locked: { label: 'XMR locked (10 confirmations)', type: 'success' },
+            xmr_sweeping: { label: 'Securing XMR for seller', type: 'info' },
+            claimed: { label: 'MOTO claimed', type: 'success' },
+            complete: { label: 'Swap completed', type: 'success' },
+        };
+
+        const evt = STEP_LABELS[currentStep];
+        if (evt) {
+            const newEvent: ActivityEvent = { timestamp: Date.now(), ...evt };
+            activityEventsRef.current = [...activityEventsRef.current, newEvent];
+            setActivityEvents([...activityEventsRef.current]);
+        }
+
+        // Sound triggers (skip initial render)
+        if (prev !== null && settings.soundEnabled) {
+            if (currentStep === 'taken' || currentStep === 'take_pending') {
+                playSound('alert');
+            } else if (currentStep === 'xmr_locked' || currentStep === 'claimed') {
+                playSound('success');
+            } else if (currentStep === 'complete') {
+                playSound('complete');
+            }
+        }
+    }, [currentStep, settings.soundEnabled]);
+
     const blocksLeft =
         swap !== null && currentBlock !== null && swap.refundBlock > currentBlock
             ? swap.refundBlock - currentBlock
@@ -396,9 +445,12 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
 
             setActionTxId(resultTxId);
             setClaimStep('done');
+            toast.success('MOTO claim submitted!');
         } catch (err) {
+            const msg = err instanceof Error ? err.message : 'Unknown error';
             setClaimStep('error');
-            setActionError(err instanceof Error ? err.message : 'Unknown error');
+            setActionError(msg);
+            toast.error(msg);
         } finally {
             actionInProgressRef.current = false;
         }
@@ -445,9 +497,12 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
 
             setActionTxId(resultTxId);
             setRefundStep('done');
+            toast.success('Refund submitted!');
         } catch (err) {
+            const msg = err instanceof Error ? err.message : 'Unknown error';
             setRefundStep('error');
-            setActionError(err instanceof Error ? err.message : 'Unknown error');
+            setActionError(msg);
+            toast.error(msg);
         } finally {
             actionInProgressRef.current = false;
         }
@@ -494,9 +549,12 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
 
             setActionTxId(resultTxId);
             setCancelStep('done');
+            toast.success('Swap cancelled!');
         } catch (err) {
+            const msg = err instanceof Error ? err.message : 'Unknown error';
             setCancelStep('error');
-            setActionError(err instanceof Error ? err.message : 'Unknown error');
+            setActionError(msg);
+            toast.error(msg);
         } finally {
             actionInProgressRef.current = false;
         }
@@ -960,6 +1018,9 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
                     })}
                 </div>
             </div>
+
+            {/* Activity Feed */}
+            <ActivityFeed events={activityEvents} />
 
             {/* Swap Details */}
             {isLoading ? (

@@ -5,6 +5,7 @@
 import React, { useState, useCallback, useEffect } from 'react';
 import { useWalletConnect } from '@btc-vision/walletconnect';
 import { networks } from '@btc-vision/bitcoin';
+import { toast } from 'sonner';
 import { getSwapVaultContract, formatTokenAmount, formatXmrAmount } from '../services/opnet';
 import { joinXmrAddress } from '../services/opnet';
 import { notifySwapTaken, submitBobKeys } from '../services/coordinator';
@@ -38,6 +39,7 @@ export function TakeSwap({ swapId, onBack, onTaken }: TakeSwapProps): React.Reac
     const [txId, setTxId] = useState<string | null>(null);
     const [errorMsg, setErrorMsg] = useState<string | null>(null);
     const [mnemonic, setMnemonic] = useState<string | null>(null);
+    const [showMnemonic, setShowMnemonic] = useState(true);
     const [bobXmrRefund, setBobXmrRefund] = useState<string>('');
 
     // Warn user before closing/navigating away during mnemonic step.
@@ -72,13 +74,21 @@ export function TakeSwap({ swapId, onBack, onTaken }: TakeSwapProps): React.Reac
 
         const words = generateSwapMnemonic();
         setMnemonic(words);
-        setStep('mnemonic');
         setErrorMsg(null);
-    }, [isConnected, walletAddress, publicKey, senderAddress, swap]);
+
+        if (showMnemonic) {
+            setStep('mnemonic');
+        } else {
+            // Skip mnemonic display — proceed directly
+            void handleMnemonicConfirmed(words);
+        }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [isConnected, walletAddress, publicKey, senderAddress, swap, showMnemonic]);
 
     // Step 2: User confirmed words -> proceed with on-chain tx
-    const handleMnemonicConfirmed = useCallback(async (): Promise<void> => {
-        if (!mnemonic || !senderAddress || !walletAddress) return;
+    const handleMnemonicConfirmed = useCallback(async (mnemonicOverride?: string): Promise<void> => {
+        const words = mnemonicOverride ?? mnemonic;
+        if (!words || !senderAddress || !walletAddress) return;
         if (!SWAP_VAULT_ADDRESS) return;
 
         setStep('taking');
@@ -88,7 +98,7 @@ export function TakeSwap({ swapId, onBack, onTaken }: TakeSwapProps): React.Reac
         try {
             // Pass hashLock to bind DLEQ proof to this specific swap (prevents cross-swap replay)
             const swapHashLock = swap ? swap.hashLock.toString(16).padStart(64, '0') : undefined;
-            const bobKeys = await deriveBobKeys(mnemonic, swapHashLock);
+            const bobKeys = await deriveBobKeys(words, swapHashLock);
 
             setStatusMessage('Simulating take transaction...');
 
@@ -145,6 +155,7 @@ export function TakeSwap({ swapId, onBack, onTaken }: TakeSwapProps): React.Reac
 
             // Navigate to SwapStatus immediately
             setStep('done');
+            toast.success('Swap taken!');
             onTaken(swapId);
 
             // Submit Bob's keys with proof-of-knowledge (async, continues after navigation)
@@ -172,8 +183,10 @@ export function TakeSwap({ swapId, onBack, onTaken }: TakeSwapProps): React.Reac
                 console.warn('Failed to submit Bob keys — will retry from status page:', keyErr);
             }
         } catch (err) {
+            const msg = err instanceof Error ? err.message : 'Unknown error';
             setStep('error');
-            setErrorMsg(err instanceof Error ? err.message : 'Unknown error');
+            setErrorMsg(msg);
+            toast.error(msg);
         }
     }, [mnemonic, senderAddress, walletAddress, swapId, setSession, onTaken]);
 
@@ -482,6 +495,55 @@ export function TakeSwap({ swapId, onBack, onTaken }: TakeSwapProps): React.Reac
                                     <p style={{ fontSize: '0.7rem', color: 'var(--color-text-muted)', marginTop: '2px' }}>
                                         If the swap expires, XMR will be refunded here. Leave blank to use the operator address.
                                     </p>
+                                </div>
+                                <div style={{
+                                    display: 'flex',
+                                    alignItems: 'center',
+                                    justifyContent: 'space-between',
+                                    padding: '10px 14px',
+                                    background: showMnemonic ? 'rgba(0, 230, 118, 0.04)' : 'rgba(255, 82, 82, 0.04)',
+                                    border: `1px solid ${showMnemonic ? 'rgba(0, 230, 118, 0.15)' : 'rgba(255, 82, 82, 0.15)'}`,
+                                    borderRadius: 'var(--radius-md)',
+                                    marginTop: '12px',
+                                }}>
+                                    <div>
+                                        <p style={{ fontSize: '0.82rem', color: 'var(--color-text-secondary)', fontWeight: 500 }}>
+                                            Show recovery words
+                                        </p>
+                                        <p style={{ fontSize: '0.7rem', color: 'var(--color-text-muted)', marginTop: '2px' }}>
+                                            {showMnemonic ? 'You\'ll see your 12 words before the swap' : 'Skipping — make sure you have a backup strategy'}
+                                        </p>
+                                    </div>
+                                    <button
+                                        type="button"
+                                        role="switch"
+                                        aria-checked={showMnemonic}
+                                        aria-label="Toggle recovery words display"
+                                        onClick={() => setShowMnemonic(!showMnemonic)}
+                                        style={{
+                                            width: '40px',
+                                            height: '22px',
+                                            borderRadius: '11px',
+                                            border: 'none',
+                                            background: showMnemonic ? 'var(--color-text-success)' : 'rgba(255,255,255,0.12)',
+                                            cursor: 'pointer',
+                                            position: 'relative',
+                                            transition: 'background var(--transition-fast)',
+                                            flexShrink: 0,
+                                            marginLeft: '12px',
+                                        }}
+                                    >
+                                        <span style={{
+                                            position: 'absolute',
+                                            top: '2px',
+                                            left: showMnemonic ? '20px' : '2px',
+                                            width: '18px',
+                                            height: '18px',
+                                            borderRadius: '50%',
+                                            background: '#fff',
+                                            transition: 'left var(--transition-fast)',
+                                        }} />
+                                    </button>
                                 </div>
                                 <button
                                     className="btn btn-primary btn-lg"
