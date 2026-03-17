@@ -92,6 +92,7 @@ export interface CoordinatorStatus {
     readonly bobDleqProof?: string;
     readonly sweepStatus?: string;
     readonly depositor?: string;
+    readonly preimage?: string;
     readonly updatedAt: number;
 }
 

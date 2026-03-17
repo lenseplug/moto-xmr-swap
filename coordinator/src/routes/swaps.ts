@@ -378,8 +378,20 @@ export function handleGetSwap(
     }
     const history = storage.getStateHistory(swapId);
     const queuePos = getQueuePosition?.(swapId) ?? null;
+    const sanitized = sanitizeSwapForApi(swap);
+
+    // For on-chain imported swaps (no claim_token), expose the preimage once XMR is locked.
+    // The preimage is meant to be revealed at this stage — it's how Bob claims MOTO.
+    // Normal swaps deliver it via authenticated WebSocket; imports need REST fallback.
+    const PREIMAGE_VISIBLE_STATES = new Set([
+        SwapStatus.XMR_LOCKED, SwapStatus.XMR_SWEEPING, SwapStatus.MOTO_CLAIMING, SwapStatus.COMPLETED,
+    ]);
+    if (!swap.claim_token && swap.preimage && PREIMAGE_VISIBLE_STATES.has(swap.status)) {
+        sanitized['preimage'] = swap.preimage;
+    }
+
     jsonResponse(res, 200, success({
-        swap: sanitizeSwapForApi(swap),
+        swap: sanitized,
         history,
         ...(queuePos ? { sweepQueuePosition: queuePos.position, sweepQueueTotal: queuePos.total } : {}),
     }));

@@ -121,8 +121,8 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
     // WebSocket for real-time preimage delivery
     const { preimage: wsPreimage, queuePosition } = useCoordinatorWs(swapId.toString(), claimToken, hashLockHex);
 
-    // Combined preimage: prefer session secret, fall back to WebSocket preimage
-    const claimablePreimage = secretHex ?? wsPreimage;
+    // Combined preimage: prefer session secret, then WebSocket, then REST API fallback
+    const claimablePreimage = secretHex ?? wsPreimage ?? coordinatorStatus?.preimage ?? null;
 
     // Retry submitting Alice's secret to coordinator (max 30 attempts, exponential backoff)
     const aliceSecp256k1Pub = aliceKeys?.aliceSecp256k1Pub ?? undefined;

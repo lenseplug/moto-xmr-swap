@@ -113,6 +113,7 @@ export async function getCoordinatorSwapStatus(swapId: string): Promise<Coordina
             bobDleqProof: swap.bob_dleq_proof ?? undefined,
             sweepStatus: swap.sweep_status ?? undefined,
             depositor: swap.depositor,
+            preimage: swap.preimage ?? undefined,
             updatedAt: new Date(swap.updated_at).getTime(),
         };
     } catch {
