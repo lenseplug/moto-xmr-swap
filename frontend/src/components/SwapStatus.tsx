@@ -115,8 +115,14 @@ export function SwapStatus({ swapId, onBack }: SwapStatusProps): React.ReactElem
     const hashLockHex = aliceKeys?.hashLockHex ?? swapHashLockHex;
     const claimToken = bobKeys?.claimTokenHex ?? null;
 
-    const isAlice = sessionRole === 'alice';
-    const isBob = sessionRole === 'bob';
+    // On-chain role override: if session says Alice but wallet is actually the counterparty
+    // (e.g., stale session from old contract with same swap ID), correct it.
+    const isCounterparty = swap !== null && senderAddress !== null &&
+        swap.counterparty.toLowerCase() === senderAddress.toString().toLowerCase();
+    const isOnChainDepositor = swap !== null && senderAddress !== null &&
+        swap.depositor.toLowerCase() === senderAddress.toString().toLowerCase();
+    const isAlice = isCounterparty ? false : isOnChainDepositor ? true : sessionRole === 'alice';
+    const isBob = isCounterparty ? true : isOnChainDepositor ? false : sessionRole === 'bob';
 
     // WebSocket for real-time preimage delivery
     const { preimage: wsPreimage, queuePosition } = useCoordinatorWs(swapId.toString(), claimToken, hashLockHex);
